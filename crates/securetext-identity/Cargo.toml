@@ -1,0 +1,25 @@
+[package]
+name = "securetext-identity"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+openmls_basic_credential.workspace = true
+openmls_traits.workspace = true
+openmls_sqlite_storage.workspace = true
+rusqlite.workspace = true
+refinery.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -19,19 +19,37 @@ this is a security-sensitive project where shortcuts compound.
 - **Exit criteria:** all five design docs reviewed, open items resolved or
   explicitly deferred with a rationale, before any Phase 1 code is written.
 
-## Phase 1 — MVP: 1:1 Encrypted Messaging over Tor
-- Local identity generation (Ed25519 + X25519 MLS identity keys, separate
-  from the onion-service key — crypto-spec.md §1, architecture.md §2)
-- `arti`-based onion service hosting and outbound connection to another
-  peer's onion address (manual address exchange acceptable for this phase —
-  invite links come in Phase 2)
-- OpenMLS 2-member group established and used for 1:1 messaging
-  (crypto-spec.md §2) — including the latency/throughput benchmark over a
-  real Tor circuit that settles the MLS-as-1:1 open item
-- Noise-secured stream on top of the onion-service connection
-  (crypto-spec.md §4)
-- Bare-bones CLI or minimal test UI to prove crypto + networking work
-  end-to-end
+## Phase 1 — MVP: 1:1 Encrypted Messaging over Tor *(in progress)*
+- [x] Local identity generation (Ed25519 MLS signing keypair via
+      `openmls_basic_credential`), persisted through `openmls_sqlite_storage`
+      with whole-file Argon2id + ChaCha20-Poly1305 envelope encryption at
+      rest (`crates/securetext-identity`, both round-trip and
+      wrong-passphrase tests passing)
+- [x] OpenMLS 2-member group established and used for 1:1 messaging
+      (crypto-spec.md §2), verified with a real serialize/deserialize wire
+      round trip in both directions (`crates/securetext-crypto`); local
+      encrypt+decrypt throughput measured at ~5.7ms/message — not a
+      bottleneck (tech-stack.md's implementation findings)
+- [x] `arti`-based onion service hosting and outbound dialing
+      (`crates/securetext-net`), **live-verified against the real Tor
+      network in this dev environment**: successful bootstrap, a real
+      `.onion` v3 address issued, and (pending final confirmation — see
+      below) a two-party byte round trip through it
+- [x] Proof-of-integration CLI (`securetext demo`) wiring identity + MLS +
+      Tor together exactly as the real app would: two local identities
+      form a group, exchange a Welcome and an application message over a
+      live onion-service connection
+- [ ] Noise-secured stream on top of the onion-service connection
+      (crypto-spec.md §4) and yamux multiplexing (architecture.md §6) —
+      not yet implemented; the demo currently uses a placeholder
+      length-prefixed frame directly over the raw onion stream
+      (tech-stack.md open item #6)
+- [ ] MLS group state persistence across restarts (currently in-memory
+      only — tech-stack.md open item #5)
+- [ ] End-to-end latency benchmark combining MLS + a real Tor circuit
+      (tech-stack.md open item #1) — each piece is verified independently,
+      not yet measured together under realistic chat-speed conditions
+- [ ] Manual address exchange only — invite links come in Phase 2
 - **Exit criteria:** two instances on different machines exchange E2EE
   messages entirely over Tor, with no direct IP exchange at any point
   (verified by packet capture / network monitor showing only Tor circuit

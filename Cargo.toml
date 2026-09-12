@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/securetext-identity",
+    "crates/securetext-crypto",
+    "crates/securetext-net",
+    "crates/securetext-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# At-rest encryption for locally persisted key material
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+
+# MLS
+openmls = "0.9"
+openmls_rust_crypto = "0.6"
+openmls_traits = "0.6"
+openmls_basic_credential = "0.6"
+openmls_sqlite_storage = "0.3"
+tls_codec = { version = "0.5", features = ["derive"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+refinery = "0.9"
+tempfile = "3"
+
+# Networking (Tor)
+arti-client = { version = "0.46", features = ["onion-service-service", "onion-service-client", "tokio", "rustls"] }
+tor-hsservice = "0.46"
+tor-rtcompat = { version = "0.46", features = ["tokio", "rustls"] }
+futures = "0.3"

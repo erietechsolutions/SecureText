@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/target/
-Cargo.lock
 
 # Node / frontend (Tauri UI)
 node_modules/

@@ -58,28 +58,97 @@ serves the "efficient and secure" goal rather than trading against it.
 | Store-and-forward relay (Phase 5) | Custom minimal Rust service, reachable only via its own onion service | No existing off-the-shelf "blind encrypted mailbox" server fits exactly; keep it deliberately simple (store blob, TTL, opaque routing ID lookup) to minimize audit surface |
 | Pluggable transport (bridges) | `obfs4proxy` (external binary, invoked by `arti` per its documented pluggable-transport config) | Same mechanism the reference C Tor implementation uses; no need to reimplement obfs4 |
 
-## Open items to resolve before Phase 1 coding starts
+## Phase 1 implementation findings (from actually building it)
 
-1. **MLS-as-1:1 latency/throughput validation** — benchmark 2-member
-   OpenMLS groups at realistic chat-speed message rates over an actual Tor
-   circuit (not just localhost) before considering the "one crypto stack"
-   decision (crypto-spec.md §2) fully settled. If it's a real problem,
-   the fallback is a from-spec Double Ratchet implementation reviewed in
-   the Phase 8 audit, not a third-party dependency.
-2. **SQLCipher Rust binding maturity** — verify `rusqlite`'s SQLCipher
-   feature flag builds cleanly on Ubuntu, Fedora, and Windows before
-   relying on it for at-rest encryption; the OpenSSL/vcpkg dependency
-   chain on Windows is the highest-risk part (see platform-support.md
-   open item #1 for the fallback plan if it proves painful).
+These replace/sharpen the open items below with what was learned writing
+the real Cargo workspace (`crates/securetext-{identity,crypto,net,cli}`),
+rather than guessed in advance:
+
+- **MLS-as-1:1 local performance: not a bottleneck.** A 2-member OpenMLS
+  group (ChaCha20-Poly1305 ciphersuite,
+  `MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`) round-tripped 200
+  encrypt+decrypt operations in ~1.15s (~5.7ms/message) with the in-memory
+  provider — negligible next to any realistic Tor circuit latency. The
+  "one crypto stack" decision (crypto-spec.md §2) is validated on the local
+  compute side; what remains is measuring actual Tor-circuit latency
+  end-to-end, not the MLS overhead itself.
+- **`openmls_basic_credential::SignatureKeyPair::private()` and
+  `MlsMessageIn::into_welcome()` are both `#[cfg(feature = "test-utils")]`
+  or `#[cfg(test)]`-gated in the published crate** — not available to
+  application code by design. Identity persistence uses
+  `openmls_sqlite_storage`'s official `StorageProvider`-based
+  `.store()`/`.read()` instead of raw key export; Welcome extraction uses
+  `MlsMessageIn::extract()` pattern-matched against `MlsMessageBodyIn`
+  instead of the test-only convenience method. Both are implemented in
+  `crates/securetext-identity` and `crates/securetext-crypto`.
+- **`tls_codec` version must track whatever `openmls` 0.9 actually pulls in
+  (0.5.x), not an independently-guessed version** — pinning it separately
+  causes two copies of the crate in the dependency graph and ambiguous
+  trait resolution errors.
+- **At-rest encryption, interim design (resolves open item #2 below more
+  concretely):** `openmls_sqlite_storage` pins its own `rusqlite` (`^0.37`)
+  with the plain `bundled` feature, separate from a hypothetical
+  SQLCipher-enabled `rusqlite` we'd add ourselves — getting the two to
+  feature-unify into one SQLCipher-enabled build needs either a patched
+  fork of `openmls_sqlite_storage` or a dependency version alignment spike,
+  neither done yet. **Interim implementation (shipped, tested):**
+  `securetext-identity` runs the SQLite database in a private temp file for
+  the session and envelope-encrypts the *entire file* with Argon2id +
+  ChaCha20-Poly1305 on `seal()`, rather than relying on SQLCipher's
+  row-level encryption. This satisfies "a stolen device shouldn't expose
+  the identity key" (threat-model.md) today; row-level SQLCipher encryption
+  (less plaintext-on-disk exposure window, no temp file) remains a
+  worthwhile hardening, tracked as open item #2.
+- **arti's `fs-mistrust` ownership check can false-positive in a sandboxed
+  dev environment** where `$HOME`'s ancestor directories have unusual
+  ownership (observed: a Flatpak sandbox presenting `/home` itself as
+  owned by a different uid than the user's own home directory). This is
+  arti behaving correctly by its own security model, not a bug — the fix
+  is pointing `TorClientConfigBuilder::from_directories()` at a directory
+  with a clean ownership chain (e.g., under `/tmp`) for that environment,
+  never disabling the check. Documented in `securetext-net`'s tests as a
+  troubleshooting note for future contributors hitting the same thing.
+- **Live-verified in this dev sandbox** (not just compiled): `arti`
+  successfully bootstrapped onto the real Tor network, launched a live v3
+  onion service, and completed a full two-party byte round trip through it
+  end to end — see `crates/securetext-net/src/lib.rs`'s
+  `#[ignore]`-marked live tests (`cargo test -p securetext-net -- --ignored
+  --nocapture`; they're `#[ignore]`d by default since they need real,
+  unrestricted internet access and take 15s+ each for Tor bootstrap).
+
+## Open items to resolve before Phase 1 is considered complete
+
+1. **End-to-end Tor-circuit latency for MLS-as-1:1 messaging** — now that
+   both pieces work independently (MLS round-trip: ~5.7ms/message locally;
+   Tor onion-service round trip: verified working), measure the *combined*
+   real-world latency of an MLS-encrypted message sent over an actual Tor
+   circuit, not each piece in isolation.
+2. **SQLCipher / row-level at-rest encryption for the MLS+identity store**
+   — see the finding above; either patch `openmls_sqlite_storage` to accept
+   an externally-configured (SQLCipher) connection, or align dependency
+   versions so Cargo's feature unification does it automatically. The
+   whole-file envelope encryption already shipped is the accepted interim
+   state, not a blocker.
 3. **`webrtc-rs` vs. FFI to `libwebrtc`** — `webrtc-rs` is younger than
    Google's `libwebrtc`; verify it covers everything needed (in particular
    ICE/TURN interop for the forced-relay calling mode) before Phase 6, or
    plan an FFI fallback.
 4. **Bridge configuration UX** — auto-detect-and-prompt vs. explicit
    settings toggle for obfs4 bridges (architecture.md §5); needs a decision
-   before Phase 1's exit criteria are finalized, not a hard blocker for
-   starting the Tor integration itself.
-5. **Frontend framework for Tauri** (React vs. Svelte vs. other) — deferred
+   before Phase 1's exit criteria are finalized. Not yet implemented in
+   `securetext-net` — the live tests so far rely on unrestricted direct Tor
+   access, not bridges.
+5. **MLS group state persistence across restarts** — `securetext-crypto`
+   currently uses OpenMLS's in-memory provider (`OpenMlsRustCrypto`) for
+   group/ratchet state, proven correct but not durable. Wiring
+   `openmls_sqlite_storage` into the group's provider (not just the
+   identity key, which already uses it) is the natural next step, likely
+   alongside item #2 above since it's the same storage layer.
+6. **Noise defense-in-depth layer and yamux multiplexing** (crypto-spec.md
+   §4, architecture.md §6) are not yet implemented — `securetext-cli`'s
+   demo currently frames messages with a plain length prefix directly over
+   the raw onion-service stream as a placeholder.
+7. **Frontend framework for Tauri** (React vs. Svelte vs. other) — deferred
    to Phase 4, not blocking.
 
 ## Standing rule: crypto/network-adjacent dependency vetting
