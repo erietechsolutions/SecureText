@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/target/
+Cargo.lock
+
+# Node / frontend (Tauri UI)
+node_modules/
+dist/
+build/
+
+# Tauri
+src-tauri/target/
+
+# Local secrets / keys — never commit identity material
+*.pem
+*.key
+*.seed
+*secrets*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Env files
+.env
+.env.*
