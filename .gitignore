@@ -16,6 +16,9 @@ src-tauri/target/
 *.seed
 *secrets*
 
+# Claude Code local state
+.claude/
+
 # Editors / OS
 .vscode/
 .idea/

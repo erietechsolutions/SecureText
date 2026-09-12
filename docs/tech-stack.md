@@ -108,23 +108,41 @@ rather than guessed in advance:
   with a clean ownership chain (e.g., under `/tmp`) for that environment,
   never disabling the check. Documented in `securetext-net`'s tests as a
   troubleshooting note for future contributors hitting the same thing.
-- **Live-verified in this dev sandbox** (not just compiled): `arti`
-  successfully bootstrapped onto the real Tor network in ~15s and launched
-  a live v3 onion service with a real `.onion` address
-  (`bootstrap_and_launch_onion_service_live`, passing). **Not yet verified:
-  a full two-party round trip** — `two_peer_round_trip_over_onion_service_live`
-  runs two independent `TorClient`s concurrently in one process and got
-  stuck for 10+ minutes on the second client's bootstrap (vs. ~15s for a
-  single client alone) before being killed; this looks like resource/thread
-  contention between two full Tor clients sharing one small
-  (`worker_threads = 2`) tokio runtime rather than a transport-layer
-  problem, since each half (bootstrap, onion service launch, and the
-  underlying `dial`/`accept_next` code) is otherwise exercised and correct.
-  **Open item, not silently resolved:** re-run this test with a larger
-  worker-thread pool and/or as two genuinely separate OS processes (closer
-  to how two real users' devices would run anyway) before treating Phase
-  1's "two instances exchange E2EE messages entirely over Tor" exit
-  criterion as met.
+- **Live-verified in this dev sandbox, fully** (not just compiled):
+  `arti` bootstraps onto the real Tor network in ~15s, launches a live v3
+  onion service, and a complete two-party byte round trip over it succeeds
+  — both as two independent `TorClient`s in one process
+  (`two_peer_round_trip_over_onion_service_live`, ~35-48s total) and as two
+  genuinely separate OS processes (`securetext net-listen` /
+  `securetext net-dial <address>` in two terminals). The full identity + MLS
+  + Tor integration also verified end to end via `securetext demo`: two
+  local identities form an MLS group, exchange a Welcome and an encrypted
+  application message in both directions, entirely over live onion
+  services.
+- **`DataStream` buffers writes internally and requires an explicit
+  `.flush()`** — `AsyncWriteExt::write_all` succeeding does *not* mean the
+  bytes left the local buffer, let alone reached the remote peer. This was
+  the actual cause of what first looked like a 10+-minute bootstrap stall
+  in the concurrent-two-clients test: bootstrap had already finished in
+  both cases (there was simply no log line between "bootstrapping" and the
+  final success message to reveal that), and the test was silently hung on
+  an unflushed write with the reader blocked forever waiting for bytes that
+  never left the sender's buffer. Once `.flush()` was added, the same test
+  finished in under a minute — the original "thread contention between two
+  Tor clients" theory was wrong; there was no bootstrap problem at all, in
+  one process or two.
+- **A successful `.flush()`/`.shutdown()` doesn't mean the *remote* has
+  received the data yet** — delivery across a live multi-hop Tor circuit
+  takes real wall-clock time that isn't synchronized with the local
+  future's completion. Dropping a stream (or exiting the process) right
+  after a successful flush/shutdown reliably raced the in-flight data and
+  produced `NotConnected` on the reader's side. Fixed with a short
+  (~3s) grace period after the last write and before the stream is
+  dropped/the process exits — acceptable for this short-lived CLI/test
+  code, and irrelevant for the real app, which is a long-running process
+  that doesn't exit right after sending a message. Both fixes are in
+  `crates/securetext-net/src/lib.rs`'s tests and
+  `crates/securetext-cli/src/main.rs`.
 
 ## Open items to resolve before Phase 1 is considered complete
 

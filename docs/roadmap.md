@@ -31,17 +31,19 @@ this is a security-sensitive project where shortcuts compound.
       encrypt+decrypt throughput measured at ~5.7ms/message — not a
       bottleneck (tech-stack.md's implementation findings)
 - [x] `arti`-based onion service hosting and outbound dialing
-      (`crates/securetext-net`), **live-verified against the real Tor
-      network in this dev environment**: successful bootstrap (~15s) and a
-      real `.onion` v3 address issued. The two-independent-clients round
-      trip test is written but not yet passing — it stalled on the second
-      client's bootstrap when run concurrently in one process (tech-stack.md
-      implementation findings); needs a re-run with more worker threads or
-      as separate processes before this item is fully closed.
+      (`crates/securetext-net`), **fully live-verified against the real Tor
+      network in this dev environment**: bootstrap (~15s), a real `.onion`
+      v3 address issued, and a complete two-party byte round trip — both
+      as two `TorClient`s in one process and as two genuinely separate OS
+      processes (`securetext net-listen` / `net-dial`). The apparent
+      10+-minute "bootstrap stall" seen earlier was a red herring: it was
+      actually a missing `.flush()` on the buffered `DataStream` writer
+      (tech-stack.md's implementation findings) — fixed.
 - [x] Proof-of-integration CLI (`securetext demo`) wiring identity + MLS +
-      Tor together exactly as the real app would: two local identities
-      form a group, exchange a Welcome and an application message over a
-      live onion-service connection
+      Tor together exactly as the real app would, **run and verified end
+      to end**: two local identities form a 2-member MLS group, exchange a
+      Welcome and an encrypted application message in both directions,
+      entirely over live Tor onion services with no IP ever exchanged.
 - [ ] Noise-secured stream on top of the onion-service connection
       (crypto-spec.md §4) and yamux multiplexing (architecture.md §6) —
       not yet implemented; the demo currently uses a placeholder

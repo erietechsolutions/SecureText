@@ -34,12 +34,36 @@ pub enum NetError {
 
 pub type Client = Arc<TorClient<PreferredRuntime>>;
 
-/// Bootstrap a Tor client. This performs real network activity (fetching
-/// consensus/descriptor documents from the Tor network) and can take from a
-/// few seconds up to significantly longer depending on network conditions —
-/// see architecture.md §6 on the accepted latency tradeoff.
+/// Bootstrap a Tor client using arti's default state/cache locations
+/// (platform-appropriate app-data directories — platform-support.md). This
+/// performs real network activity (fetching consensus/descriptor documents
+/// from the Tor network) and can take from a few seconds up to significantly
+/// longer depending on network conditions — see architecture.md §6 on the
+/// accepted latency tradeoff.
+///
+/// Arti enforces that its state directory has a trustworthy owner
+/// (correct, security-conscious behavior — not something to relax). On a
+/// real user machine this just works; in a sandboxed dev environment where
+/// `$HOME`'s ancestor directories have unusual ownership, this call will
+/// fail with a filesystem-permissions error. Use
+/// [`bootstrap_with_dirs`] pointed at a directory with a clean ownership
+/// chain in that case (see `crates/securetext-net`'s tests and
+/// tech-stack.md's implementation findings).
 pub async fn bootstrap() -> Result<Client, NetError> {
     let config = TorClientConfig::default();
+    let client = TorClient::create_bootstrapped(config).await?;
+    Ok(client)
+}
+
+/// Bootstrap a Tor client using explicit state/cache directories instead of
+/// arti's platform default. See [`bootstrap`] for when you'd want this.
+pub async fn bootstrap_with_dirs(
+    state_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+) -> Result<Client, NetError> {
+    let config = arti_client::config::TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+        .build()
+        .map_err(|e| NetError::Config(format!("{e:?}")))?;
     let client = TorClient::create_bootstrapped(config).await?;
     Ok(client)
 }
@@ -163,7 +187,7 @@ mod tests {
     /// standing in for two peers' devices, exchange bytes with one side
     /// only ever knowing the other's `.onion` address — never an IP.
     #[ignore]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn two_peer_round_trip_over_onion_service_live() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -193,6 +217,17 @@ mod tests {
                 .write_all(&buf[..n])
                 .await
                 .expect("echo back to dialer");
+            stream.flush().await.expect("flush echo to dialer");
+            stream.shutdown().await.expect("shutdown after echo");
+            // A successful shutdown().await means our local buffer was
+            // handed off, not that the remote side has necessarily
+            // received it yet -- delivery across a live multi-hop Tor
+            // circuit takes real wall-clock time. Dropping `stream`
+            // immediately after risks the circuit being reclaimed before
+            // that delivery completes, which is exactly what caused this
+            // test to flake with `NotConnected` on the dialer's read side.
+            // See tech-stack.md's implementation findings.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             buf[..n].to_vec()
         });
 
@@ -207,6 +242,10 @@ mod tests {
             .write_all(b"hello over tor")
             .await
             .expect("write to listener");
+        // DataStream buffers internally -- without flushing, the listener's
+        // read() blocks forever waiting for bytes that never leave the
+        // local buffer. See tech-stack.md's implementation findings.
+        dial_stream.flush().await.expect("flush to listener");
 
         let mut echo_buf = [0u8; 64];
         let n = dial_stream
