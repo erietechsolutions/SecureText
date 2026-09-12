@@ -1,156 +1,210 @@
 # Network Architecture
 
-## 1. Topology: hybrid P2P, not pure mesh
+## 1. Topology: Tor v3 onion services, mandatory, for everything except calls
 
-Pure P2P (every peer only ever talks directly to every other peer) breaks on
-two real-world problems: **discovery** (how do you find a peer without a
-central directory?) and **NAT traversal** (most consumer devices sit behind
-NATs that block unsolicited inbound connections). SecureText uses the same
-hybrid pattern as other successful "P2P" chat systems (Session, Briar,
-Tox): direct P2P connections whenever possible, with minimal, dumb,
-untrusted infrastructure filling the gaps.
+**Every peer runs a Tor v3 onion service (via `arti`, the Tor Project's own
+Rust implementation) as its sole listening address.** No component of the
+system — peers, store-and-forward relays, or the app's own infrastructure —
+ever learns another party's real IP address for text, group, or file
+traffic. This directly satisfies the requirement that no message be
+traceable to a device: an onion address is not a network location, and
+onion routing means neither end of a connection (nor anyone relaying it)
+can determine the other end's IP.
 
 ```
- Peer A ───────── direct P2P (libp2p/Noise) ─────────── Peer B
+ Peer A                                                    Peer B
+ (.onion service,                                    (.onion service,
+  arti)                                                arti)
    │                                                        │
-   │        (when direct connection fails: NAT'd,           │
-   │         both offline, etc.)                            │
-   └──────────► DHT for discovery ◄──────────────────────────┘
-                       │
-              TURN relay (fallback transport,
-              sees ciphertext only)
-                       │
-              Store-and-forward relay (Phase 5,
-              holds encrypted blobs briefly,
-              sees ciphertext only)
+   └───── Tor circuit (3+ hops, mutually anonymous) ─────────┘
+                             │
+              Store-and-forward relay (Phase 5) —
+              also a .onion service; never sees a
+              real IP, never sees plaintext
+                             │
+              obfs4 bridge (optional, when Tor
+              itself is blocked/throttled — §5)
 ```
 
-None of the infrastructure boxes above ever see plaintext or hold long-term
-message history — see threat-model.md and crypto-spec.md.
+This replaces the earlier libp2p-based hybrid-P2P design (direct
+connections + DHT discovery + STUN/TURN/ICE NAT traversal). That design is
+no longer needed: **Tor onion services solve NAT traversal and discovery
+reachability inherently** (an onion service is reachable through any NAT
+without port forwarding, by construction), so the DHT/STUN/TURN/hole-punching
+machinery that hybrid P2P designs need is simply not required for this
+transport. `rust-libp2p` has accordingly been dropped from the stack —
+see tech-stack.md.
 
-## 2. Core networking library: libp2p
+This pattern is proven prior art, not speculative: **Cwtch** (Open Privacy
+Research Society), inspired by **Ricochet**, uses exactly this shape — E2EE
+messaging entirely over Tor v3 onion services, with untrusted relay
+infrastructure for offline delivery — for the same goal of metadata-resistant,
+serverless anonymous messaging.
 
-**libp2p** (`rust-libp2p`) provides, out of the box:
-- Multiplexed streams over a single connection
-- Pluggable transports (TCP, QUIC, WebRTC)
-- `noise` transport security (see crypto-spec.md §4)
-- A Kademlia DHT implementation for discovery
-- NAT traversal helpers (identify protocol, AutoNAT, relay protocol, hole
-  punching / DCUtR)
+## 2. Identity, onion addresses, and invites
 
-Building on libp2p avoids reimplementing NAT traversal and stream
-multiplexing, which are notoriously easy to get subtly wrong.
+- A v3 onion address is itself derived from an Ed25519 public key. Each
+  identity's onion-service key is kept **separate from** the long-term MLS
+  identity signing key (crypto-spec.md §1) — this is a deliberate
+  separation of concerns (network-reachability key vs. cryptographic
+  identity key), not a cost-saving reuse, so that either can be rotated
+  independently without disturbing the other (e.g., rotating the onion
+  address for better unlinkability over time without losing MLS group
+  membership continuity, which is tied to the identity key).
+- **Invite links** encode: the target's current onion address + enough
+  initial key material (an MLS "Welcome" message for joining a group, or
+  the recipient's MLS key package for starting a 1:1 — see crypto-spec.md
+  §2) to bootstrap the cryptographic session without any additional
+  discovery step. There is no DHT and no other discovery mechanism in v1 —
+  onion address + invite is the entire reachability model, matching
+  Cwtch/Ricochet's approach.
+- Onion addresses can be rotated by a user (generating a new onion-service
+  key) as a deliberate unlinkability measure; peers who already hold a
+  contact's MLS identity key learn the new address via an MLS-group-internal
+  "I've moved" message signed by the same long-term identity key, so
+  rotation doesn't require re-establishing trust from scratch.
 
-## 3. Peer discovery
+## 3. Why no DHT / STUN / TURN / hole-punching for messaging
 
-- Each **identity** publishes a record into the **Kademlia DHT**, keyed by a
-  hash of its public key, containing its currently-reachable
-  multiaddresses (updated as connectivity changes).
-- Each **group ("server")** has its own DHT rendezvous key, derived from the
-  group ID, that members use to find each other.
-- **Invite links** encode: the group/peer rendezvous key + enough initial
-  key material (an MLS "Welcome" message, or an X3DH prekey bundle for 1:1)
-  to bootstrap the cryptographic session without any additional
-  handshake round trip against a central server.
+The previous design used a Kademlia DHT for peer discovery and
+STUN/TURN/ICE/DCUtR for NAT traversal, because pure clearnet P2P needs both.
+Onion services make both unnecessary for this traffic:
 
-## 4. Prekey distribution (for X3DH)
+- **Discovery:** solved by invite links (§2) — there's no need for a global
+  or semi-global discovery mechanism in v1, and a clearnet DHT would
+  actively work against the anonymity goal (DHT participation ordinarily
+  means exposing your IP to arbitrary other DHT nodes).
+- **NAT traversal:** solved inherently — an onion service is reachable via
+  the Tor network regardless of the host's NAT/firewall situation, with no
+  port forwarding, STUN, or TURN required. This also sidesteps the
+  platform-specific firewall friction noted in platform-support.md (Windows
+  Defender prompts, Fedora's `firewalld` default-deny) for this traffic,
+  since there's no inbound clearnet port involved at all.
 
-X3DH requires the *responder* to have published prekeys somewhere the
-*initiator* can fetch them even while the responder is offline. Without a
-central server, this means:
-- A peer publishes a signed prekey bundle into the DHT under its own
-  identity key, refreshed periodically and after each use of a one-time
-  prekey.
-- If the peer is unreachable and no DHT record is fresh, the initiator's
-  message queues locally and retries — or is handed to a store-and-forward
-  relay (Phase 5) once that exists.
+This is a meaningful simplification, not just an anonymity win: it removes
+an entire category of NAT-traversal edge cases and platform-specific
+firewall handling from the codebase, directly serving the "efficient [to
+build and maintain], secure" goal alongside the anonymity requirement.
 
-## 5. NAT traversal
+## 4. Offline message delivery
 
-Layered fallback, most-preferred first:
-1. **Direct connection** — both peers have public/reachable addresses.
-2. **Hole punching (DCUtR)** — libp2p's direct connection upgrade through
-   relay, works for most consumer NATs.
-3. **STUN** — address discovery to attempt a direct path even through NAT.
-4. **TURN relay fallback** — when direct connection is impossible (symmetric
-   NAT, restrictive firewalls), traffic is relayed through a TURN-like
-   node. This node sees ciphertext and connection metadata only, never
-   plaintext (transport encryption via Noise is already in place before
-   this hop).
+Unchanged in spirit from the original design, adapted to onion services:
 
-Budget for TURN relay fallback being used far more often in practice than
-naive P2P demos suggest — carrier-grade NAT and corporate firewalls are
-common. This is compounded by OS-level firewall defaults differing across
-target platforms (Windows Defender Firewall prompts, Fedora's `firewalld`
-default-deny inbound policy) — see platform-support.md §"Firewall & inbound
-connections" for why outbound-initiated hole punching is the preferred
-primary path rather than relying on inbound port access.
+- **Phase 1–4:** messages queue locally and send on next successful
+  connection to the recipient's onion service; no offline-to-offline
+  delivery yet.
+- **Phase 5:** **store-and-forward relay nodes** — volunteer-run or
+  self-hosted — each reachable only via its own onion service, hold
+  encrypted, addressed blobs for a bounded time until the recipient's
+  client polls and retrieves them. A relay never sees a real IP (clients
+  reach it only through Tor) and never sees plaintext (crypto-spec.md §6).
 
-## 6. Offline message delivery
+## 5. Circumventing Tor blocking: pluggable transports (bridges)
 
-The one place pure P2P fundamentally struggles: if both peers are offline
-simultaneously, no direct or relayed connection is possible at all.
+Some networks and countries block or throttle Tor itself. Since the
+anonymity guarantee is mandatory rather than optional, SecureText must
+remain usable on such networks from the start, not as a later add-on:
 
-- **Phase 1–4 (MVP through UI):** messages queue locally and send on next
-  successful connection; no offline-to-offline delivery yet. This is an
-  acceptable, explicit limitation for early phases.
-- **Phase 5:** introduce **store-and-forward relay nodes** — volunteer-run
-  or self-hosted — that hold encrypted, addressed blobs for a bounded time
-  (e.g., a rolling 30-day window) until the recipient's client polls and
-  retrieves them. Relays are, by design, blind: they route on an opaque
-  routing ID, not the recipient's identity key, and cannot decrypt the
-  payload (see crypto-spec.md §6 for the residual metadata this still
-  exposes, and why routing IDs should differ from identity keys).
+- **`arti` supports pluggable transports, including obfs4, since v1.1.0**
+  (configured via an external `obfs4proxy` binary, the same mechanism the
+  reference C Tor implementation uses). This is built into Phase 1, not
+  deferred.
+- The client ships with (or can fetch) a set of known public bridge
+  addresses and supports the user adding their own (e.g., obtained via
+  Tor's bridge distribution channels), consistent with how Tor Browser
+  handles bridge configuration.
+- **Open item:** decide the UX for bridge configuration in Phase 1/2 —
+  auto-detect-and-prompt when a direct Tor connection fails, vs. an
+  explicit settings toggle. Not blocking initial architecture work, but
+  should be resolved before Phase 1's exit criteria are finalized.
+
+## 6. Efficiency within the Tor constraint
+
+Mandatory onion routing has an unavoidable latency floor (circuit
+construction and multi-hop relaying are simply slower than a direct or
+lightly-relayed clearnet connection). "Efficient" for SecureText means
+minimizing overhead *within* that constraint, not competing with a
+clearnet service's raw latency:
+
+- **Persistent circuits / connection reuse:** build a Tor circuit to a
+  given contact or server once and reuse it for the session rather than
+  rebuilding per message — circuit construction is the dominant latency
+  cost, not the per-message onion relaying itself.
+- **Stream multiplexing over one circuit:** rather than opening a new
+  onion-service connection per logical stream (e.g., per channel, or a
+  control stream vs. a data stream), multiplex multiple logical streams
+  over a single established connection using a lightweight multiplexer
+  (the `yamux` crate) on top of the Noise-secured stream (crypto-spec.md
+  §4). This avoids paying circuit-build latency repeatedly for what the UI
+  presents as one "connection" to a server.
+- **Efficient serialization:** binary/structured wire formats (not
+  JSON/text) for protocol messages, to minimize bytes sent over
+  already-latency-constrained circuits.
+- **Client resource efficiency:** the Rust + Tauri stack (tech-stack.md)
+  keeps CPU/memory overhead low independent of the network layer, so the
+  Tor latency cost isn't compounded by an inefficient client.
+- This is a genuine, disclosed tradeoff: text messaging over Tor will feel
+  noticeably slower than Discord's direct clearnet connections, especially
+  for the first message in a new session (circuit build time). Set
+  expectations accordingly rather than promising Discord-equivalent
+  responsiveness for text.
 
 ## 7. "Servers" and channels without a server
 
 Mapping Discord's guild/channel/role model onto the group-crypto model from
-crypto-spec.md §3:
+crypto-spec.md §3 — unchanged by the Tor pivot, since this operates at the
+message/group layer, orthogonal to the transport:
 
 - **Server** = one MLS group. Its "existence" is just the set of members who
   hold current key state — there's no single machine that must stay online
-  for the group to persist.
+  for the group to persist, and no server-side onion service required
+  beyond each member's own.
 - **Channels** = key-partitioned sub-scopes within the group, so channel
-  membership can be narrower than server membership (e.g., a private
-  mod-only channel within an otherwise-open server).
+  membership can be narrower than server membership.
 - **Roles & permissions** = signed capability tokens issued by admin
-  key(s) (crypto-spec.md §3) — e.g. "may post," "may kick," "may invite" —
-  checked locally by every client, no central enforcement point.
+  key(s) (crypto-spec.md §3) — checked locally by every client.
 - **Admin key management**: v1 assumes a single admin keypair per server
-  (the creator); multi-admin / admin transfer is a Phase 3–4 design
-  question once the base group model is working, likely via a
-  threshold-signature or simply multiple keys on an ACL.
+  (the creator); multi-admin/transfer is a Phase 3–4 question.
 
 ## 8. Moderation & abuse mitigation
 
-Decentralization weakens centralized-style moderation — plan around it
-rather than pretending it isn't a gap (see threat-model.md's non-goals):
+Unchanged from the original design (decentralization's moderation weakness
+is orthogonal to the transport choice — see threat-model.md's non-goals):
 
-- **Signed ban lists**, distributed within a group, enforced client-side by
-  every member's client.
-- **Local, per-user block lists**, optionally exportable/shareable
-  ("import a trusted blocklist" from someone you trust).
-- **Rate-limiting / lightweight proof-of-work** on message sends to raise
-  the cost of spam floods, since there's no central rate limiter.
-- **Client-side moderation bots**: a bot is just another group member with
-  elevated signed capabilities (e.g., "may kick") — no special server-side
-  hook needed.
+- **Signed ban lists**, distributed within a group, enforced client-side.
+- **Local, per-user block lists**, optionally exportable/shareable.
+- **Rate-limiting / lightweight proof-of-work** on message sends.
+- **Client-side moderation bots**: just another member with elevated
+  signed capabilities.
 
-## 9. Voice & video (Phase 6)
+## 9. Voice & video (Phase 6) — the disclosed exception
 
-- **WebRTC** for media transport — handles SRTP media encryption, NAT
-  traversal (it uses the same STUN/TURN/ICE machinery as §5), and is the
-  de facto standard so we're not reinventing real-time media handling.
-  Layer SecureText's own key exchange (from the MLS/Double-Ratchet session
-  already established for the channel/DM) on top to get E2EE guarantees
-  WebRTC's default (DTLS-SRTP) doesn't fully provide when a call is
-  server-relayed elsewhere.
+Per the explicit design decision (see threat-model.md's disclosed
+exception): calls use a **separate, faster path than text messaging**,
+trading some anonymity for usable call quality, rather than routing
+real-time media over Tor.
 
-## 10. Optional anonymity transport (Phase 9)
-
-- Opt-in "Paranoid Mode": route P2P traffic over **Tor** (as a hidden/onion
-  service per peer) or a purpose-built onion-routing overlay, trading
-  latency for IP-level unlinkability.
-- This is additive to, not a replacement for, the E2EE guarantees above —
-  see threat-model.md's confidentiality-vs-anonymity split for why it's a
-  toggle rather than mandatory.
+- **WebRTC** for media transport (SRTP), using STUN/TURN/ICE for NAT
+  traversal — this reintroduces, *for calls only*, the NAT-traversal
+  machinery that §3 otherwise eliminates for messaging.
+- **Mitigation to preserve as much anonymity as practical:** default to a
+  **forced-relay mode** (media always routed through a TURN-style relay
+  rather than attempting a direct peer connection), so participants don't
+  learn each other's raw IP directly — the relay operator can see both
+  IPs, which is the accepted exposure for this feature, but the other call
+  participant does not. This mirrors how mainstream E2EE calling apps
+  (e.g., Signal's "always relay calls" setting) handle the same tradeoff.
+- **Call signaling** (who is being called, ringing, accept/decline) still
+  goes over the Tor-routed MLS channel like any other message — only the
+  real-time media stream itself uses the separate path, once a call is
+  accepted.
+- Call content itself remains E2EE: layer SecureText's own MLS-derived key
+  material on top of WebRTC's DTLS-SRTP rather than relying solely on
+  WebRTC's default, which doesn't guarantee confidentiality end-to-end when
+  media is server-relayed.
+- **UI requirement:** the calling UI must disclose that starting a call
+  uses a faster, non-anonymous connection, so users don't assume the
+  always-on text anonymity guarantee extends to calls (threat-model.md).
+- This design is a placeholder for Phase 6 — the exact mechanism should be
+  re-validated against threat-model.md's disclosed-exception language once
+  Phase 6 actually starts.

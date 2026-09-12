@@ -1,9 +1,14 @@
 # SecureText
 
-A peer-to-peer, end-to-end encrypted messaging application — Discord-like in
-UX (servers, channels, roles, voice), decentralized in architecture (no
-central account database, no server that can read or be compelled to hand
-over message content).
+An anonymous, end-to-end encrypted messaging application — Discord-like in
+UX (servers, channels, roles, voice), decentralized and anonymous in
+architecture: no central account database, no server that can read or be
+compelled to hand over message content, and no way to trace a message back
+to a device or IP address. All text/group/file traffic is mandatorily
+routed over Tor v3 onion services; messages are readable only by the
+sender and the intended recipient(s) via end-to-end encryption (MLS,
+RFC 9420). Voice/video calls are the one explicit, disclosed exception to
+the anonymity guarantee — see [docs/threat-model.md](docs/threat-model.md).
 
 This repository currently holds **Phase 0** deliverables only: the threat
 model, cryptographic design, network architecture, and technology stack

@@ -20,36 +20,45 @@ default picked is the more conservative, more widely-reviewed option.
 - v1 assumption: **one identity == one device.** Multi-device is deferred to
   Phase 7 (see threat-model.md — it changes the trust model).
 
-## 2. One-to-one messaging: X3DH + Double Ratchet
+## 2. Resolved: one crypto stack for everything — MLS, including 1:1
 
-Adopt the Signal protocol design directly (do not reimplement from the
-paper — use an existing library):
+**Decision (finalized):** rather than running two separate cryptographic
+stacks — X3DH + Double Ratchet for 1:1, MLS for groups — SecureText uses
+**MLS (RFC 9420) for both**, treating a 1:1 conversation as a 2-member MLS
+group. This was decided after evaluating libsignal and every viable
+alternative (see the research trail: libsignal is AGPL-3.0-licensed and its
+own README states "use outside of Signal is unsupported" with no API
+stability guarantee; Ockam's X3DH crate is abandoned inside its own
+now-current codebase; `double-ratchet-2` is an unmaintained, unaudited
+solo project; `vodozemac` has an unresolved high-severity disclosure as of
+Feb 2026; `p2panda-encryption` is purpose-built for this exact use case but
+pre-1.0 and not yet stable). Every option either fails on license, fails on
+maintenance/audit status, or both — while OpenMLS (already required for
+groups) is standardized, actively maintained, and eliminates a second
+dependency and a second audit surface entirely.
 
-- **X3DH (Extended Triple Diffie-Hellman)** for the initial asynchronous key
-  agreement, so two peers can establish a shared secret even if one is
-  offline when the "session request" is sent (requires the initiating peer
-  to have fetched the recipient's prekey bundle in advance — see
-  architecture.md §4 for how prekeys are distributed without a central
-  server).
-- **Double Ratchet** for the ongoing session: every message advances a
-  symmetric-key ratchet (forward secrecy — a compromised key can't decrypt
-  past messages) and periodically advances a Diffie-Hellman ratchet
-  (post-compromise security — the session heals after a compromise).
+- **Why this is safe to do:** MLS's TreeKEM construction degrades cleanly to
+  a 2-party case; it still provides forward secrecy and post-compromise
+  security via the same Commit/epoch mechanism used for larger groups.
+- **Known tradeoff to validate in Phase 1:** MLS's per-message ratchet is
+  not as narrowly optimized for rapid-fire 1:1 exchange as a dedicated
+  Double Ratchet (Commits are somewhat heavier than a pure symmetric-ratchet
+  step). Phase 1 must include a latency/throughput benchmark of 2-member
+  MLS groups under realistic chat-speed message rates over the actual Tor
+  transport (architecture.md §1) before this is considered fully settled —
+  if it's a real problem in practice, the fallback is a from-spec Double
+  Ratchet implementation reviewed in the Phase 8 audit (using Wire's
+  Proteus as prior-art reference, not as a dependency, since it's
+  GPL-3.0-licensed), not adopting any of the rejected options above.
 - **AEAD:** ChaCha20-Poly1305 for message encryption (fast, constant-time,
-  no hardware-AES dependency for cross-platform consistency); AES-256-GCM
-  is an acceptable alternative if a chosen library standardizes on it.
-
-**Library:** `libsignal` (Signal's own Rust/C++ implementation, if its
-license and API fit) or a from-spec Rust crate implementing X3DH + Double
-Ratchet with a maintained audit history. This is decided in
-tech-stack.md — the point here is: **use a library, not a paper.**
+  no hardware-AES dependency for cross-platform consistency).
 
 ## 3. Group messaging ("servers" & channels): MLS
 
-Double Ratchet doesn't scale to groups efficiently (pairwise ratchets =
-O(n²) key management). Use **MLS — Messaging Layer Security, RFC 9420** —
-the modern IETF standard for group E2EE, already adopted by Matrix/Element,
-Wire, Google Messages (RCS), and Cisco Webex:
+Use **MLS — Messaging Layer Security, RFC 9420** — the modern IETF standard
+for group E2EE, already adopted by Matrix/Element, Wire, Google Messages
+(RCS), and Cisco Webex, and now used uniformly for both 1:1 and group
+conversations in SecureText (§2 above):
 
 - Each **"server"** in the Discord-like UI maps to one MLS group.
 - Each **channel** within a server maps to a sub-tree/partitioned key
@@ -74,15 +83,19 @@ derivation, commit ordering, welcome messages for new members).
 
 ## 4. Transport-layer encryption (defense in depth)
 
-Independent of the message-layer E2EE above, the peer-to-peer transport
-itself is encrypted:
+Independent of the message-layer E2EE above, and independent of Tor's own
+onion-layer encryption (architecture.md §1), the stream between two peers
+gets an additional authenticated encryption layer:
 
-- **Noise Protocol Framework** (via libp2p's built-in `noise` transport
-  security) for the encrypted channel between directly-connected peers.
-- This means even metadata like "which libp2p stream protocol is being
-  negotiated" isn't visible to a passive network observer — though it
-  doesn't hide *that* two IPs are talking to each other (that's the
-  anonymity-layer's job, see threat-model.md).
+- **Noise Protocol Framework** (via the `snow` crate) runs immediately once
+  an onion-service stream is established, authenticating the specific
+  peer's long-term identity key (not just "some onion service responded")
+  and adding a layer of encryption that doesn't depend on trusting Tor's
+  own transport crypto exclusively.
+- This is defense-in-depth, not the anonymity mechanism — anonymity (hiding
+  *that* two identities are communicating at all, and both parties' real
+  IPs) is provided entirely by routing the connection over Tor v3 onion
+  services in the first place (architecture.md §1), not by this layer.
 
 ## 5. At-rest encryption
 
@@ -100,17 +113,20 @@ itself is encrypted:
 ## 6. What is explicitly NOT encrypted (and must be minimized)
 
 Being upfront about residual metadata is part of not overpromising
-(threat-model.md's confidentiality/anonymity split applies here too):
+(threat-model.md's confidentiality-and-anonymity section applies here too):
 
-- Packet timing and size are visible to network-level observers unless the
-  optional anonymity transport (Tor/onion routing, Phase 9) is enabled —
-  padding/timing obfuscation is a possible later hardening, not a v1
-  commitment.
+- Packet timing and size are still observable to *someone on the Tor
+  circuit path* even though Tor hides the endpoints from each other and
+  from outside observers — padding/timing obfuscation beyond what Tor
+  itself provides is possible later hardening, not a v1 commitment.
 - A relay node handling store-and-forward delivery (Phase 5) sees *that* a
   blob addressed to routing-ID Y exists and roughly when it was
-  deposited/collected, even though it cannot read the blob. Routing IDs
-  should be distinct from long-term identity keys and ideally rotated to
-  limit correlation.
+  deposited/collected, even though it cannot read the blob and never learns
+  the depositing/collecting peer's real IP (it's reached only via its own
+  onion service). Routing IDs should be distinct from long-term identity
+  keys and ideally rotated to limit correlation.
+- Voice/video calls (Phase 6) are the one feature where IP-level exposure
+  is accepted by design — see threat-model.md's disclosed exception.
 
 ## 7. Primitive summary
 
@@ -118,11 +134,11 @@ Being upfront about residual metadata is part of not overpromising
 |---|---|
 | Signing | Ed25519 |
 | Key agreement | X25519 |
-| 1:1 session establishment | X3DH |
-| 1:1 ongoing session | Double Ratchet |
+| 1:1 session | MLS (RFC 9420) via OpenMLS, as a 2-member group |
 | Group session | MLS (RFC 9420) via OpenMLS |
 | Symmetric AEAD | ChaCha20-Poly1305 |
-| Transport security | Noise Protocol Framework |
+| Transport-layer defense in depth | Noise Protocol Framework (`snow`) |
+| Network-level anonymity | Tor v3 onion services (`arti`) — architecture.md §1 |
 | Password/passphrase KDF | Argon2id |
 | Local storage encryption | SQLCipher (AES-256) |
 
