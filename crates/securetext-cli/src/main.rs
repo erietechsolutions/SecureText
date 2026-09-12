@@ -30,6 +30,10 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("demo") => run_demo().await,
+        Some("bench") => {
+            let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+            run_bench(n).await
+        }
         Some("net-listen") => run_net_listen().await,
         Some("net-dial") => {
             let address = args.get(2).cloned().ok_or_else(|| {
@@ -42,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
             run_net_dial(&address, &expected_noise_pubkey).await
         }
         _ => {
-            eprintln!("usage: securetext demo");
+            eprintln!("usage: securetext demo | bench [N]");
             eprintln!("  Runs the Phase 1 proof: two local identities exchange an MLS-encrypted,");
             eprintln!("  Noise-wrapped message over real Tor v3 onion services, in one process.");
             eprintln!();
@@ -257,6 +261,99 @@ async fn run_demo() -> anyhow::Result<()> {
 
     bob_task.await??;
     println!("[done] Phase 1 proof complete: identity + MLS + Noise + Tor onion services, end to end.");
+    Ok(())
+}
+
+/// Resolves tech-stack.md's open item #1: measure the *combined*
+/// real-world per-message latency of MLS + Noise + a live Tor circuit,
+/// once the connection is already established -- not connection setup
+/// time, which is dominated by Tor circuit/onion-service bootstrap and
+/// isn't representative of ongoing chat-speed messaging cost.
+async fn run_bench(n: usize) -> anyhow::Result<()> {
+    let work_dir = tempfile::tempdir()?;
+    println!("[bench] setting up identities, MLS group, and a live Tor connection ({n} round trips after setup)...");
+
+    let (alice_store, alice_public) =
+        IdentityStore::create(&work_dir.path().join("alice.enc"), "alice", "bench passphrase")?;
+    let (bob_store, bob_public) =
+        IdentityStore::create(&work_dir.path().join("bob.enc"), "bob", "bench passphrase")?;
+    let alice_signer = alice_store.signing_key_pair(&alice_public)?.expect("alice key pair");
+    let bob_signer = bob_store.signing_key_pair(&bob_public)?.expect("bob key pair");
+    let alice_noise_private = alice_store.noise_static_private_key()?;
+    let bob_noise_private = bob_store.noise_static_private_key()?;
+
+    let alice = Member::new("alice", alice_signer);
+    let bob = Member::new("bob", bob_signer);
+    let mut alice_group = alice.create_group()?;
+    let bob_key_package = bob.key_package_bytes()?;
+    let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
+
+    let bob_tor: Client = bootstrap_for_this_run().await?;
+    let mut bob_listener = Listener::launch(&bob_tor, "securetext-bench-bob")?;
+    let bob_address = bob_listener.onion_address()?;
+    let alice_tor: Client = bootstrap_for_this_run().await?;
+
+    let bob_task: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        let mut stream = bob_listener
+            .accept_next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("listener closed with no connection"))?;
+        let (mut noise, _alice_noise_key) =
+            securetext_net::handshake_responder(&mut stream, &bob_noise_private).await?;
+
+        let welcome_bytes = read_framed(&mut stream, &mut noise).await?;
+        let mut bob_group = bob.join_from_welcome(&welcome_bytes)?;
+
+        for _ in 0..n {
+            let ciphertext = read_framed(&mut stream, &mut noise).await?;
+            bob.decrypt(&mut bob_group, &ciphertext)?
+                .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+            let ack = bob.encrypt(&mut bob_group, b"ack")?;
+            write_framed(&mut stream, &mut noise, &ack).await?;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        Ok(())
+    });
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    let mut stream = securetext_net::dial(&alice_tor, &bob_address, 1).await?;
+    let (mut noise, bob_noise_key) =
+        securetext_net::handshake_initiator(&mut stream, &alice_noise_private).await?;
+    anyhow::ensure!(bob_noise_key == bob_public.noise_public_key, "bob's noise key mismatch");
+
+    write_framed(&mut stream, &mut noise, &welcome_bytes).await?;
+    println!("[bench] connection established (identity + MLS + Noise + Tor); starting timed round trips...");
+
+    let mut durations = Vec::with_capacity(n);
+    for i in 0..n {
+        let msg = format!("bench message {i}");
+        let start = std::time::Instant::now();
+        let ciphertext = alice.encrypt(&mut alice_group, msg.as_bytes())?;
+        write_framed(&mut stream, &mut noise, &ciphertext).await?;
+        let ack_ciphertext = read_framed(&mut stream, &mut noise).await?;
+        alice
+            .decrypt(&mut alice_group, &ack_ciphertext)?
+            .ok_or_else(|| anyhow::anyhow!("expected an ack"))?;
+        durations.push(start.elapsed());
+    }
+
+    bob_task.await??;
+
+    durations.sort();
+    let total: std::time::Duration = durations.iter().sum();
+    let avg = total / n as u32;
+    let min = durations.first().copied().unwrap_or_default();
+    let max = durations.last().copied().unwrap_or_default();
+    let p50 = durations[durations.len() / 2];
+    println!(
+        "[bench] {n} MLS+Noise round trips over an established Tor circuit: \
+         min={min:?} p50={p50:?} avg={avg:?} max={max:?}"
+    );
+    println!(
+        "[bench] (excludes one-time connection setup: identity/MLS group creation, \
+         two Tor bootstraps, and the Noise handshake -- this is steady-state chat-speed cost)"
+    );
     Ok(())
 }
 

@@ -161,11 +161,24 @@ rather than guessed in advance:
 
 ## Open items to resolve before Phase 1 is considered complete
 
-1. **End-to-end Tor-circuit latency for MLS-as-1:1 messaging** — now that
-   both pieces work independently (MLS round-trip: ~5.7ms/message locally;
-   Tor onion-service round trip: verified working), measure the *combined*
-   real-world latency of an MLS-encrypted message sent over an actual Tor
-   circuit, not each piece in isolation.
+1. ~~**End-to-end Tor-circuit latency for MLS-as-1:1 messaging**~~ —
+   **measured** (`securetext bench [N]`, `crates/securetext-cli`): 20
+   MLS+Noise-encrypted round trips over one already-established Tor
+   circuit (i.e. excluding the one-time connection setup: two Tor
+   bootstraps, onion-service launch, and the Noise handshake) came in at
+   min=2.23s, p50=3.09s, avg=3.46s, max=6.32s in this dev environment.
+   MLS's own overhead is negligible (~5.7ms/message locally, per the
+   finding above) — this multi-second cost is essentially all Tor circuit
+   latency, consistent with architecture.md §6's disclosed tradeoff
+   ("text messaging over Tor will feel noticeably slower than Discord").
+   **Verdict:** usable for text chat (a few seconds per message is
+   tolerable, unlike for calls — architecture.md §9's separate path
+   remains the right call there), but confirms this is a real, now-
+   quantified cost rather than a hypothetical one. Numbers will vary by
+   network conditions and should be re-measured periodically, not treated
+   as a permanent constant; worth re-running once yamux multiplexing
+   (open item #6) lands, since reusing one circuit for multiple logical
+   streams may change steady-state behavior.
 2. **SQLCipher / row-level at-rest encryption for the MLS+identity store**
    — see the finding above; either patch `openmls_sqlite_storage` to accept
    an externally-configured (SQLCipher) connection, or align dependency

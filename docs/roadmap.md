@@ -59,9 +59,11 @@ this is a security-sensitive project where shortcuts compound.
       (tech-stack.md open item #6)
 - [ ] MLS group state persistence across restarts (currently in-memory
       only — tech-stack.md open item #5)
-- [ ] End-to-end latency benchmark combining MLS + a real Tor circuit
-      (tech-stack.md open item #1) — each piece is verified independently,
-      not yet measured together under realistic chat-speed conditions
+- [x] End-to-end latency benchmark combining MLS + a real Tor circuit
+      (`securetext bench`), **measured**: 20 round trips over one
+      established circuit came in at p50=3.09s, avg=3.46s (tech-stack.md
+      open item #1) — usable for text chat, consistent with the disclosed
+      "slower than Discord" tradeoff in architecture.md §6, not a surprise
 - [ ] Manual address exchange only — invite links come in Phase 2
 - **Exit criteria:** two instances on different machines exchange E2EE
   messages entirely over Tor, with no direct IP exchange at any point
