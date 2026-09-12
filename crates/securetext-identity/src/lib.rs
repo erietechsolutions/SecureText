@@ -95,6 +95,24 @@ impl PublicIdentity {
     }
 }
 
+/// How to currently reach a peer this identity has an established
+/// relationship with (e.g. a shared MLS group) -- kept separate from the
+/// group's own state because it can change independently: architecture.md
+/// §2 describes rotating an onion address/Noise key for unlinkability
+/// without losing group membership continuity, which means "how do I
+/// currently reach this peer" has to be an updatable record, not baked
+/// into the invite that first established the relationship.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Contact {
+    /// The peer's long-term MLS identity public key -- stable across
+    /// address/Noise-key rotation, so this is the lookup key for "this is
+    /// still the same person, just reachable differently now."
+    pub peer_mls_public_key: Vec<u8>,
+    pub peer_label: String,
+    pub onion_address: String,
+    pub noise_public_key: Vec<u8>,
+}
+
 /// An open, decrypted identity store backed by a temporary plaintext SQLite
 /// file. Holds the Argon2id-derived symmetric key for the session so
 /// `seal()` can be called repeatedly without re-prompting for a passphrase.
@@ -267,6 +285,28 @@ impl IdentityStore {
         Ok(row.get(0)?)
     }
 
+    /// Rotate this identity's Noise static keypair (architecture.md §2's
+    /// unlinkability rotation), replacing it for all future connections.
+    /// Callers must also launch a new onion service and tell existing
+    /// contacts about both the new address and this new key -- typically
+    /// via an `AppMessage::Moved` sent through each existing MLS group
+    /// (crypto-spec.md/`securetext-crypto`) -- since rotating only one of
+    /// the two would weaken the unlinkability this exists to provide.
+    /// Reseals the store to disk before returning; callers don't need to
+    /// call `seal()` separately for this specific change.
+    pub fn rotate_noise_key(&mut self) -> Result<Vec<u8>, IdentityError> {
+        let new_keypair = snow::Builder::new(NOISE_PATTERN.parse().expect("valid noise pattern"))
+            .generate_keypair()
+            .map_err(|e| IdentityError::Kdf(format!("noise keygen: {e:?}")))?;
+        write_noise_keys(&self.connection, &new_keypair.public, &new_keypair.private)?;
+        self.connection.execute(
+            "UPDATE securetext_identity_meta SET noise_public_key = ?1 WHERE id = 0",
+            rusqlite::params![new_keypair.public],
+        )?;
+        self.seal()?;
+        Ok(new_keypair.public)
+    }
+
     /// Path to the decrypted, plaintext-for-this-session SQLite file
     /// backing this identity's tables (signature keys, Noise keys, our own
     /// metadata). Intended for `securetext-crypto`'s `PersistentProvider`
@@ -281,6 +321,63 @@ impl IdentityStore {
     pub fn db_path(&self) -> &Path {
         &self.tmp_db_path
     }
+
+    /// Record or update how to reach a contact, keyed by their stable MLS
+    /// identity public key. Call this when processing a `Moved` message
+    /// (architecture.md §2) so future connection attempts use the
+    /// contact's current onion address/Noise key instead of a stale one.
+    pub fn upsert_contact(&self, contact: &Contact) -> Result<(), IdentityError> {
+        create_contacts_table(&self.connection)?;
+        self.connection.execute(
+            "INSERT INTO securetext_contacts (peer_mls_public_key, peer_label, onion_address, noise_public_key)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(peer_mls_public_key) DO UPDATE SET
+                peer_label = excluded.peer_label,
+                onion_address = excluded.onion_address,
+                noise_public_key = excluded.noise_public_key",
+            rusqlite::params![
+                contact.peer_mls_public_key,
+                contact.peer_label,
+                contact.onion_address,
+                contact.noise_public_key
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up how to currently reach a contact by their stable MLS
+    /// identity public key. Returns `None` if this identity has no
+    /// contact record for that peer yet.
+    pub fn get_contact(&self, peer_mls_public_key: &[u8]) -> Result<Option<Contact>, IdentityError> {
+        create_contacts_table(&self.connection)?;
+        let mut stmt = self.connection.prepare(
+            "SELECT peer_mls_public_key, peer_label, onion_address, noise_public_key
+             FROM securetext_contacts WHERE peer_mls_public_key = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![peer_mls_public_key])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Contact {
+                peer_mls_public_key: row.get(0)?,
+                peer_label: row.get(1)?,
+                onion_address: row.get(2)?,
+                noise_public_key: row.get(3)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn create_contacts_table(connection: &Connection) -> Result<(), IdentityError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS securetext_contacts (
+            peer_mls_public_key BLOB PRIMARY KEY,
+            peer_label TEXT NOT NULL,
+            onion_address TEXT NOT NULL,
+            noise_public_key BLOB NOT NULL
+        );",
+    )?;
+    Ok(())
 }
 
 impl Drop for IdentityStore {
@@ -425,6 +522,65 @@ mod tests {
             reopened.noise_static_private_key().expect("noise private key"),
             noise_private,
             "noise static key survives seal/reopen"
+        );
+    }
+
+    #[test]
+    fn contacts_can_be_recorded_and_updated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let enc_path = dir.path().join("identity.enc");
+        let (store, _public) = IdentityStore::create(&enc_path, "alice", "pw").expect("create");
+
+        let peer_key = vec![1, 2, 3, 4];
+        assert_eq!(store.get_contact(&peer_key).expect("lookup"), None);
+
+        store
+            .upsert_contact(&Contact {
+                peer_mls_public_key: peer_key.clone(),
+                peer_label: "bob".to_string(),
+                onion_address: "old-address.onion".to_string(),
+                noise_public_key: vec![9, 9, 9],
+            })
+            .expect("insert contact");
+        let found = store.get_contact(&peer_key).expect("lookup").expect("present");
+        assert_eq!(found.onion_address, "old-address.onion");
+
+        // Simulate processing a Moved message: same peer, new reachability.
+        store
+            .upsert_contact(&Contact {
+                peer_mls_public_key: peer_key.clone(),
+                peer_label: "bob".to_string(),
+                onion_address: "new-address.onion".to_string(),
+                noise_public_key: vec![7, 7, 7],
+            })
+            .expect("update contact");
+        let updated = store.get_contact(&peer_key).expect("lookup").expect("present");
+        assert_eq!(updated.onion_address, "new-address.onion");
+        assert_eq!(updated.noise_public_key, vec![7, 7, 7]);
+    }
+
+    #[test]
+    fn rotate_noise_key_replaces_it_and_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let enc_path = dir.path().join("identity.enc");
+        let (mut store, original_public) = IdentityStore::create(&enc_path, "alice", "pw").expect("create");
+        let original_noise_key = original_public.noise_public_key.clone();
+
+        let rotated_public_key = store.rotate_noise_key().expect("rotate");
+        assert_ne!(rotated_public_key, original_noise_key);
+        assert_eq!(rotated_public_key.len(), 32);
+
+        let rotated_private = store.noise_static_private_key().expect("private key after rotate");
+        assert_eq!(rotated_private.len(), 32);
+        drop(store);
+
+        // Reopen and confirm the rotation survived a full close/reopen,
+        // and that PublicIdentity's copy of the key was updated too.
+        let (reopened, reopened_public) = IdentityStore::open(&enc_path, "pw").expect("reopen");
+        assert_eq!(reopened_public.noise_public_key, rotated_public_key);
+        assert_eq!(
+            reopened.noise_static_private_key().expect("private key after reopen"),
+            rotated_private
         );
     }
 

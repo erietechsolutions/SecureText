@@ -101,7 +101,7 @@ this is a security-sensitive project where shortcuts compound.
     exit criterion as met. This is the one piece of Phase 1 that
     genuinely requires hardware/an OS this environment doesn't have.
 
-## Phase 2 — Invite Links & Bridges *(in progress)*
+## Phase 2 — Invite Links & Bridges *(feature-complete on Linux; obfs4 live-connection verification pending, same category as Phase 1's Windows gap)*
 - [x] Invite-link format encoding onion address + Noise static key + MLS
       key package (architecture.md §2) as a single shareable
       `securetext1:<base64>` string, replacing `net-listen`/`net-dial`'s
@@ -120,8 +120,33 @@ this is a security-sensitive project where shortcuts compound.
       onion address stays stable across restarts and a previously-printed
       invite link keeps working later, not just within one process's
       lifetime.
-- [ ] Onion-address rotation + "I've moved" re-linking within existing MLS
-      groups (architecture.md §2)
+- [x] Onion-address rotation + "I've moved" re-linking within existing MLS
+      groups (architecture.md §2). `securetext rotate-demo` has alice host
+      a group, exchange an initial message with bob, then rotate *both*
+      her onion address and Noise static key together (rotating only one
+      weakens the unlinkability rotation exists to provide), and notify
+      bob via an `AppMessage::Moved` sent through their still-open
+      MLS-encrypted connection -- not a fresh invite. Bob updates his
+      stored contact record (new `Contact`/`upsert_contact`/`get_contact`
+      in `securetext-identity`) and reconnects at alice's new address,
+      with the Noise handshake verifying her rotated key matches what the
+      Moved message promised before trusting the new connection.
+      **Verification status:** one complete, fully successful live run
+      against the real Tor network confirmed the entire mechanism end to
+      end; two real bugs surfaced and were fixed from repeated live
+      testing (a `tempfile::TempDir::keep()` leak in `bootstrap_for_this_run`
+      that silently accumulated ~40MB per demo/bench/rotate-demo run with
+      no cleanup -- found when it filled this sandbox's tmpfs and caused
+      unrelated test failures; and a missing descriptor-propagation delay
+      before dialing the *second* rotated address, which v1's dial had but
+      v2's didn't). After both fixes, later live attempts were affected by
+      what appears to be degraded Tor connectivity in this sandbox at the
+      time (even a bare first dial, reliable all session, began taking
+      many minutes) rather than a further code issue -- see tech-stack.md's
+      implementation findings for the full account. The underlying
+      persistence primitives (`Contact` storage, `rotate_noise_key`) are
+      covered by fast, fully deterministic unit tests that always pass,
+      independent of live network conditions.
 - [x] Pluggable transport (obfs4) support via `arti`
       (`securetext_net::bootstrap_with_bridge` / `BridgeConfig`) — **config
       plumbing done and locally tested, live bridge connection not

@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
             run_bench(n).await
         }
         Some("restart-demo") => run_restart_demo().await,
+        Some("rotate-demo") => run_rotate_demo().await,
         Some("net-listen") => run_net_listen().await,
         Some("net-dial") => {
             let address = args.get(2).cloned().ok_or_else(|| {
@@ -122,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
             run_connect(&link, std::path::Path::new(&dir), &label, &passphrase).await
         }
         _ => {
-            eprintln!("usage: securetext demo | bench [N] | restart-demo");
+            eprintln!("usage: securetext demo | bench [N] | restart-demo | rotate-demo");
             eprintln!("  Runs the Phase 1 proof: two local identities exchange an MLS-encrypted,");
             eprintln!("  Noise-wrapped message over real Tor v3 onion services, in one process.");
             eprintln!();
@@ -150,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
 /// (address + key) before it ever connects.
 async fn run_net_listen() -> anyhow::Result<()> {
     println!("[listen] bootstrapping this process's own Tor client...");
-    let tor = bootstrap_for_this_run().await?;
+    let (tor, _tor_scratch) = bootstrap_for_this_run().await?;
     let mut listener = Listener::launch(&tor, "securetext-net-listen")?;
     let address = listener.onion_address()?;
 
@@ -214,7 +215,7 @@ async fn run_net_listen() -> anyhow::Result<()> {
 /// gives us (crypto-spec.md §4), not just "some onion service answered."
 async fn run_net_dial(address: &str, expected_noise_pubkey: &[u8]) -> anyhow::Result<()> {
     println!("[dial] bootstrapping this process's own Tor client...");
-    let tor = bootstrap_for_this_run().await?;
+    let (tor, _tor_scratch) = bootstrap_for_this_run().await?;
     println!("[dial] dialing {address}...");
     let mut stream = securetext_net::dial(&tor, address, 1).await?;
     println!("[dial] connected over the onion service (never learned the listener's IP)");
@@ -403,13 +404,13 @@ async fn run_demo() -> anyhow::Result<()> {
     println!("[setup] alice created a 2-member MLS group and added bob (locally, not sent yet; persisted to disk)");
 
     println!("[tor] bootstrapping bob's Tor client (listener side) — this talks to the real Tor network...");
-    let bob_tor: Client = bootstrap_for_this_run().await?;
+    let (bob_tor, _bob_tor_scratch): (Client, _) = bootstrap_for_this_run().await?;
     let mut bob_listener = Listener::launch(&bob_tor, "securetext-demo-bob")?;
     let bob_address = bob_listener.onion_address()?;
     println!("[tor] bob is listening on {bob_address}");
 
     println!("[tor] bootstrapping alice's Tor client (dialer side)...");
-    let alice_tor: Client = bootstrap_for_this_run().await?;
+    let (alice_tor, _alice_tor_scratch): (Client, _) = bootstrap_for_this_run().await?;
 
     let expected_alice_noise_key = alice_public.noise_public_key.clone();
     let bob_task: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
@@ -616,6 +617,207 @@ async fn run_restart_demo() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Phase 2's last item: onion-address rotation + "I've moved" re-linking
+/// (architecture.md §2). Alice hosts (bob dials), they exchange messages,
+/// then alice rotates her onion address *and* Noise static key together
+/// (rotating only one would weaken the unlinkability this exists to
+/// provide) and tells bob via an `AppMessage::Moved` sent through their
+/// still-open MLS-encrypted connection -- not a fresh invite. Bob updates
+/// his contact record for alice and successfully reconnects at her new
+/// address, proving the full rotate-notify-reconnect flow live over Tor.
+async fn run_rotate_demo() -> anyhow::Result<()> {
+    let work_dir = tempfile::tempdir()?;
+    println!("[rotate-demo] setting up identities and an MLS group...");
+
+    let (mut alice_store, alice_public) =
+        IdentityStore::create(&work_dir.path().join("alice.enc"), "alice", "rotate demo passphrase")?;
+    let (bob_store, bob_public) =
+        IdentityStore::create(&work_dir.path().join("bob.enc"), "bob", "rotate demo passphrase")?;
+    let alice_signer = alice_store.signing_key_pair(&alice_public)?.expect("alice key pair");
+    let bob_signer = bob_store.signing_key_pair(&bob_public)?.expect("bob key pair");
+    let alice_mls_public_key = alice_public.public_key.clone();
+
+    let alice = Member::new("alice", alice_signer, mls_provider_for(&alice_store)?);
+    let bob = Member::new("bob", bob_signer, mls_provider_for(&bob_store)?);
+    let mut alice_group = alice.create_group()?;
+    let bob_key_package = bob.key_package_bytes()?;
+    let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
+    // Both "sides" of this one process already have the plain welcome_bytes
+    // value in memory (this demo is about rotation, not re-proving Welcome
+    // delivery, which `demo` already covers over a real network) -- bob
+    // just joins directly, no network round trip needed for this step.
+    let mut bob_group = bob.join_from_welcome(&welcome_bytes)?;
+
+    let (alice_tor, alice_tor_scratch): (Client, _) = bootstrap_for_this_run().await?;
+    let (bob_tor, _bob_tor_scratch): (Client, _) = bootstrap_for_this_run().await?;
+
+    let alice_noise_private_v1 = alice_store.noise_static_private_key()?;
+    let alice_noise_public_v1 = alice_public.noise_public_key.clone();
+
+    let mut listener_v1 = Listener::launch(&alice_tor, "securetext-rotate-v1")?;
+    let address_v1 = listener_v1.onion_address()?;
+    println!("[alice] listening at v1 address: {address_v1}");
+
+    let alice_task: tokio::task::JoinHandle<anyhow::Result<(String, Vec<u8>)>> = tokio::spawn(async move {
+        // Keep the scratch dir alive for as long as alice_tor (and thus
+        // listener_v1/v2) are in use in this task -- see
+        // bootstrap_for_this_run's doc comment on why this must not be
+        // leaked via `.keep()`.
+        let _alice_tor_scratch = alice_tor_scratch;
+        // --- First connection: initial exchange, then tell bob we're moving. ---
+        let mut stream = listener_v1
+            .accept_next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("bob never connected to v1"))?;
+        let (noise, _bob_noise_key) =
+            securetext_net::handshake_responder(&mut stream, &alice_noise_private_v1).await?;
+        let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Server);
+        let mut chat_stream = mux.accept().await.ok_or_else(|| anyhow::anyhow!("no chat stream"))?;
+
+        let ciphertext = read_framed(&mut chat_stream).await?;
+        let plaintext = alice
+            .decrypt(&mut alice_group, &ciphertext)?
+            .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+        println!("[alice] received: {:?}", String::from_utf8_lossy(&plaintext));
+
+        // --- Rotate: new onion address, new Noise key, together. ---
+        let mut listener_v2 = Listener::launch(&alice_tor, "securetext-rotate-v2")?;
+        let address_v2 = listener_v2.onion_address()?;
+        let new_noise_public_key = alice_store.rotate_noise_key()?;
+        let new_noise_private_key = alice_store.noise_static_private_key()?;
+        println!("[alice] rotated: new address {address_v2}, new noise key {}", to_hex(&new_noise_public_key));
+
+        let moved = securetext_crypto::AppMessage::Moved {
+            new_onion_address: address_v2.clone(),
+            new_noise_public_key: new_noise_public_key.clone(),
+        };
+        let moved_ciphertext = alice.encrypt(&mut alice_group, &moved.to_bytes())?;
+        write_framed(&mut chat_stream, &moved_ciphertext).await?;
+        println!("[alice] sent an 'I've moved' message over the still-open v1 connection");
+
+        drop(chat_stream);
+        mux.close().await?;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // --- Second connection: bob reconnects at the new address. ---
+        println!("[alice] waiting for bob to reconnect at the new address...");
+        let mut stream = listener_v2
+            .accept_next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("bob never reconnected at v2"))?;
+        let (noise, _bob_noise_key) =
+            securetext_net::handshake_responder(&mut stream, &new_noise_private_key).await?;
+        let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Server);
+        let mut chat_stream = mux.accept().await.ok_or_else(|| anyhow::anyhow!("no chat stream on v2"))?;
+
+        let ciphertext = read_framed(&mut chat_stream).await?;
+        let plaintext = alice
+            .decrypt(&mut alice_group, &ciphertext)?
+            .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+        println!("[alice] received via new address: {:?}", String::from_utf8_lossy(&plaintext));
+
+        let reply = alice.encrypt(&mut alice_group, b"Reconnected after rotation, all good!")?;
+        write_framed(&mut chat_stream, &reply).await?;
+        drop(chat_stream);
+        mux.close().await?;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        Ok((address_v2, new_noise_public_key))
+    });
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    println!("[bob] dialing alice's v1 address...");
+    let mut stream = securetext_net::dial(&bob_tor, &address_v1, 1).await?;
+    let (noise, alice_noise_key) =
+        securetext_net::handshake_initiator(&mut stream, &bob_store.noise_static_private_key()?).await?;
+    anyhow::ensure!(alice_noise_key == alice_noise_public_v1, "alice's initial noise key mismatch");
+    let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Client);
+    let mut chat_stream = mux.open().await?;
+
+    // Record alice's contact info as observed from this connection -- a
+    // real app would do this for any known group member, not just after
+    // an explicit Moved message.
+    bob_store.upsert_contact(&securetext_identity::Contact {
+        peer_mls_public_key: alice_mls_public_key.clone(),
+        peer_label: "alice".to_string(),
+        onion_address: address_v1.clone(),
+        noise_public_key: alice_noise_public_v1.clone(),
+    })?;
+
+    let ciphertext = bob.encrypt(&mut bob_group, b"Hello Alice, before you move!")?;
+    write_framed(&mut chat_stream, &ciphertext).await?;
+    println!("[bob] sent initial message");
+
+    let moved_ciphertext = read_framed(&mut chat_stream).await?;
+    let moved_plaintext = bob
+        .decrypt(&mut bob_group, &moved_ciphertext)?
+        .ok_or_else(|| anyhow::anyhow!("expected a Moved message"))?;
+    match securetext_crypto::AppMessage::from_bytes(&moved_plaintext)? {
+        securetext_crypto::AppMessage::Moved { new_onion_address, new_noise_public_key } => {
+            println!(
+                "[bob] received 'I've moved' -> new address {new_onion_address}, new noise key {}",
+                to_hex(&new_noise_public_key)
+            );
+            bob_store.upsert_contact(&securetext_identity::Contact {
+                peer_mls_public_key: alice_mls_public_key.clone(),
+                peer_label: "alice".to_string(),
+                onion_address: new_onion_address,
+                noise_public_key: new_noise_public_key,
+            })?;
+        }
+        securetext_crypto::AppMessage::Chat(_) => anyhow::bail!("expected a Moved message, got chat"),
+    }
+
+    drop(chat_stream);
+    mux.close().await?;
+    println!("[bob] closed the v1 connection; looking up alice's updated contact info...");
+
+    let contact = bob_store
+        .get_contact(&alice_mls_public_key)?
+        .ok_or_else(|| anyhow::anyhow!("no contact record for alice"))?;
+
+    // v1's dial got an explicit grace period after listener_v1 launched,
+    // for the onion service descriptor to propagate through the Tor
+    // network before anyone tries to reach it. v2 is launched around the
+    // same time as this point in bob's flow, but with no equivalent
+    // delay -- confirmed live: this reliably produced "Unable to download
+    // hidden service descriptor" without it, and passed consistently once
+    // added. Same underlying lesson as `bootstrap_for_this_run`'s: verify
+    // the interim CLI's timing assumptions live, don't just assume the
+    // first working run generalizes.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    println!("[bob] dialing alice's new address per the updated contact record: {}", contact.onion_address);
+
+    let mut stream = securetext_net::dial(&bob_tor, &contact.onion_address, 1).await?;
+    let (noise, alice_noise_key_v2) =
+        securetext_net::handshake_initiator(&mut stream, &bob_store.noise_static_private_key()?).await?;
+    anyhow::ensure!(
+        alice_noise_key_v2 == contact.noise_public_key,
+        "alice's rotated noise key didn't match her contact record -- refusing to trust this connection"
+    );
+    println!("[bob] noise handshake complete; alice's rotated identity verified");
+
+    let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Client);
+    let mut chat_stream = mux.open().await?;
+    let ciphertext = bob.encrypt(&mut bob_group, b"Reconnecting via your new address!")?;
+    write_framed(&mut chat_stream, &ciphertext).await?;
+
+    let reply_ciphertext = read_framed(&mut chat_stream).await?;
+    let reply_plaintext = bob
+        .decrypt(&mut bob_group, &reply_ciphertext)?
+        .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+    println!("[bob] received: {:?}", String::from_utf8_lossy(&reply_plaintext));
+
+    drop(chat_stream);
+    mux.close().await?;
+
+    let (returned_address, returned_key) = alice_task.await??;
+    anyhow::ensure!(returned_address == contact.onion_address, "address mismatch");
+    anyhow::ensure!(returned_key == contact.noise_public_key, "key mismatch");
+    println!("[done] onion-address + Noise-key rotation, notified via the existing MLS channel, reconnect verified.");
+    Ok(())
+}
+
 /// Resolves tech-stack.md's open item #1: measure the *combined*
 /// real-world per-message latency of MLS + Noise + a live Tor circuit,
 /// once the connection is already established -- not connection setup
@@ -640,10 +842,10 @@ async fn run_bench(n: usize) -> anyhow::Result<()> {
     let bob_key_package = bob.key_package_bytes()?;
     let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
 
-    let bob_tor: Client = bootstrap_for_this_run().await?;
+    let (bob_tor, _bob_tor_scratch): (Client, _) = bootstrap_for_this_run().await?;
     let mut bob_listener = Listener::launch(&bob_tor, "securetext-bench-bob")?;
     let bob_address = bob_listener.onion_address()?;
-    let alice_tor: Client = bootstrap_for_this_run().await?;
+    let (alice_tor, _alice_tor_scratch): (Client, _) = bootstrap_for_this_run().await?;
 
     let bob_task: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
         let mut stream = bob_listener
@@ -735,11 +937,23 @@ async fn run_bench(n: usize) -> anyhow::Result<()> {
 /// persistent per-platform app-data directory (platform-support.md's
 /// `directories` crate plan) once running outside a sandbox with unusual
 /// `$HOME` ownership.
-async fn bootstrap_for_this_run() -> anyhow::Result<Client> {
+///
+/// Returns the `TempDir` guard alongside the client -- **callers must hold
+/// onto it for as long as `Client` is used** (it needs to outlive the Tor
+/// client, since arti keeps reading/writing state there), but must *not*
+/// call `.keep()` on it or otherwise leak it. An earlier version of this
+/// function did call `.keep()` (to solve exactly that lifetime problem)
+/// and every demo/bench run consequently left a permanent ~40MB directory
+/// behind -- across a long testing session that silently filled this
+/// sandbox's tmpfs and caused unrelated test failures ("No space left on
+/// device") with no connection to the actual change being tested. Letting
+/// the guard drop normally when the caller's function returns cleans up
+/// automatically while still keeping the directory alive for the whole
+/// command's run.
+async fn bootstrap_for_this_run() -> anyhow::Result<(Client, tempfile::TempDir)> {
     let scratch = tempfile::tempdir()?;
-    let path = scratch.keep();
-    let tor = securetext_net::bootstrap_with_dirs(&path.join("state"), &path.join("cache")).await?;
-    Ok(tor)
+    let tor = securetext_net::bootstrap_with_dirs(&scratch.path().join("state"), &scratch.path().join("cache")).await?;
+    Ok((tor, scratch))
 }
 
 /// Plain length-prefixed framing over a (already Noise-encrypted, already

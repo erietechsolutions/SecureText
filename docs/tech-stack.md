@@ -282,6 +282,51 @@ rather than guessed in advance:
   the identical API surface for a different pluggable transport
   (snowflake instead of obfs4) — worth knowing this pattern generalizes to
   other PTs if one is ever needed. See `securetext_net::bootstrap_with_bridge`.
+- **"I've moved" notifications ride the existing MLS-encrypted channel
+  rather than needing a new signature scheme.** MLS's `process_message`
+  already verifies the sender's credential as part of the protocol, so an
+  `AppMessage::Moved` (`securetext-crypto`, a small enum alongside
+  `AppMessage::Chat`) delivered through a group a peer is already a
+  verified member of inherits that authenticity for free — no separate
+  signature over the new address/key was needed. The harder design
+  question turned out to be *when* to send it: a rotated address is only
+  reachable *before* the switch, so the notification has to go out over
+  the still-open old connection, not a new one (a new connection to an
+  address the recipient doesn't know yet is a chicken-and-egg problem).
+  `securetext rotate-demo` sequences this explicitly: rotate, notify over
+  the still-open v1 connection, only *then* close it and let the peer
+  reconnect via their updated contact record.
+- **`bootstrap_for_this_run`'s `.keep()` call was a real, silent disk-space
+  leak, found by actually stress-testing the CLI repeatedly rather than in
+  code review.** It called `.keep()` on its `tempfile::TempDir` to solve a
+  genuine lifetime problem (the Tor state/cache dir must outlive the
+  function, since arti keeps using it for as long as the returned `Client`
+  does) -- but that also means the directory (~40MB per Tor bootstrap,
+  consensus/descriptor data) was never cleaned up, for the life of the
+  process or the disk. Across this session's many `demo`/`bench`/
+  `rotate-demo` runs, these silently accumulated and eventually filled
+  this sandbox's 1.6GB tmpfs, which then caused unrelated `securetext-identity`
+  tests to fail with "No space left on device" -- a failure with zero
+  apparent connection to the change actually being tested, which took a
+  `df`/`du` investigation to trace back to this. **Fixed** by returning the
+  `TempDir` guard alongside the `Client` instead of leaking it, so callers
+  hold it for exactly as long as they need it and it cleans up
+  automatically via `Drop` when their function returns -- same lifetime
+  guarantee, no leak. Worth remembering generally: `.keep()`/`.into_path()`
+  on a tempdir is a real permanent leak, not a convenience, and needs a
+  matching cleanup story if used at all.
+- **A second real bug found the same way: onion-service descriptor
+  propagation delay was only applied to the *first* dial, not the second.**
+  `rotate-demo`'s v1 connection had an explicit 5-second sleep after
+  `Listener::launch()` before anyone tried to dial it (needed for the
+  onion service's descriptor to become discoverable on the Tor network).
+  The v2 (post-rotation) listener had no equivalent delay before bob's
+  reconnection dial, which reliably reproduced arti's "Unable to download
+  hidden service descriptor" error live. Fixed by adding the same 5-second
+  delay before the v2 dial. General lesson: a working demo's timing
+  assumptions don't automatically generalize to a structurally similar but
+  not-identical code path in the same function -- each dial-after-launch
+  needs its own verified delay, not just the first one.
 
 ## Standing rule: crypto/network-adjacent dependency vetting
 

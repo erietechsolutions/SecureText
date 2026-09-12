@@ -17,6 +17,9 @@ use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 mod provider;
 pub use provider::PersistentProvider;
 
+mod message;
+pub use message::AppMessage;
+
 /// The one ciphersuite SecureText speaks: X25519 + ChaCha20-Poly1305 +
 /// Ed25519 (crypto-spec.md §7's primitive table).
 pub const CIPHERSUITE: Ciphersuite =
