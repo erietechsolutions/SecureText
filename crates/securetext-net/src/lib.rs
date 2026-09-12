@@ -81,6 +81,97 @@ pub async fn bootstrap_with_dirs(
     Ok(client)
 }
 
+/// An obfs4 bridge to route around Tor being blocked or throttled
+/// (architecture.md §5, threat-model.md's mandatory-anonymity requirement
+/// -- the app must stay usable where Tor itself is blocked, not just where
+/// it isn't). `bridge_line` is a standard Tor bridge line, the same format
+/// Tor Browser uses (`Bridge obfs4 <ip>:<port> <fingerprint> cert=... iat-mode=...`),
+/// typically obtained from Tor's own bridge distribution channels.
+/// `obfs4proxy_path` is the path to the `obfs4proxy` (or `lyrebird`)
+/// binary, which arti launches itself (`run_on_startup`) rather than
+/// requiring you to run it separately.
+pub struct BridgeConfig {
+    pub bridge_line: String,
+    pub obfs4proxy_path: std::path::PathBuf,
+}
+
+/// Bootstrap a Tor client through an obfs4 bridge instead of connecting to
+/// the Tor network directly -- see [`BridgeConfig`].
+///
+/// **Verification note:** this is built against arti's own real example
+/// (`arti-client/examples/snowflake.rs` -- the crate ships no obfs4-specific
+/// example, so the snowflake one, which uses the identical
+/// `BridgeConfigBuilder`/`TransportConfigBuilder` API, was used as the
+/// verified reference) and exercised by this crate's local config-only
+/// test. **What it has not been verified against is an actual live,
+/// currently-provisioned obfs4 bridge or `obfs4proxy` binary** -- neither
+/// was available in this development sandbox (no Go toolchain to build
+/// `obfs4proxy` from source, and standing up a real bridge relay to test
+/// against is its own separate undertaking). This is the same category of
+/// gap as the Windows cross-platform verification in `roadmap.md`: the
+/// code is written against the real, verified API, but a genuine
+/// end-to-end censorship-circumvention test still needs to be run by
+/// someone with an `obfs4proxy` binary and a real bridge line.
+pub async fn bootstrap_with_bridge(
+    state_dir: &std::path::Path,
+    cache_dir: &std::path::Path,
+    bridge: &BridgeConfig,
+) -> Result<Client, NetError> {
+    use arti_client::config::pt::TransportConfigBuilder;
+    use arti_client::config::{BridgeConfigBuilder, CfgPath};
+
+    let mut builder = arti_client::config::TorClientConfigBuilder::from_directories(state_dir, cache_dir);
+
+    let bridge_config: BridgeConfigBuilder = bridge
+        .bridge_line
+        .parse()
+        .map_err(|e| NetError::Config(format!("invalid bridge line: {e:?}")))?;
+    builder.bridges().bridges().push(bridge_config);
+
+    let mut transport = TransportConfigBuilder::default();
+    transport
+        .protocols(vec!["obfs4".parse().expect("\"obfs4\" is a valid transport name")])
+        .path(CfgPath::new(bridge.obfs4proxy_path.to_string_lossy().into_owned()))
+        .run_on_startup(true);
+    builder.bridges().transports().push(transport);
+
+    let config = builder.build().map_err(|e| NetError::Config(format!("{e:?}")))?;
+    let client = TorClient::create_bootstrapped(config).await?;
+    Ok(client)
+}
+
+#[cfg(test)]
+mod bridge_config_tests {
+    /// Local-only: proves the bridge/transport config this crate builds is
+    /// accepted by arti's own config validation, without needing a live
+    /// bridge or `obfs4proxy` binary to actually bootstrap through (see
+    /// `bootstrap_with_bridge`'s doc comment for what remains unverified).
+    #[test]
+    fn bridge_config_builds_successfully() {
+        use arti_client::config::pt::TransportConfigBuilder;
+        use arti_client::config::{BridgeConfigBuilder, CfgPath};
+
+        // A syntactically valid obfs4 bridge line (fingerprint/cert are
+        // made up, not a real bridge -- this only tests config parsing).
+        const BRIDGE_LINE: &str = "Bridge obfs4 192.0.2.3:443 0011223344556677889900112233445566778899 cert=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA iat-mode=0";
+
+        let mut builder =
+            arti_client::config::TorClientConfigBuilder::from_directories("/tmp/securetext-test-state", "/tmp/securetext-test-cache");
+
+        let bridge_config: BridgeConfigBuilder = BRIDGE_LINE.parse().expect("valid bridge line");
+        builder.bridges().bridges().push(bridge_config);
+
+        let mut transport = TransportConfigBuilder::default();
+        transport
+            .protocols(vec!["obfs4".parse().unwrap()])
+            .path(CfgPath::new("obfs4proxy".to_string()))
+            .run_on_startup(true);
+        builder.bridges().transports().push(transport);
+
+        builder.build().expect("bridge config should build successfully");
+    }
+}
+
 /// A running onion service plus the stream of incoming client connections.
 pub struct Listener {
     pub service: Arc<RunningOnionService>,

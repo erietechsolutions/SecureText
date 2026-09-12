@@ -272,6 +272,16 @@ rather than guessed in advance:
   payload format; still JSON, just with base64 strings for the byte
   fields. Worth remembering for any future wire format carrying key
   material as JSON.
+- **obfs4 bridge support needs the `pt-client` Cargo feature on
+  `arti-client`** (pulls in `bridge-client`, `tor-ptmgr`, and PT support in
+  `tor-chanmgr`/`tor-guardmgr`) — confirmed no regression to normal
+  (non-bridge) bootstrap after enabling it. **The `arti-client` crate ships
+  no obfs4-specific example**; the real, verified reference for the
+  `BridgeConfigBuilder`/`TransportConfigBuilder` API was
+  `arti-client/examples/snowflake.rs` in arti's own repository, which uses
+  the identical API surface for a different pluggable transport
+  (snowflake instead of obfs4) — worth knowing this pattern generalizes to
+  other PTs if one is ever needed. See `securetext_net::bootstrap_with_bridge`.
 
 ## Standing rule: crypto/network-adjacent dependency vetting
 

@@ -122,13 +122,29 @@ this is a security-sensitive project where shortcuts compound.
       lifetime.
 - [ ] Onion-address rotation + "I've moved" re-linking within existing MLS
       groups (architecture.md §2)
-- [ ] Pluggable transport (obfs4) support via `arti`, with the bridge
-      configuration UX decided in Phase 1's open items (architecture.md §5)
+- [x] Pluggable transport (obfs4) support via `arti`
+      (`securetext_net::bootstrap_with_bridge` / `BridgeConfig`) — **config
+      plumbing done and locally tested, live bridge connection not
+      verified.** Built against arti's own real example
+      (`arti-client/examples/snowflake.rs`, the closest verified reference
+      since the crate ships no obfs4-specific example — it uses the
+      identical `BridgeConfigBuilder`/`TransportConfigBuilder` API) and
+      proven to construct a valid, buildable Tor client config from a
+      bridge line + obfs4 transport declaration. **Not verified: an actual
+      live obfs4 bridge connection.** This sandbox has no Go toolchain to
+      build `obfs4proxy` from source and no real bridge relay to test
+      against — the same category of gap as the Windows cross-platform
+      item, flagged rather than glossed over. See
+      `bootstrap_with_bridge`'s doc comment for exactly what's unverified.
 - **Exit criteria:**
   - ✅ Two peers connect via invite link with no manual address exchange:
     verified live as described above.
-  - 🔲 A simulated Tor-blocked network condition is overcome using a
-    configured obfs4 bridge, verified end-to-end — not yet attempted.
+  - 🔲 **A simulated Tor-blocked network condition overcome using a
+    configured obfs4 bridge, verified end-to-end — not yet possible in
+    this environment.** Action needed: on a machine with an `obfs4proxy`
+    (or `lyrebird`) binary and a real bridge line (e.g. from
+    bridges.torproject.org), call `securetext_net::bootstrap_with_bridge`
+    and confirm it successfully bootstraps through the bridge.
 
 ## Phase 3 — Groups ("Servers") & Channels
 - MLS group creation/join/leave via OpenMLS, scaled beyond 2 members
