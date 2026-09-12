@@ -85,6 +85,21 @@ rather than guessed in advance:
   (0.5.x), not an independently-guessed version** — pinning it separately
   causes two copies of the crate in the dependency graph and ambiguous
   trait resolution errors.
+- **Noise defense-in-depth layer (crypto-spec.md §4): implemented and
+  live-verified.** Uses `snow` with `Noise_XX_25519_ChaChaPoly_BLAKE2s`
+  (matching the project's ChaCha20-Poly1305 preference). Each identity now
+  carries a persistent Noise static X25519 keypair alongside its MLS
+  signing key (`securetext-identity`, stored in the same envelope-encrypted
+  SQLite file). Two things worth flagging for future work in this area:
+  `snow` 0.10's `Builder::local_private_key()` returns a `Result` (the
+  docs.rs example available at the time showed it as infallible — always
+  verify against the actual installed version, not cached documentation);
+  and the handshake/transport functions in `securetext-net` are generic
+  over `AsyncRead + AsyncWrite` rather than concretely typed to
+  `arti_client::DataStream`, specifically so the handshake logic could be
+  correctness-tested locally over an in-memory `tokio::io::duplex` pipe
+  without needing a live Tor connection for every iteration — worth doing
+  for any future protocol layer built on top of the transport.
 - **At-rest encryption, interim design (resolves open item #2 below more
   concretely):** `openmls_sqlite_storage` pins its own `rusqlite` (`^0.37`)
   with the plain `bundled` feature, separate from a hypothetical
@@ -172,10 +187,14 @@ rather than guessed in advance:
    `openmls_sqlite_storage` into the group's provider (not just the
    identity key, which already uses it) is the natural next step, likely
    alongside item #2 above since it's the same storage layer.
-6. **Noise defense-in-depth layer and yamux multiplexing** (crypto-spec.md
-   §4, architecture.md §6) are not yet implemented — `securetext-cli`'s
-   demo currently frames messages with a plain length prefix directly over
-   the raw onion-service stream as a placeholder.
+6. **yamux multiplexing over the Noise session** (architecture.md §6) is
+   not yet implemented — the Noise defense-in-depth layer itself
+   (crypto-spec.md §4) is done and live-verified (see the implementation
+   findings above); each connection is still one logical stream, not
+   multiplexed, so a server with multiple channels would currently need
+   one onion-service connection per channel rather than one shared
+   connection carrying several logical streams. This is the remaining
+   piece before the transport layer matches architecture.md §6's design.
 7. **Frontend framework for Tauri** (React vs. Svelte vs. other) — deferred
    to Phase 4, not blocking.
 

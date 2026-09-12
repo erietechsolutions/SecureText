@@ -18,6 +18,9 @@ use futures::StreamExt;
 use tor_hsservice::{HsNickname, RunningOnionService};
 use tor_rtcompat::PreferredRuntime;
 
+mod noise;
+pub use noise::{handshake_initiator, handshake_responder, NoiseTransport, NOISE_PATTERN};
+
 #[derive(thiserror::Error, Debug)]
 pub enum NetError {
     #[error("tor client error: {0}")]
@@ -30,6 +33,10 @@ pub enum NetError {
     Stream(String),
     #[error("this onion service has no address yet")]
     NoAddress,
+    #[error("noise handshake/transport error: {0}")]
+    Noise(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Client = Arc<TorClient<PreferredRuntime>>;

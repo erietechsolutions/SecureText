@@ -9,6 +9,7 @@ publish.workspace = true
 openmls_basic_credential.workspace = true
 openmls_traits.workspace = true
 openmls_sqlite_storage.workspace = true
+snow.workspace = true
 rusqlite.workspace = true
 refinery.workspace = true
 argon2.workspace = true

@@ -1,10 +1,17 @@
 //! Local identity generation and encrypted-at-rest storage.
 //!
-//! An "identity" here is the long-term MLS signing keypair
-//! (`openmls_basic_credential::SignatureKeyPair`, Ed25519) plus a
-//! human-readable local label. This is deliberately separate from the Tor
-//! onion-service key (architecture.md §2), which `securetext-net` manages
-//! on its own.
+//! An "identity" here is:
+//! - the long-term MLS signing keypair (`openmls_basic_credential::SignatureKeyPair`,
+//!   Ed25519), used for MLS group membership and message authentication;
+//! - a long-term Noise static X25519 keypair, used only for the transport
+//!   defense-in-depth layer (crypto-spec.md §4) — kept separate from the
+//!   MLS key deliberately, since it serves a different purpose (transport
+//!   authentication, not group cryptography) and Noise's XX pattern wants
+//!   an X25519 key, not the Ed25519 signing key;
+//! - a human-readable local label.
+//!
+//! Both keys are deliberately separate from the Tor onion-service key
+//! (architecture.md §2), which `securetext-net` manages on its own.
 //!
 //! ## At-rest encryption approach (Phase 1 interim design)
 //!
@@ -42,6 +49,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 
+/// Must match `securetext_net::NOISE_PATTERN` exactly — this is the pattern
+/// under which the static keypair generated here is valid.
+const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+
 #[derive(thiserror::Error, Debug)]
 pub enum IdentityError {
     #[error("key derivation failed: {0}")]
@@ -70,6 +81,12 @@ pub struct PublicIdentity {
     pub label: String,
     pub public_key: Vec<u8>,
     pub signature_scheme_id: u16,
+    /// The Noise static public key (X25519), for the transport
+    /// defense-in-depth layer (crypto-spec.md §4). Share this out-of-band
+    /// alongside an onion address/invite so the peer can pin and verify it
+    /// during the Noise handshake, the same way the onion address itself
+    /// is shared in Phase 1's manual-exchange model.
+    pub noise_public_key: Vec<u8>,
 }
 
 impl PublicIdentity {
@@ -130,10 +147,16 @@ impl IdentityStore {
         let storage = SqliteStorageProvider::<JsonCodec, &Connection>::new(&connection);
         key_pair.store(&storage).map_err(IdentityError::Sqlite)?;
 
+        let noise_keypair = snow::Builder::new(NOISE_PATTERN.parse().expect("valid noise pattern"))
+            .generate_keypair()
+            .map_err(|e| IdentityError::Kdf(format!("noise keygen: {e:?}")))?;
+        write_noise_keys(&connection, &noise_keypair.public, &noise_keypair.private)?;
+
         let public = PublicIdentity {
             label: label.into(),
             public_key: key_pair.to_public_vec(),
             signature_scheme_id: SignatureScheme::ED25519 as u16,
+            noise_public_key: noise_keypair.public,
         };
         write_meta(&connection, &public)?;
 
@@ -229,6 +252,20 @@ impl IdentityStore {
             public.signature_scheme()?,
         ))
     }
+
+    /// The Noise static private key (X25519, raw bytes) for this identity,
+    /// for use with `securetext_net`'s Noise handshake. Kept out of
+    /// `PublicIdentity` deliberately since that type is meant to be safe to
+    /// display/share — this is the one secret this crate hands out
+    /// directly, mirroring how `signing_key_pair` hands out the MLS secret.
+    pub fn noise_static_private_key(&self) -> Result<Vec<u8>, IdentityError> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT private_key FROM securetext_noise_keys WHERE id = 0")?;
+        let mut rows = stmt.query([])?;
+        let row = rows.next()?.ok_or(IdentityError::NoIdentity)?;
+        Ok(row.get(0)?)
+    }
 }
 
 impl Drop for IdentityStore {
@@ -253,7 +290,13 @@ fn create_meta_table(connection: &Connection) -> Result<(), IdentityError> {
             id INTEGER PRIMARY KEY CHECK (id = 0),
             label TEXT NOT NULL,
             public_key BLOB NOT NULL,
-            signature_scheme_id INTEGER NOT NULL
+            signature_scheme_id INTEGER NOT NULL,
+            noise_public_key BLOB NOT NULL DEFAULT (x'')
+        );
+        CREATE TABLE IF NOT EXISTS securetext_noise_keys (
+            id INTEGER PRIMARY KEY CHECK (id = 0),
+            public_key BLOB NOT NULL,
+            private_key BLOB NOT NULL
         );",
     )?;
     Ok(())
@@ -261,23 +304,38 @@ fn create_meta_table(connection: &Connection) -> Result<(), IdentityError> {
 
 fn write_meta(connection: &Connection, public: &PublicIdentity) -> Result<(), IdentityError> {
     connection.execute(
-        "INSERT OR REPLACE INTO securetext_identity_meta (id, label, public_key, signature_scheme_id)
-         VALUES (0, ?1, ?2, ?3)",
-        rusqlite::params![public.label, public.public_key, public.signature_scheme_id],
+        "INSERT OR REPLACE INTO securetext_identity_meta (id, label, public_key, signature_scheme_id, noise_public_key)
+         VALUES (0, ?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            public.label,
+            public.public_key,
+            public.signature_scheme_id,
+            public.noise_public_key
+        ],
+    )?;
+    Ok(())
+}
+
+fn write_noise_keys(connection: &Connection, public_key: &[u8], private_key: &[u8]) -> Result<(), IdentityError> {
+    connection.execute(
+        "INSERT OR REPLACE INTO securetext_noise_keys (id, public_key, private_key) VALUES (0, ?1, ?2)",
+        rusqlite::params![public_key, private_key],
     )?;
     Ok(())
 }
 
 fn read_meta(connection: &Connection) -> Result<Option<PublicIdentity>, IdentityError> {
     create_meta_table(connection)?;
-    let mut stmt = connection
-        .prepare("SELECT label, public_key, signature_scheme_id FROM securetext_identity_meta WHERE id = 0")?;
+    let mut stmt = connection.prepare(
+        "SELECT label, public_key, signature_scheme_id, noise_public_key FROM securetext_identity_meta WHERE id = 0",
+    )?;
     let mut rows = stmt.query([])?;
     if let Some(row) = rows.next()? {
         Ok(Some(PublicIdentity {
             label: row.get(0)?,
             public_key: row.get(1)?,
             signature_scheme_id: row.get(2)?,
+            noise_public_key: row.get(3)?,
         }))
     } else {
         Ok(None)
@@ -333,17 +391,26 @@ mod tests {
             .expect("read key pair")
             .expect("key pair present");
         assert_eq!(key_pair.to_public_vec(), public.public_key);
+        assert_eq!(public.noise_public_key.len(), 32, "X25519 public key is 32 bytes");
+        let noise_private = store.noise_static_private_key().expect("noise private key");
+        assert_eq!(noise_private.len(), 32, "X25519 private key is 32 bytes");
         drop(store);
 
         let (reopened, reopened_public) =
             IdentityStore::open(&enc_path, "correct horse battery staple").expect("open");
         assert_eq!(reopened_public.label, "alice");
         assert_eq!(reopened_public.public_key, public.public_key);
+        assert_eq!(reopened_public.noise_public_key, public.noise_public_key);
         let reopened_key_pair = reopened
             .signing_key_pair(&reopened_public)
             .expect("read key pair")
             .expect("key pair present");
         assert_eq!(reopened_key_pair.to_public_vec(), public.public_key);
+        assert_eq!(
+            reopened.noise_static_private_key().expect("noise private key"),
+            noise_private,
+            "noise static key survives seal/reopen"
+        );
     }
 
     #[test]

@@ -44,10 +44,18 @@ this is a security-sensitive project where shortcuts compound.
       to end**: two local identities form a 2-member MLS group, exchange a
       Welcome and an encrypted application message in both directions,
       entirely over live Tor onion services with no IP ever exchanged.
-- [ ] Noise-secured stream on top of the onion-service connection
-      (crypto-spec.md §4) and yamux multiplexing (architecture.md §6) —
-      not yet implemented; the demo currently uses a placeholder
-      length-prefixed frame directly over the raw onion stream
+- [x] Noise_XX-secured transport session on top of the onion-service
+      connection (crypto-spec.md §4), **live-verified**: each identity now
+      has a persistent Noise static X25519 keypair (`securetext-identity`),
+      `securetext-net` performs the full handshake and transport
+      encryption (unit-tested locally over an in-memory pipe, no Tor
+      needed for that check), and `securetext demo` / `net-dial` verify
+      the peer's presented static key against the expected one obtained
+      out-of-band before trusting the connection — real mutual
+      authentication, not just "some onion service answered."
+- [ ] yamux multiplexing over the Noise session (architecture.md §6) —
+      not yet implemented; each connection is still one logical stream,
+      framed with a plain length prefix around the Noise ciphertext
       (tech-stack.md open item #6)
 - [ ] MLS group state persistence across restarts (currently in-memory
       only — tech-stack.md open item #5)

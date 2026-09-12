@@ -11,6 +11,7 @@ tor-hsservice.workspace = true
 tor-rtcompat.workspace = true
 tor-cell = "0.46"
 safelog = "0.9"
+snow.workspace = true
 tokio.workspace = true
 futures.workspace = true
 anyhow.workspace = true
