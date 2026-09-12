@@ -266,6 +266,21 @@ impl IdentityStore {
         let row = rows.next()?.ok_or(IdentityError::NoIdentity)?;
         Ok(row.get(0)?)
     }
+
+    /// Path to the decrypted, plaintext-for-this-session SQLite file
+    /// backing this identity's tables (signature keys, Noise keys, our own
+    /// metadata). Intended for `securetext-crypto`'s `PersistentProvider`
+    /// to open its *own* connection to the same underlying file for MLS
+    /// group storage, rather than sharing this store's live `Connection`
+    /// by reference -- that would tie a `Member`'s lifetime to this
+    /// store's borrow state (e.g. conflicting with `seal(&mut self)`).
+    /// SQLite supports multiple connections to one file; both this store
+    /// and any `PersistentProvider`s opened against this path get sealed
+    /// together whenever `seal()` is called, since it re-encrypts the
+    /// whole file regardless of which connection wrote what.
+    pub fn db_path(&self) -> &Path {
+        &self.tmp_db_path
+    }
 }
 
 impl Drop for IdentityStore {

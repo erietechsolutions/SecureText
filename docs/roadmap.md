@@ -57,8 +57,11 @@ this is a security-sensitive project where shortcuts compound.
       not yet implemented; each connection is still one logical stream,
       framed with a plain length prefix around the Noise ciphertext
       (tech-stack.md open item #6)
-- [ ] MLS group state persistence across restarts (currently in-memory
-      only — tech-stack.md open item #5)
+- [x] MLS group state persistence across restarts (tech-stack.md open item
+      #5), **verified via a full simulated restart**: `securetext
+      restart-demo` seals identity stores to their encrypted files, drops
+      everything, reopens from those files, reloads the MLS group by ID,
+      and keeps messaging correctly in both directions
 - [x] End-to-end latency benchmark combining MLS + a real Tor circuit
       (`securetext bench`), **measured**: 20 round trips over one
       established circuit came in at p50=3.09s, avg=3.46s (tech-stack.md

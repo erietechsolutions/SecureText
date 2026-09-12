@@ -1,18 +1,21 @@
 //! OpenMLS wrapper: one crypto stack for both 1:1 (as a 2-member group) and
 //! multi-member groups, per crypto-spec.md §2-3.
 //!
-//! This is intentionally the *in-memory* provider for now — persisting MLS
-//! group state across restarts needs a `StorageProvider` wired in the same
-//! way `securetext-identity` wires `openmls_sqlite_storage` for the signing
-//! key, and is tracked as a Phase 1 follow-up rather than attempted here.
-//! What this module proves is protocol *correctness*: that a 2-member MLS
-//! group can be created, joined via Welcome, and used to exchange
-//! authenticated, forward-secret application messages.
+//! `Member<P>` is generic over the `OpenMlsProvider` it uses: tests (and
+//! any throwaway session) can use the in-memory `OpenMlsRustCrypto`, while
+//! the real application uses [`PersistentProvider`] so group state survives
+//! a restart. What this module proves, independent of which provider is
+//! used, is protocol *correctness*: that a 2-member MLS group can be
+//! created, joined via Welcome, and used to exchange authenticated,
+//! forward-secret application messages.
 
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::OpenMlsRustCrypto;
+use openmls_traits::OpenMlsProvider;
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
+
+mod provider;
+pub use provider::PersistentProvider;
 
 /// The one ciphersuite SecureText speaks: X25519 + ChaCha20-Poly1305 +
 /// Ed25519 (crypto-spec.md §7's primitive table).
@@ -27,31 +30,37 @@ pub enum CryptoError {
     TlsCodec(String),
     #[error("expected a {expected} message, got something else")]
     UnexpectedMessageType { expected: &'static str },
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
-/// A member of a conversation: the OpenMLS crypto provider plus this
+/// A member of a conversation: an OpenMLS crypto provider plus this
 /// member's credential/signing key. One `Member` corresponds to one
 /// `securetext_identity::IdentityStore` in the full application.
-pub struct Member {
-    provider: OpenMlsRustCrypto,
+///
+/// Generic over the provider so the same logic works whether group state
+/// is ephemeral (`OpenMlsRustCrypto`, used by this module's tests) or
+/// persisted (`PersistentProvider`, used by the real application).
+pub struct Member<P: OpenMlsProvider> {
+    provider: P,
     credential_with_key: CredentialWithKey,
     signer: SignatureKeyPair,
 }
 
-impl Member {
-    /// Wrap an existing identity signing key as an MLS member.
+impl<P: OpenMlsProvider> Member<P> {
+    /// Wrap an existing identity signing key and provider as an MLS member.
     ///
     /// `label` becomes the MLS `BasicCredential`'s identity bytes — this is
     /// the local, unverified display label from crypto-spec.md §1, not a
     /// global directory entry.
-    pub fn new(label: &str, signer: SignatureKeyPair) -> Self {
+    pub fn new(label: &str, signer: SignatureKeyPair, provider: P) -> Self {
         let credential = BasicCredential::new(label.as_bytes().to_vec());
         let credential_with_key = CredentialWithKey {
             credential: credential.into(),
             signature_key: signer.to_public_vec().into(),
         };
         Self {
-            provider: OpenMlsRustCrypto::default(),
+            provider,
             credential_with_key,
             signer,
         }
@@ -88,6 +97,16 @@ impl Member {
             self.credential_with_key.clone(),
         )
         .map_err(|e| CryptoError::Mls(format!("{e:?}")))
+    }
+
+    /// Reload a previously-created/joined group from this member's
+    /// provider after a restart (architecture.md/tech-stack.md: this is
+    /// what makes group state durable when `P` is [`PersistentProvider`]
+    /// rather than the in-memory default). Returns `None` if no group with
+    /// this ID has been persisted.
+    pub fn load_group(&self, group_id: &GroupId) -> Result<Option<MlsGroup>, CryptoError> {
+        MlsGroup::load(self.provider.storage(), group_id)
+            .map_err(|e| CryptoError::Storage(format!("{e:?}")))
     }
 
     /// Add a member (identified by their serialized KeyPackage) to `group`,
@@ -194,11 +213,12 @@ impl Member {
 mod tests {
     use super::*;
     use openmls_basic_credential::SignatureKeyPair;
+    use openmls_rust_crypto::OpenMlsRustCrypto;
     use openmls_traits::types::SignatureScheme;
 
-    fn fresh_member(label: &str) -> Member {
+    fn fresh_member(label: &str) -> Member<OpenMlsRustCrypto> {
         let signer = SignatureKeyPair::new(SignatureScheme::ED25519).expect("keygen");
-        Member::new(label, signer)
+        Member::new(label, signer, OpenMlsRustCrypto::default())
     }
 
     /// The critical correctness proof for the Phase 1 "one crypto stack"
@@ -274,5 +294,99 @@ mod tests {
             "two_member_group_message_throughput_smoke_test: {N} encrypt+decrypt round trips in {elapsed:?} ({:?}/message)",
             elapsed / N as u32
         );
+    }
+
+    /// Proves the actual persistence property: a group created with a
+    /// SQLite-backed `PersistentProvider`, then "restarted" (the `Member`
+    /// and in-memory `MlsGroup` handle both dropped and a fresh one loaded
+    /// from the same database file), can still send and receive messages
+    /// correctly. This is the property tech-stack.md's open item #5 asked
+    /// for -- group state surviving a restart, not just living in memory.
+    #[test]
+    fn group_state_survives_reload_from_sqlite() {
+        use provider::PersistentProvider;
+        use rusqlite::Connection;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alice_db_path = dir.path().join("alice.db");
+        let bob_db_path = dir.path().join("bob.db");
+
+        let alice_signer = SignatureKeyPair::new(SignatureScheme::ED25519).expect("keygen");
+        let bob_signer = SignatureKeyPair::new(SignatureScheme::ED25519).expect("keygen");
+        // SignatureKeyPair doesn't derive Clone by default (that's behind
+        // openmls_basic_credential's test-utils feature, which we don't
+        // enable outside that crate's own tests) -- round-trip through its
+        // own Serialize/Deserialize impl instead to get an independent
+        // second copy for "after restart", below.
+        let alice_signer_bytes = serde_json::to_vec(&alice_signer).unwrap();
+        let bob_signer_bytes = serde_json::to_vec(&bob_signer).unwrap();
+
+        // --- "First run": create the group, exchange one message, then
+        // drop everything (simulating a process restart). ---
+        let alice_group_id = {
+            let mut alice_provider = PersistentProvider::new(Connection::open(&alice_db_path).unwrap());
+            alice_provider.run_migrations().expect("alice migrations");
+            let mut bob_provider = PersistentProvider::new(Connection::open(&bob_db_path).unwrap());
+            bob_provider.run_migrations().expect("bob migrations");
+
+            let alice = Member::new("alice", alice_signer, alice_provider);
+            let bob = Member::new("bob", bob_signer, bob_provider);
+
+            let mut alice_group = alice.create_group().expect("alice creates group");
+            let group_id = alice_group.group_id().clone();
+            let bob_key_package = bob.key_package_bytes().expect("bob key package");
+            let welcome_bytes = alice
+                .add_member(&mut alice_group, &bob_key_package)
+                .expect("alice adds bob");
+            let mut bob_group = bob.join_from_welcome(&welcome_bytes).expect("bob joins");
+
+            let ciphertext = alice
+                .encrypt(&mut alice_group, b"before restart")
+                .expect("encrypt");
+            let plaintext = bob
+                .decrypt(&mut bob_group, &ciphertext)
+                .expect("decrypt")
+                .expect("application message");
+            assert_eq!(plaintext, b"before restart");
+
+            group_id
+            // alice, bob, alice_group, bob_group all dropped here.
+        };
+
+        // --- "Second run": reopen the same SQLite files, reload the group
+        // by ID, and prove messaging still works. ---
+        let alice_signer: SignatureKeyPair = serde_json::from_slice(&alice_signer_bytes).unwrap();
+        let bob_signer: SignatureKeyPair = serde_json::from_slice(&bob_signer_bytes).unwrap();
+        let alice_provider = PersistentProvider::new(Connection::open(&alice_db_path).unwrap());
+        let bob_provider = PersistentProvider::new(Connection::open(&bob_db_path).unwrap());
+        let alice = Member::new("alice", alice_signer, alice_provider);
+        let bob = Member::new("bob", bob_signer, bob_provider);
+
+        let mut alice_group = alice
+            .load_group(&alice_group_id)
+            .expect("load alice group")
+            .expect("alice group present after reload");
+        let mut bob_group = bob
+            .load_group(&alice_group_id)
+            .expect("load bob group")
+            .expect("bob group present after reload");
+
+        let ciphertext = alice
+            .encrypt(&mut alice_group, b"after restart")
+            .expect("encrypt after reload");
+        let plaintext = bob
+            .decrypt(&mut bob_group, &ciphertext)
+            .expect("decrypt after reload")
+            .expect("application message");
+        assert_eq!(plaintext, b"after restart");
+
+        let reply_ciphertext = bob
+            .encrypt(&mut bob_group, b"reply after restart")
+            .expect("encrypt reply after reload");
+        let reply_plaintext = alice
+            .decrypt(&mut alice_group, &reply_ciphertext)
+            .expect("decrypt reply after reload")
+            .expect("application message");
+        assert_eq!(reply_plaintext, b"reply after restart");
     }
 }

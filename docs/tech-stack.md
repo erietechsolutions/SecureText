@@ -194,12 +194,29 @@ rather than guessed in advance:
    before Phase 1's exit criteria are finalized. Not yet implemented in
    `securetext-net` — the live tests so far rely on unrestricted direct Tor
    access, not bridges.
-5. **MLS group state persistence across restarts** — `securetext-crypto`
-   currently uses OpenMLS's in-memory provider (`OpenMlsRustCrypto`) for
-   group/ratchet state, proven correct but not durable. Wiring
-   `openmls_sqlite_storage` into the group's provider (not just the
-   identity key, which already uses it) is the natural next step, likely
-   alongside item #2 above since it's the same storage layer.
+5. ~~**MLS group state persistence across restarts**~~ — **done.**
+   `Member<P>` (`crates/securetext-crypto`) is now generic over its
+   `OpenMlsProvider`; `PersistentProvider` (new: `provider.rs`) composes
+   `openmls_rust_crypto::RustCrypto` (crypto/rand — no need to persist
+   that) with `openmls_sqlite_storage::SqliteStorageProvider` (storage).
+   OpenMLS's own persistence design does the rest: group state is written
+   through automatically during normal operations, and `MlsGroup::load(storage,
+   group_id)` reconstructs a group handle from a fresh provider — no
+   custom serialization needed on our side. `PersistentProvider` opens its
+   *own* connection to `IdentityStore::db_path()`'s underlying SQLite file
+   rather than sharing the store's live `Connection` by reference, which
+   would otherwise tie a `Member`'s lifetime to the store's borrow state
+   (conflicting with `seal(&mut self)`) — SQLite handles multiple
+   connections to one file fine. Verified two ways: a fast local unit test
+   (`group_state_survives_reload_from_sqlite`, no Tor) that drops and
+   reloads a group mid-test, and `securetext restart-demo`, which performs
+   a *complete* simulated restart — identity stores sealed to their
+   encrypted files and fully dropped, then reopened from those files with
+   the MLS group reloaded by ID — and successfully exchanges messages in
+   both directions afterward. Matches OpenMLS's own persistence guidance
+   ("protect the storage backend itself, for example with authenticated
+   encryption") for free, since it's reusing `securetext-identity`'s
+   already-encrypted file rather than a second, separately-secured store.
 6. **yamux multiplexing over the Noise session** (architecture.md §6) is
    not yet implemented — the Noise defense-in-depth layer itself
    (crypto-spec.md §4) is done and live-verified (see the implementation

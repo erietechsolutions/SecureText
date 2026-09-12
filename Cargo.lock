@@ -4061,6 +4061,7 @@ name = "securetext-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "rusqlite",
  "securetext-crypto",
  "securetext-identity",
  "securetext-net",
@@ -4077,7 +4078,13 @@ dependencies = [
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
+ "openmls_sqlite_storage",
  "openmls_traits",
+ "refinery",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tls_codec",
 ]

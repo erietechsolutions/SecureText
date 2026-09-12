@@ -10,6 +10,14 @@ openmls.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_traits.workspace = true
 openmls_basic_credential.workspace = true
+openmls_sqlite_storage.workspace = true
+rusqlite.workspace = true
+refinery.workspace = true
 tls_codec.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

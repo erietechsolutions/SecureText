@@ -10,7 +10,14 @@
 //! on top of the onion-service stream, independent of both Tor's own
 //! transport crypto and MLS's message-layer E2EE.
 //!
-//! What this demo does **not** yet include, tracked as follow-ups rather
+//! MLS group state is persisted to the same encrypted SQLite file as the
+//! identity itself (`securetext_crypto::PersistentProvider`, sharing
+//! `IdentityStore::db_path()` via a second connection to that file) --
+//! `securetext restart-demo` proves this survives an actual simulated
+//! restart: identity stores sealed and dropped, then reopened from their
+//! encrypted files and the MLS group reloaded by ID before continuing.
+//!
+//! What this demo does **not** yet include, tracked as a follow-up rather
 //! than silently skipped:
 //! - yamux multiplexing over the Noise session (architecture.md §6) — this
 //!   demo still uses one logical stream per connection.
@@ -18,12 +25,23 @@
 //!   and MLS key package are exchanged in-process (`demo`) or via manual
 //!   copy-paste (`net-listen`/`net-dial`) instead of a real invite
 //!   mechanism.
-//! - Persisting the MLS group across restarts (tracked in tech-stack.md).
 
-use securetext_crypto::Member;
+use rusqlite::Connection;
+use securetext_crypto::{Member, PersistentProvider};
 use securetext_identity::IdentityStore;
 use securetext_net::{Client, DataStream, Listener, NoiseTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Open a *second*, independent connection to `identity_store`'s
+/// underlying SQLite file and wrap it as an MLS storage provider -- see
+/// `IdentityStore::db_path`'s doc comment for why this doesn't just share
+/// the store's own `Connection` by reference.
+fn mls_provider_for(identity_store: &IdentityStore) -> anyhow::Result<PersistentProvider<Connection>> {
+    let connection = Connection::open(identity_store.db_path())?;
+    let mut provider = PersistentProvider::new(connection);
+    provider.run_migrations()?;
+    Ok(provider)
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -34,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
             let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
             run_bench(n).await
         }
+        Some("restart-demo") => run_restart_demo().await,
         Some("net-listen") => run_net_listen().await,
         Some("net-dial") => {
             let address = args.get(2).cloned().ok_or_else(|| {
@@ -46,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
             run_net_dial(&address, &expected_noise_pubkey).await
         }
         _ => {
-            eprintln!("usage: securetext demo | bench [N]");
+            eprintln!("usage: securetext demo | bench [N] | restart-demo");
             eprintln!("  Runs the Phase 1 proof: two local identities exchange an MLS-encrypted,");
             eprintln!("  Noise-wrapped message over real Tor v3 onion services, in one process.");
             eprintln!();
@@ -164,13 +183,13 @@ async fn run_demo() -> anyhow::Result<()> {
     let alice_noise_private = alice_store.noise_static_private_key()?;
     let bob_noise_private = bob_store.noise_static_private_key()?;
 
-    let alice = Member::new("alice", alice_signer);
-    let bob = Member::new("bob", bob_signer);
+    let alice = Member::new("alice", alice_signer, mls_provider_for(&alice_store)?);
+    let bob = Member::new("bob", bob_signer, mls_provider_for(&bob_store)?);
 
     let mut alice_group = alice.create_group()?;
     let bob_key_package = bob.key_package_bytes()?;
     let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
-    println!("[setup] alice created a 2-member MLS group and added bob (locally, not sent yet)");
+    println!("[setup] alice created a 2-member MLS group and added bob (locally, not sent yet; persisted to disk)");
 
     println!("[tor] bootstrapping bob's Tor client (listener side) — this talks to the real Tor network...");
     let bob_tor: Client = bootstrap_for_this_run().await?;
@@ -264,6 +283,101 @@ async fn run_demo() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolves tech-stack.md's open item #5: proves identity *and* MLS group
+/// state actually survive a restart, not just "in a unit test with nothing
+/// dropped" -- this simulates it for real: identity stores are sealed to
+/// their encrypted files and fully dropped (temp files removed), then
+/// reopened from those files and the MLS group reloaded by ID, entirely
+/// separately from the first run's in-memory state. No Tor involved here
+/// deliberately -- this isolates the persistence property from the
+/// network layer, which `demo`/`bench` already cover.
+async fn run_restart_demo() -> anyhow::Result<()> {
+    let work_dir = tempfile::tempdir()?;
+    let alice_path = work_dir.path().join("alice.enc");
+    let bob_path = work_dir.path().join("bob.enc");
+
+    println!("[restart-demo] === run 1: create identities, form an MLS group, exchange a message ===");
+    let alice_group_id = {
+        let (alice_store, alice_public) = IdentityStore::create(&alice_path, "alice", "restart demo passphrase")?;
+        let (bob_store, bob_public) = IdentityStore::create(&bob_path, "bob", "restart demo passphrase")?;
+        let alice_signer = alice_store.signing_key_pair(&alice_public)?.expect("alice key pair");
+        let bob_signer = bob_store.signing_key_pair(&bob_public)?.expect("bob key pair");
+
+        let alice = Member::new("alice", alice_signer, mls_provider_for(&alice_store)?);
+        let bob = Member::new("bob", bob_signer, mls_provider_for(&bob_store)?);
+
+        let mut alice_group = alice.create_group()?;
+        let group_id = alice_group.group_id().clone();
+        let bob_key_package = bob.key_package_bytes()?;
+        let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
+        let mut bob_group = bob.join_from_welcome(&welcome_bytes)?;
+
+        let ciphertext = alice.encrypt(&mut alice_group, b"Hello Bob, before the restart!")?;
+        let plaintext = bob
+            .decrypt(&mut bob_group, &ciphertext)?
+            .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+        println!(
+            "[restart-demo] bob decrypted: {:?}",
+            String::from_utf8_lossy(&plaintext)
+        );
+
+        // Drop the MLS providers (and their SQLite connections) before
+        // sealing, so the identity stores' seal() reads a file with no
+        // outstanding writers.
+        drop(alice_group);
+        drop(bob_group);
+        drop(alice);
+        drop(bob);
+
+        let mut alice_store = alice_store;
+        let mut bob_store = bob_store;
+        alice_store.seal()?;
+        bob_store.seal()?;
+        println!("[restart-demo] sealed both identities to disk; dropping everything now (simulated restart)");
+        group_id
+        // alice_store/bob_store drop here -> their decrypted temp files
+        // are removed. Only alice.enc/bob.enc remain on disk.
+    };
+
+    println!("[restart-demo] === run 2: reopen identities from their encrypted files, reload the MLS group ===");
+    let (alice_store, alice_public) = IdentityStore::open(&alice_path, "restart demo passphrase")?;
+    let (bob_store, bob_public) = IdentityStore::open(&bob_path, "restart demo passphrase")?;
+    let alice_signer = alice_store.signing_key_pair(&alice_public)?.expect("alice key pair");
+    let bob_signer = bob_store.signing_key_pair(&bob_public)?.expect("bob key pair");
+
+    let alice = Member::new("alice", alice_signer, mls_provider_for(&alice_store)?);
+    let bob = Member::new("bob", bob_signer, mls_provider_for(&bob_store)?);
+
+    let mut alice_group = alice
+        .load_group(&alice_group_id)?
+        .ok_or_else(|| anyhow::anyhow!("alice's group was not persisted"))?;
+    let mut bob_group = bob
+        .load_group(&alice_group_id)?
+        .ok_or_else(|| anyhow::anyhow!("bob's group was not persisted"))?;
+    println!("[restart-demo] both identities reopened and the MLS group reloaded from disk");
+
+    let ciphertext = alice.encrypt(&mut alice_group, b"Hello again, after the restart!")?;
+    let plaintext = bob
+        .decrypt(&mut bob_group, &ciphertext)?
+        .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+    println!(
+        "[restart-demo] bob decrypted (after restart): {:?}",
+        String::from_utf8_lossy(&plaintext)
+    );
+
+    let reply_ciphertext = bob.encrypt(&mut bob_group, b"Got it, still works!")?;
+    let reply_plaintext = alice
+        .decrypt(&mut alice_group, &reply_ciphertext)?
+        .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+    println!(
+        "[restart-demo] alice decrypted (after restart): {:?}",
+        String::from_utf8_lossy(&reply_plaintext)
+    );
+
+    println!("[done] identity + MLS group state both survived a simulated restart.");
+    Ok(())
+}
+
 /// Resolves tech-stack.md's open item #1: measure the *combined*
 /// real-world per-message latency of MLS + Noise + a live Tor circuit,
 /// once the connection is already established -- not connection setup
@@ -282,8 +396,8 @@ async fn run_bench(n: usize) -> anyhow::Result<()> {
     let alice_noise_private = alice_store.noise_static_private_key()?;
     let bob_noise_private = bob_store.noise_static_private_key()?;
 
-    let alice = Member::new("alice", alice_signer);
-    let bob = Member::new("bob", bob_signer);
+    let alice = Member::new("alice", alice_signer, mls_provider_for(&alice_store)?);
+    let bob = Member::new("bob", bob_signer, mls_provider_for(&bob_store)?);
     let mut alice_group = alice.create_group()?;
     let bob_key_package = bob.key_package_bytes()?;
     let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
