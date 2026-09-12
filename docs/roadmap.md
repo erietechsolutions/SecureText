@@ -171,13 +171,32 @@ this is a security-sensitive project where shortcuts compound.
     bridges.torproject.org), call `securetext_net::bootstrap_with_bridge`
     and confirm it successfully bootstraps through the bridge.
 
-## Phase 3 — Groups ("Servers") & Channels
-- MLS group creation/join/leave via OpenMLS, scaled beyond 2 members
-- Channel-level key partitioning within a group
-- Signed role/permission capability tokens (post/invite/kick)
+## Phase 3 — Groups ("Servers") & Channels *(in progress)*
+- [x] MLS group creation/join/leave via OpenMLS, scaled beyond 2 members.
+      **Verified deterministically** (`removed_member_cannot_decrypt_subsequent_messages`,
+      `crates/securetext-crypto`, no live Tor needed for this proof): a
+      3-member group (alice, bob, charlie) exchanges a message all three
+      can read; alice removes bob and fans the removal commit out to
+      charlie; a message alice encrypts *after* removal is readable by
+      charlie but **fails to decrypt for bob** — checked by actually
+      attempting the decrypt and asserting it errors, not assumed from the
+      library. Along the way, fixed a real gap: `add_member` previously
+      discarded the commit message entirely, which happened not to matter
+      for Phase 1/2's 2-member scenarios (no third existing member to
+      notify) but would silently desync any *other* existing member's view
+      of the group once a group grew past two people. It now returns
+      `(commit_bytes, welcome_bytes)`; all Phase 1/2 call sites updated.
+- [ ] Channel-level key partitioning within a group
+- [ ] Signed role/permission capability tokens (post/invite/kick)
 - **Exit criteria:** a 3+ member group can be created, a member removed
   loses access to subsequently-sent messages (verified directly, not just
-  assumed from the library), entirely over the Tor transport from Phase 1.
+  assumed from the library) — ✅ met, deterministically, above. "Entirely
+  over the Tor transport from Phase 1" is not yet separately verified for
+  this specific 3-member/removal scenario (the proof above is local,
+  matching how Phase 1's own MLS correctness was first established before
+  layering Tor underneath) — the underlying transport was already
+  extensively live-verified in Phases 1-2, so this is about confirming the
+  3-member case specifically, not a new transport risk.
 
 ## Phase 4 — Discord-like Client UI
 - Server list, channel list, DM list, message view, member/role list

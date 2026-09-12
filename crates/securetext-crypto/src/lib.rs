@@ -102,6 +102,14 @@ impl<P: OpenMlsProvider> Member<P> {
         .map_err(|e| CryptoError::Mls(format!("{e:?}")))
     }
 
+    /// This member's MLS identity public key (matches
+    /// `securetext_identity::PublicIdentity::public_key`) -- the stable
+    /// handle used to find/remove them in a group's member list
+    /// (`remove_member`) or record them as a contact.
+    pub fn public_key(&self) -> &[u8] {
+        self.signer.public()
+    }
+
     /// Reload a previously-created/joined group from this member's
     /// provider after a restart (architecture.md/tech-stack.md: this is
     /// what makes group state durable when `P` is [`PersistentProvider`]
@@ -113,20 +121,25 @@ impl<P: OpenMlsProvider> Member<P> {
     }
 
     /// Add a member (identified by their serialized KeyPackage) to `group`,
-    /// merge the resulting commit locally, and return the Welcome bytes to
-    /// send to the new member.
+    /// merge the resulting commit locally, and return `(commit_bytes,
+    /// welcome_bytes)`: `commit_bytes` must be fanned out to every
+    /// *existing* member besides the sender (so their view of the group
+    /// advances to include the new member -- essential once a group has
+    /// more than the two parties involved in this one Add, or their view
+    /// desyncs from the actual roster), and `welcome_bytes` goes to the
+    /// new member being added.
     pub fn add_member(
         &self,
         group: &mut MlsGroup,
         their_key_package_bytes: &[u8],
-    ) -> Result<Vec<u8>, CryptoError> {
+    ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
         let key_package_in = KeyPackageIn::tls_deserialize_exact(their_key_package_bytes)
             .map_err(|e| CryptoError::TlsCodec(format!("{e:?}")))?;
         let key_package = key_package_in
             .validate(self.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| CryptoError::Mls(format!("invalid key package: {e:?}")))?;
 
-        let (_commit, welcome, _group_info) = group
+        let (commit, welcome, _group_info) = group
             .add_members(
                 &self.provider,
                 &self.signer,
@@ -138,7 +151,41 @@ impl<P: OpenMlsProvider> Member<P> {
             .merge_pending_commit(&self.provider)
             .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
 
-        welcome
+        let commit_bytes = commit
+            .tls_serialize_detached()
+            .map_err(|e| CryptoError::TlsCodec(format!("{e:?}")))?;
+        let welcome_bytes = welcome
+            .tls_serialize_detached()
+            .map_err(|e| CryptoError::TlsCodec(format!("{e:?}")))?;
+        Ok((commit_bytes, welcome_bytes))
+    }
+
+    /// Remove `target_public_key` (an MLS identity public key -- see
+    /// `PublicIdentity::public_key`) from `group`, merge the resulting
+    /// commit locally, and return the commit bytes to fan out to every
+    /// *remaining* member (including, if reachable, the removed member
+    /// themselves -- OpenMLS marks their view of the group inactive once
+    /// they process it, per its own "getting removed" semantics). This is
+    /// Phase 3's core exit criterion: after this commit is merged
+    /// everywhere it needs to be, a message encrypted in the new epoch is
+    /// not decryptable by the removed member, who no longer has that
+    /// epoch's keys -- true whether or not they ever process this commit.
+    pub fn remove_member(&self, group: &mut MlsGroup, target_public_key: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let leaf_index = group
+            .members()
+            .find(|member| member.signature_key == target_public_key)
+            .map(|member| member.index)
+            .ok_or_else(|| CryptoError::Mls("target is not a member of this group".into()))?;
+
+        let (commit, _welcome_option, _group_info) = group
+            .remove_members(&self.provider, &self.signer, &[leaf_index])
+            .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
+
+        group
+            .merge_pending_commit(&self.provider)
+            .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
+
+        commit
             .tls_serialize_detached()
             .map_err(|e| CryptoError::TlsCodec(format!("{e:?}")))
     }
@@ -236,7 +283,7 @@ mod tests {
         let mut alice_group = alice.create_group().expect("alice creates group");
 
         let bob_key_package = bob.key_package_bytes().expect("bob key package");
-        let welcome_bytes = alice
+        let (_commit_bytes, welcome_bytes) = alice
             .add_member(&mut alice_group, &bob_key_package)
             .expect("alice adds bob");
 
@@ -274,7 +321,7 @@ mod tests {
         let bob = fresh_member("bob");
         let mut alice_group = alice.create_group().expect("alice creates group");
         let bob_key_package = bob.key_package_bytes().expect("bob key package");
-        let welcome_bytes = alice
+        let (_commit_bytes, welcome_bytes) = alice
             .add_member(&mut alice_group, &bob_key_package)
             .expect("alice adds bob");
         let mut bob_group = bob.join_from_welcome(&welcome_bytes).expect("bob joins");
@@ -296,6 +343,89 @@ mod tests {
         eprintln!(
             "two_member_group_message_throughput_smoke_test: {N} encrypt+decrypt round trips in {elapsed:?} ({:?}/message)",
             elapsed / N as u32
+        );
+    }
+
+    /// Proves the actual persistence property: a group created with a
+    /// Phase 3's core exit criterion: a 3+ member group works, and once a
+    /// member is removed, a message encrypted *after* that removal is not
+    /// decryptable by them -- verified directly (actually attempting the
+    /// decrypt and checking it fails), not assumed from the library.
+    #[test]
+    fn removed_member_cannot_decrypt_subsequent_messages() {
+        let alice = fresh_member("alice");
+        let bob = fresh_member("bob");
+        let charlie = fresh_member("charlie");
+
+        // --- Build a 3-member group. ---
+        let mut alice_group = alice.create_group().expect("alice creates group");
+        let bob_key_package = bob.key_package_bytes().expect("bob key package");
+        let (_commit, welcome_for_bob) = alice
+            .add_member(&mut alice_group, &bob_key_package)
+            .expect("alice adds bob");
+        let mut bob_group = bob.join_from_welcome(&welcome_for_bob).expect("bob joins");
+
+        let charlie_key_package = charlie.key_package_bytes().expect("charlie key package");
+        let (commit_for_bob, welcome_for_charlie) = alice
+            .add_member(&mut alice_group, &charlie_key_package)
+            .expect("alice adds charlie");
+        // Bob is an *existing* member at this point (unlike Phase 1/2's
+        // 2-member scenarios, where there was never a third existing
+        // member to notify) -- he must process this Add commit or his
+        // view of the group desyncs from alice's and charlie's.
+        let bob_processed = bob
+            .decrypt(&mut bob_group, &commit_for_bob)
+            .expect("bob processes the add-charlie commit");
+        assert_eq!(bob_processed, None, "a commit carries no application content");
+        let mut charlie_group = charlie
+            .join_from_welcome(&welcome_for_charlie)
+            .expect("charlie joins");
+
+        // Sanity: all three can read a message sent before any removal.
+        let before_ciphertext = alice
+            .encrypt(&mut alice_group, b"hello everyone")
+            .expect("alice encrypts");
+        assert_eq!(
+            bob.decrypt(&mut bob_group, &before_ciphertext).expect("bob decrypts"),
+            Some(b"hello everyone".to_vec())
+        );
+        assert_eq!(
+            charlie
+                .decrypt(&mut charlie_group, &before_ciphertext)
+                .expect("charlie decrypts"),
+            Some(b"hello everyone".to_vec())
+        );
+
+        // --- Alice removes bob. ---
+        let removal_commit = alice
+            .remove_member(&mut alice_group, bob.public_key())
+            .expect("alice removes bob");
+        // Charlie (remaining member) processes the removal to advance to
+        // the new epoch.
+        charlie
+            .decrypt(&mut charlie_group, &removal_commit)
+            .expect("charlie processes the removal commit");
+
+        // --- A message encrypted in the new (post-removal) epoch... ---
+        let after_ciphertext = alice
+            .encrypt(&mut alice_group, b"bob should not see this")
+            .expect("alice encrypts after removal");
+
+        // ...is readable by the remaining member...
+        assert_eq!(
+            charlie
+                .decrypt(&mut charlie_group, &after_ciphertext)
+                .expect("charlie decrypts after removal"),
+            Some(b"bob should not see this".to_vec())
+        );
+
+        // ...but NOT by the removed member, whose group handle is stuck at
+        // the old epoch and lacks the new epoch's keys. This is the actual
+        // revocation property, verified by attempting it, not assumed.
+        let bob_result = bob.decrypt(&mut bob_group, &after_ciphertext);
+        assert!(
+            bob_result.is_err(),
+            "removed member must NOT be able to decrypt a post-removal message, got: {bob_result:?}"
         );
     }
 
@@ -338,7 +468,7 @@ mod tests {
             let mut alice_group = alice.create_group().expect("alice creates group");
             let group_id = alice_group.group_id().clone();
             let bob_key_package = bob.key_package_bytes().expect("bob key package");
-            let welcome_bytes = alice
+            let (_commit_bytes, welcome_bytes) = alice
                 .add_member(&mut alice_group, &bob_key_package)
                 .expect("alice adds bob");
             let mut bob_group = bob.join_from_welcome(&welcome_bytes).expect("bob joins");

@@ -336,7 +336,7 @@ async fn run_connect(link: &str, dir: &std::path::Path, label: &str, passphrase:
     let noise_private = identity_store.noise_static_private_key()?;
 
     let mut group = member.create_group()?;
-    let welcome_bytes = member.add_member(&mut group, &invite.mls_key_package)?;
+    let (_commit_bytes, welcome_bytes) = member.add_member(&mut group, &invite.mls_key_package)?;
     println!("[connect] created a new group and added {:?} from their key package", invite.label);
 
     println!("[connect] dialing {}...", invite.onion_address);
@@ -400,7 +400,7 @@ async fn run_demo() -> anyhow::Result<()> {
 
     let mut alice_group = alice.create_group()?;
     let bob_key_package = bob.key_package_bytes()?;
-    let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
+    let (_commit_bytes, welcome_bytes) = alice.add_member(&mut alice_group, &bob_key_package)?;
     println!("[setup] alice created a 2-member MLS group and added bob (locally, not sent yet; persisted to disk)");
 
     println!("[tor] bootstrapping bob's Tor client (listener side) — this talks to the real Tor network...");
@@ -548,7 +548,7 @@ async fn run_restart_demo() -> anyhow::Result<()> {
         let mut alice_group = alice.create_group()?;
         let group_id = alice_group.group_id().clone();
         let bob_key_package = bob.key_package_bytes()?;
-        let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
+        let (_commit_bytes, welcome_bytes) = alice.add_member(&mut alice_group, &bob_key_package)?;
         let mut bob_group = bob.join_from_welcome(&welcome_bytes)?;
 
         let ciphertext = alice.encrypt(&mut alice_group, b"Hello Bob, before the restart!")?;
@@ -641,7 +641,7 @@ async fn run_rotate_demo() -> anyhow::Result<()> {
     let bob = Member::new("bob", bob_signer, mls_provider_for(&bob_store)?);
     let mut alice_group = alice.create_group()?;
     let bob_key_package = bob.key_package_bytes()?;
-    let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
+    let (_commit_bytes, welcome_bytes) = alice.add_member(&mut alice_group, &bob_key_package)?;
     // Both "sides" of this one process already have the plain welcome_bytes
     // value in memory (this demo is about rotation, not re-proving Welcome
     // delivery, which `demo` already covers over a real network) -- bob
@@ -840,7 +840,7 @@ async fn run_bench(n: usize) -> anyhow::Result<()> {
     let bob = Member::new("bob", bob_signer, mls_provider_for(&bob_store)?);
     let mut alice_group = alice.create_group()?;
     let bob_key_package = bob.key_package_bytes()?;
-    let welcome_bytes = alice.add_member(&mut alice_group, &bob_key_package)?;
+    let (_commit_bytes, welcome_bytes) = alice.add_member(&mut alice_group, &bob_key_package)?;
 
     let (bob_tor, _bob_tor_scratch): (Client, _) = bootstrap_for_this_run().await?;
     let mut bob_listener = Listener::launch(&bob_tor, "securetext-bench-bob")?;
