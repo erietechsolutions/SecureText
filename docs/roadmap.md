@@ -32,9 +32,12 @@ this is a security-sensitive project where shortcuts compound.
       bottleneck (tech-stack.md's implementation findings)
 - [x] `arti`-based onion service hosting and outbound dialing
       (`crates/securetext-net`), **live-verified against the real Tor
-      network in this dev environment**: successful bootstrap, a real
-      `.onion` v3 address issued, and (pending final confirmation — see
-      below) a two-party byte round trip through it
+      network in this dev environment**: successful bootstrap (~15s) and a
+      real `.onion` v3 address issued. The two-independent-clients round
+      trip test is written but not yet passing — it stalled on the second
+      client's bootstrap when run concurrently in one process (tech-stack.md
+      implementation findings); needs a re-run with more worker threads or
+      as separate processes before this item is fully closed.
 - [x] Proof-of-integration CLI (`securetext demo`) wiring identity + MLS +
       Tor together exactly as the real app would: two local identities
       form a group, exchange a Welcome and an application message over a

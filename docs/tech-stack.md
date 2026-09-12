@@ -109,12 +109,22 @@ rather than guessed in advance:
   never disabling the check. Documented in `securetext-net`'s tests as a
   troubleshooting note for future contributors hitting the same thing.
 - **Live-verified in this dev sandbox** (not just compiled): `arti`
-  successfully bootstrapped onto the real Tor network, launched a live v3
-  onion service, and completed a full two-party byte round trip through it
-  end to end — see `crates/securetext-net/src/lib.rs`'s
-  `#[ignore]`-marked live tests (`cargo test -p securetext-net -- --ignored
-  --nocapture`; they're `#[ignore]`d by default since they need real,
-  unrestricted internet access and take 15s+ each for Tor bootstrap).
+  successfully bootstrapped onto the real Tor network in ~15s and launched
+  a live v3 onion service with a real `.onion` address
+  (`bootstrap_and_launch_onion_service_live`, passing). **Not yet verified:
+  a full two-party round trip** — `two_peer_round_trip_over_onion_service_live`
+  runs two independent `TorClient`s concurrently in one process and got
+  stuck for 10+ minutes on the second client's bootstrap (vs. ~15s for a
+  single client alone) before being killed; this looks like resource/thread
+  contention between two full Tor clients sharing one small
+  (`worker_threads = 2`) tokio runtime rather than a transport-layer
+  problem, since each half (bootstrap, onion service launch, and the
+  underlying `dial`/`accept_next` code) is otherwise exercised and correct.
+  **Open item, not silently resolved:** re-run this test with a larger
+  worker-thread pool and/or as two genuinely separate OS processes (closer
+  to how two real users' devices would run anyway) before treating Phase
+  1's "two instances exchange E2EE messages entirely over Tor" exit
+  criterion as met.
 
 ## Open items to resolve before Phase 1 is considered complete
 
