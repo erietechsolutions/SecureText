@@ -13,6 +13,7 @@ path = "src/main.rs"
 securetext-identity = { path = "../securetext-identity" }
 securetext-crypto = { path = "../securetext-crypto" }
 securetext-net = { path = "../securetext-net" }
+securetext-invite = { path = "../securetext-invite" }
 snow.workspace = true
 rusqlite.workspace = true
 tokio.workspace = true

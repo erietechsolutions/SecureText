@@ -1,4 +1,4 @@
-//! Phase 1 proof-of-integration CLI.
+//! SecureText proof-of-integration CLI (Phase 1 + Phase 2 so far).
 //!
 //! `securetext demo` runs the actual Phase 1 exit criteria end to end in one
 //! process, standing in for two separate machines: two local identities
@@ -22,16 +22,18 @@
 //! restart: identity stores sealed and dropped, then reopened from their
 //! encrypted files and the MLS group reloaded by ID before continuing.
 //!
-//! What this demo does **not** yet include, tracked as a follow-up rather
-//! than silently skipped:
-//! - Invite links (Phase 2) — the onion address, Noise static public key,
-//!   and MLS key package are exchanged in-process (`demo`) or via manual
-//!   copy-paste (`net-listen`/`net-dial`) instead of a real invite
-//!   mechanism.
+//! `securetext invite` / `securetext connect <link>` (Phase 2) replace that
+//! three-argument manual exchange with a single shareable invite link
+//! (`securetext-invite`) encoding the onion address, Noise static key, and
+//! MLS key package together -- see architecture.md §2. Unlike `demo`/
+//! `bench`/`net-listen`/`net-dial`, these two commands use a **persistent**
+//! identity and Tor state directory (`--dir`), so the onion address stays
+//! stable across runs and an invite printed once remains valid later.
 
 use rusqlite::Connection;
 use securetext_crypto::{Member, PersistentProvider};
 use securetext_identity::IdentityStore;
+use securetext_invite::Invite;
 use securetext_net::{Client, Listener, SecureMux};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -44,6 +46,38 @@ fn mls_provider_for(identity_store: &IdentityStore) -> anyhow::Result<Persistent
     let mut provider = PersistentProvider::new(connection);
     provider.run_migrations()?;
     Ok(provider)
+}
+
+/// Find `--name value` in `args` (the args after the subcommand itself).
+fn parse_flag(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// Open (or create, on first run) a persistent identity and its Tor client
+/// under `dir`, so both survive across separate process invocations --
+/// what makes an invite link printed by one run still valid the next time
+/// this identity's process starts. `dir`'s ownership chain must be clean
+/// for arti's own sake (platform-support.md; a sandboxed dev environment
+/// may need `dir` under e.g. `/tmp` -- see tech-stack.md's implementation
+/// findings).
+async fn open_persistent_identity(
+    dir: &std::path::Path,
+    label: &str,
+    passphrase: &str,
+) -> anyhow::Result<(IdentityStore, securetext_identity::PublicIdentity, Client)> {
+    std::fs::create_dir_all(dir)?;
+    let identity_path = dir.join("identity.enc");
+    let (identity_store, public_identity) = if identity_path.exists() {
+        IdentityStore::open(&identity_path, passphrase)?
+    } else {
+        IdentityStore::create(&identity_path, label, passphrase)?
+    };
+
+    let tor = securetext_net::bootstrap_with_dirs(&dir.join("tor-state"), &dir.join("tor-cache")).await?;
+    Ok((identity_store, public_identity, tor))
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -67,6 +101,26 @@ async fn main() -> anyhow::Result<()> {
             let expected_noise_pubkey = from_hex(&expected_noise_pubkey_hex)?;
             run_net_dial(&address, &expected_noise_pubkey).await
         }
+        Some("invite") => {
+            let rest = &args[2..];
+            let dir = parse_flag(rest, "--dir").ok_or_else(|| anyhow::anyhow!("--dir <path> is required"))?;
+            let label = parse_flag(rest, "--label").unwrap_or_else(|| "me".to_string());
+            let passphrase = parse_flag(rest, "--passphrase")
+                .ok_or_else(|| anyhow::anyhow!("--passphrase <value> is required"))?;
+            run_invite(std::path::Path::new(&dir), &label, &passphrase).await
+        }
+        Some("connect") => {
+            let link = args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("usage: securetext connect <invite-link> --dir <path> --passphrase <value>"))?;
+            let rest = &args[3..];
+            let dir = parse_flag(rest, "--dir").ok_or_else(|| anyhow::anyhow!("--dir <path> is required"))?;
+            let label = parse_flag(rest, "--label").unwrap_or_else(|| "me".to_string());
+            let passphrase = parse_flag(rest, "--passphrase")
+                .ok_or_else(|| anyhow::anyhow!("--passphrase <value> is required"))?;
+            run_connect(&link, std::path::Path::new(&dir), &label, &passphrase).await
+        }
         _ => {
             eprintln!("usage: securetext demo | bench [N] | restart-demo");
             eprintln!("  Runs the Phase 1 proof: two local identities exchange an MLS-encrypted,");
@@ -76,6 +130,13 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  Same round trip split across two separate OS processes (run in two");
             eprintln!("  terminals) -- net-listen prints the onion address and its Noise static");
             eprintln!("  public key; paste both into net-dial's arguments in the other terminal.");
+            eprintln!();
+            eprintln!("usage: securetext invite --dir <path> --passphrase <value> [--label <name>]");
+            eprintln!("usage: securetext connect <invite-link> --dir <path> --passphrase <value> [--label <name>]");
+            eprintln!("  Phase 2: a real invite-link exchange (architecture.md §2) instead of");
+            eprintln!("  net-listen/net-dial's manual arguments. `--dir` is a persistent identity +");
+            eprintln!("  Tor state directory (unlike demo/bench/net-*, which use a fresh one every");
+            eprintln!("  run), so the printed invite link keeps working across restarts.");
             std::process::exit(2);
         }
     }
@@ -182,6 +243,136 @@ async fn run_net_dial(address: &str, expected_noise_pubkey: &[u8]) -> anyhow::Re
     drop(mux_stream);
     mux.close().await?;
     println!("[dial] round trip verified; done");
+    Ok(())
+}
+
+/// Phase 2: create/open a persistent identity, print an invite link for
+/// it, and wait for one holder of that link to connect -- accepts the
+/// resulting Welcome on a control stream, joins the group, then exchanges
+/// one application message on a chat stream (mirroring `demo`'s shape, but
+/// reached via the invite link instead of in-process wiring).
+async fn run_invite(dir: &std::path::Path, label: &str, passphrase: &str) -> anyhow::Result<()> {
+    println!("[invite] opening/creating identity at {}...", dir.display());
+    let (identity_store, public_identity, tor) = open_persistent_identity(dir, label, passphrase).await?;
+    let signer = identity_store
+        .signing_key_pair(&public_identity)?
+        .expect("key pair present");
+    let noise_private = identity_store.noise_static_private_key()?;
+    let member = Member::new(label, signer, mls_provider_for(&identity_store)?);
+
+    let mut listener = Listener::launch(&tor, "securetext")?;
+    let onion_address = listener.onion_address()?;
+    let key_package = member.key_package_bytes()?;
+
+    let invite = Invite {
+        label: label.to_string(),
+        onion_address: onion_address.clone(),
+        noise_public_key: public_identity.noise_public_key.clone(),
+        mls_key_package: key_package,
+    };
+    println!("[invite] share this link:");
+    println!("{}", invite.to_link());
+    println!("[invite] waiting for someone to connect with it...");
+
+    let mut stream = listener
+        .accept_next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("listener closed with no connection"))?;
+    println!("[invite] someone connected over the onion service");
+
+    let (noise, remote_noise_key) = securetext_net::handshake_responder(&mut stream, &noise_private).await?;
+    println!(
+        "[invite] noise handshake complete; connecting party's static key: {}",
+        to_hex(&remote_noise_key)
+    );
+
+    let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Server);
+    let mut control_stream = mux
+        .accept()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("connecting party never opened the control stream"))?;
+    let mut chat_stream = mux
+        .accept()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("connecting party never opened the chat stream"))?;
+
+    let welcome_bytes = read_framed(&mut control_stream).await?;
+    let mut group = member.join_from_welcome(&welcome_bytes)?;
+    println!("[invite] joined the group from the connecting party's Welcome message");
+
+    let ciphertext = read_framed(&mut chat_stream).await?;
+    let plaintext = member
+        .decrypt(&mut group, &ciphertext)?
+        .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+    println!("[invite] received: {:?}", String::from_utf8_lossy(&plaintext));
+
+    let reply = member.encrypt(&mut group, b"Got your message via the invite link!")?;
+    write_framed(&mut chat_stream, &reply).await?;
+    drop(control_stream);
+    drop(chat_stream);
+    mux.close().await?;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    println!("[invite] sent a reply; done");
+    Ok(())
+}
+
+/// Phase 2: parse an invite link, create/open a persistent identity, and
+/// use the invite's onion address + Noise key + MLS key package to reach
+/// and add the inviter to a brand-new group -- no manually copy-pasted
+/// address or key, unlike `net-dial`.
+async fn run_connect(link: &str, dir: &std::path::Path, label: &str, passphrase: &str) -> anyhow::Result<()> {
+    let invite = Invite::from_link(link)?;
+    println!(
+        "[connect] parsed invite for {:?} at {}",
+        invite.label, invite.onion_address
+    );
+
+    let (identity_store, public_identity, tor) = open_persistent_identity(dir, label, passphrase).await?;
+    let signer = identity_store
+        .signing_key_pair(&public_identity)?
+        .expect("key pair present");
+    let member = Member::new(label, signer, mls_provider_for(&identity_store)?);
+    let noise_private = identity_store.noise_static_private_key()?;
+
+    let mut group = member.create_group()?;
+    let welcome_bytes = member.add_member(&mut group, &invite.mls_key_package)?;
+    println!("[connect] created a new group and added {:?} from their key package", invite.label);
+
+    println!("[connect] dialing {}...", invite.onion_address);
+    let mut stream = securetext_net::dial(&tor, &invite.onion_address, 1).await?;
+    println!("[connect] connected over the onion service (never learned their IP)");
+
+    let (noise, remote_noise_key) = securetext_net::handshake_initiator(&mut stream, &noise_private).await?;
+    anyhow::ensure!(
+        remote_noise_key == invite.noise_public_key,
+        "the party at this onion address presented a different Noise key than the invite promised \
+         -- refusing to trust this connection (presented: {}, expected: {})",
+        to_hex(&remote_noise_key),
+        to_hex(&invite.noise_public_key)
+    );
+    println!("[connect] noise handshake complete; identity matches the invite");
+
+    let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Client);
+    let mut control_stream = mux.open().await?;
+    let mut chat_stream = mux.open().await?;
+
+    write_framed(&mut control_stream, &welcome_bytes).await?;
+    println!("[connect] sent Welcome message");
+
+    let ciphertext = member.encrypt(&mut group, b"Hello via your invite link!")?;
+    write_framed(&mut chat_stream, &ciphertext).await?;
+    println!("[connect] sent an application message");
+
+    let reply_ciphertext = read_framed(&mut chat_stream).await?;
+    let reply_plaintext = member
+        .decrypt(&mut group, &reply_ciphertext)?
+        .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
+    println!("[connect] received: {:?}", String::from_utf8_lossy(&reply_plaintext));
+
+    drop(control_stream);
+    drop(chat_stream);
+    mux.close().await?;
+    println!("[connect] done");
     Ok(())
 }
 

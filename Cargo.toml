@@ -4,6 +4,7 @@ members = [
     "crates/securetext-identity",
     "crates/securetext-crypto",
     "crates/securetext-net",
+    "crates/securetext-invite",
     "crates/securetext-cli",
 ]
 
@@ -38,6 +39,7 @@ tempfile = "3"
 
 snow = "0.10"
 yamux = "0.14"
+base64 = "0.23"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Networking (Tor)

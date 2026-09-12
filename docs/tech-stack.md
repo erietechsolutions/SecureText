@@ -34,6 +34,7 @@ question) — both are now settled below.
 | Password/passphrase KDF | `argon2` crate (Argon2id) | Memory-hard, current best practice over PBKDF2/bcrypt |
 | Local storage | SQLite via `rusqlite` + SQLCipher | Encrypted at rest; SQL is sufficient for message/channel/member metadata at this scale |
 | Voice/video | WebRTC via `webrtc-rs` | Native Rust WebRTC implementation; used only for the Phase 6 calls exception (architecture.md §9), which is deliberately outside the Tor transport |
+| Invite link encoding | `base64` (`marshallpierce/rust-base64`) | Extremely widely used (1.5B+ downloads), MIT/Apache-2.0, actively maintained — vetted per this doc's own standing rule below; used to keep byte fields (keys, key packages) compact within an invite link's JSON payload instead of serde_json's default number-array encoding |
 
 **Dropped from the stack:** `rust-libp2p`. It was chosen when the network
 design was hybrid clearnet P2P needing DHT discovery and STUN/TURN/ICE NAT
@@ -247,6 +248,30 @@ rather than guessed in advance:
    onion-service connection.
 7. **Frontend framework for Tauri** (React vs. Svelte vs. other) — deferred
    to Phase 4, not blocking.
+
+## Phase 2 implementation findings
+
+- **Invite links needed a persistent identity/Tor-state directory, which
+  the Phase 1 CLI didn't have.** `demo`/`bench`/`net-listen`/`net-dial` all
+  use a fresh `tempfile::tempdir()` per run — fine for one-shot proofs, but
+  an invite link printed by one run of a tempdir-based process would
+  reference an onion address that stops existing the moment that process
+  exits. `invite`/`connect` introduced `open_persistent_identity()`
+  (`crates/securetext-cli`), which opens/creates the identity at
+  `<dir>/identity.enc` and points `arti` at `<dir>/tor-state` /
+  `<dir>/tor-cache` instead of a tempdir, so the onion-service key (and
+  thus the address) stays stable across restarts — this is the same
+  `bootstrap_with_dirs` function from Phase 1, just pointed somewhere
+  durable instead of ephemeral.
+- **serde's default `Vec<u8>` encoding (a JSON array of numbers) is very
+  wasteful for key material.** An invite carrying a 32-byte Noise key and a
+  ~200-300 byte MLS key package came out well over 1000 characters before
+  fixing this — each byte was ~4-5 JSON characters (`"186,"`) instead of
+  ~1.4 base64 characters. Fixed with a small `#[serde(with = "as_base64")]`
+  helper module (`securetext-invite`) rather than switching the whole
+  payload format; still JSON, just with base64 strings for the byte
+  fields. Worth remembering for any future wire format carrying key
+  material as JSON.
 
 ## Standing rule: crypto/network-adjacent dependency vetting
 

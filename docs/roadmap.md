@@ -101,16 +101,34 @@ this is a security-sensitive project where shortcuts compound.
     exit criterion as met. This is the one piece of Phase 1 that
     genuinely requires hardware/an OS this environment doesn't have.
 
-## Phase 2 — Invite Links & Bridges
-- Invite-link format encoding onion address + MLS key package/Welcome
-  message (architecture.md §2), replacing manual address exchange
-- Onion-address rotation + "I've moved" re-linking within existing MLS
-  groups (architecture.md §2)
-- Pluggable transport (obfs4) support via `arti`, with the bridge
-  configuration UX decided in Phase 1's open items (architecture.md §5)
-- **Exit criteria:** two peers connect via invite link with no manual
-  address exchange; a simulated Tor-blocked network condition is overcome
-  using a configured obfs4 bridge, verified end-to-end.
+## Phase 2 — Invite Links & Bridges *(in progress)*
+- [x] Invite-link format encoding onion address + Noise static key + MLS
+      key package (architecture.md §2) as a single shareable
+      `securetext1:<base64>` string, replacing `net-listen`/`net-dial`'s
+      manual three-argument exchange (new crate: `securetext-invite`).
+      **Live-verified against the real Tor network**: `securetext invite
+      --dir <path> --passphrase <pw>` prints a link; `securetext connect
+      <link> --dir <path> --passphrase <pw>` (a genuinely separate process)
+      parses it, dials the onion address, verifies the presented Noise key
+      matches what the invite promised, adds the inviter to a new MLS
+      group from their key package, and exchanges application messages
+      correctly in both directions. Byte fields are base64-encoded within
+      the JSON payload (not JSON's default number-array encoding) to keep
+      the link reasonably compact.
+      Unlike `demo`/`bench`/`net-listen`/`net-dial`, `invite`/`connect` use
+      a **persistent** identity and Tor state directory (`--dir`), so the
+      onion address stays stable across restarts and a previously-printed
+      invite link keeps working later, not just within one process's
+      lifetime.
+- [ ] Onion-address rotation + "I've moved" re-linking within existing MLS
+      groups (architecture.md §2)
+- [ ] Pluggable transport (obfs4) support via `arti`, with the bridge
+      configuration UX decided in Phase 1's open items (architecture.md §5)
+- **Exit criteria:**
+  - ✅ Two peers connect via invite link with no manual address exchange:
+    verified live as described above.
+  - 🔲 A simulated Tor-blocked network condition is overcome using a
+    configured obfs4 bridge, verified end-to-end — not yet attempted.
 
 ## Phase 3 — Groups ("Servers") & Channels
 - MLS group creation/join/leave via OpenMLS, scaled beyond 2 members

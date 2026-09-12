@@ -4070,6 +4070,7 @@ dependencies = [
  "rusqlite",
  "securetext-crypto",
  "securetext-identity",
+ "securetext-invite",
  "securetext-net",
  "snow",
  "tempfile",
@@ -4114,6 +4115,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "zeroize",
+]
+
+[[package]]
+name = "securetext-invite"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
