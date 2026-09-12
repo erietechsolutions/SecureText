@@ -80,7 +80,11 @@ Layered fallback, most-preferred first:
 
 Budget for TURN relay fallback being used far more often in practice than
 naive P2P demos suggest — carrier-grade NAT and corporate firewalls are
-common.
+common. This is compounded by OS-level firewall defaults differing across
+target platforms (Windows Defender Firewall prompts, Fedora's `firewalld`
+default-deny inbound policy) — see platform-support.md §"Firewall & inbound
+connections" for why outbound-initiated hole punching is the preferred
+primary path rather than relying on inbound port access.
 
 ## 6. Offline message delivery
 

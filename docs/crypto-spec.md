@@ -92,8 +92,10 @@ itself is encrypted:
   brute-force better than PBKDF2/bcrypt).
 - Private key material itself is stored separately from message history,
   ideally in the OS-native secure enclave / keychain where available
-  (Keychain on macOS, Credential Manager/DPAPI on Windows, Secret Service
-  on Linux), falling back to the same passphrase-derived encryption.
+  (Credential Manager/DPAPI on Windows, Secret Service on Ubuntu/Fedora),
+  falling back to the same passphrase-derived encryption when no OS keyring
+  is available (e.g., a headless Linux install with no Secret Service
+  daemon running — see platform-support.md for this gap in detail).
 
 ## 6. What is explicitly NOT encrypted (and must be minimized)
 

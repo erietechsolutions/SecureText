@@ -8,6 +8,12 @@ cleanly to a shared library that mobile clients (Phase 9) can call into via
 UniFFI — avoiding a second implementation of the crypto/networking layer
 for mobile.
 
+**Target platforms:** Ubuntu, Fedora, and Windows 10/11 (see
+[platform-support.md](platform-support.md) for the full matrix and
+per-platform implementation notes — OS keyring, firewall defaults,
+packaging). Every choice below was made with cross-platform Rust crates
+specifically to avoid OS-specific forks of the core logic.
+
 ## Core / backend
 
 | Concern | Choice | Why |
@@ -26,7 +32,7 @@ for mobile.
 
 | Concern | Choice | Why |
 |---|---|---|
-| Desktop shell | **Tauri** | Rust backend (shares the core directly, no FFI boundary for desktop), web frontend for fast UI iteration, much smaller binary/resource footprint than Electron |
+| Desktop shell | **Tauri** | Rust backend (shares the core directly, no FFI boundary for desktop), web frontend for fast UI iteration, much smaller binary/resource footprint than Electron; ships native installers for all three target OSes (see platform-support.md) |
 | Frontend framework | React or Svelte (pick during Phase 4 UI work, not a Phase 0 blocker) | Either works fine inside Tauri; decision deferred since it doesn't affect the core architecture |
 | Mobile (Phase 9) | React Native or Flutter shell, calling the Rust core via UniFFI | Reuses the audited Rust core instead of reimplementing crypto/networking per platform |
 
@@ -48,8 +54,10 @@ for mobile.
    better fit. This is the single highest-risk library decision — resolve
    it with a focused spike before committing.
 2. **SQLCipher Rust binding maturity** — verify `rusqlite`'s SQLCipher
-   feature flag is well-maintained on all target platforms (Linux/macOS/
-   Windows) before relying on it for at-rest encryption.
+   feature flag builds cleanly on Ubuntu, Fedora, and Windows before
+   relying on it for at-rest encryption; the OpenSSL/vcpkg dependency
+   chain on Windows is the highest-risk part (see platform-support.md
+   open item #1 for the fallback plan if it proves painful).
 3. **`webrtc-rs` vs. FFI to `libwebrtc`** — `webrtc-rs` is younger than
    Google's `libwebrtc`; verify it covers everything needed (in particular
    ICE/TURN interop) before Phase 6, or plan an FFI fallback.

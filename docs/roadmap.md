@@ -24,6 +24,9 @@ this is a security-sensitive project where shortcuts compound.
 - **Exit criteria:** two instances on different machines can exchange E2EE
   messages with no shared server, verified against the threat model's
   eavesdropper scenario (e.g., a packet capture shows only ciphertext).
+  Verified across at least one Linux-to-Windows pair (e.g., Fedora ↔
+  Windows 11) in addition to same-OS pairs, since this is the first phase
+  where cross-platform wire compatibility could silently break.
 
 ## Phase 2 — Peer Discovery & NAT Traversal
 - Kademlia DHT integration for peer discovery
@@ -83,6 +86,9 @@ this is a security-sensitive project where shortcuts compound.
 
 ## Cross-cutting, ongoing throughout all phases
 
+- **Every phase's exit criteria must be verified on Ubuntu, Fedora, and
+  Windows 10/11** (see `platform-support.md`), not just the OS the code
+  happened to be written on. macOS is not an official v1 target.
 - Revisit `threat-model.md` whenever a new feature changes what data
   leaves a device unencrypted.
 - No custom cryptographic protocol changes ship without review against
