@@ -37,6 +37,8 @@ refinery = "0.9"
 tempfile = "3"
 
 snow = "0.10"
+yamux = "0.14"
+tokio-util = { version = "0.7", features = ["compat"] }
 
 # Networking (Tor)
 arti-client = { version = "0.46", features = ["onion-service-service", "onion-service-client", "tokio", "rustls"] }

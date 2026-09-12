@@ -21,6 +21,10 @@ use tor_rtcompat::PreferredRuntime;
 mod noise;
 pub use noise::{handshake_initiator, handshake_responder, NoiseTransport, NOISE_PATTERN};
 
+mod secure_mux;
+pub use secure_mux::{MuxStream, SecureMux};
+pub use yamux::Mode as MuxMode;
+
 #[derive(thiserror::Error, Debug)]
 pub enum NetError {
     #[error("tor client error: {0}")]
@@ -35,6 +39,8 @@ pub enum NetError {
     NoAddress,
     #[error("noise handshake/transport error: {0}")]
     Noise(String),
+    #[error("stream multiplexing error: {0}")]
+    Mux(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

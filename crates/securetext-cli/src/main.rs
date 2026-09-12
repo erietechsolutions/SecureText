@@ -10,6 +10,11 @@
 //! on top of the onion-service stream, independent of both Tor's own
 //! transport crypto and MLS's message-layer E2EE.
 //!
+//! Two of those logical streams are multiplexed over that one connection
+//! via `SecureMux` (architecture.md §6, backed by `yamux`): a "control"
+//! stream for the MLS Welcome and a "chat" stream for application
+//! messages, avoiding a second Tor circuit for the second stream.
+//!
 //! MLS group state is persisted to the same encrypted SQLite file as the
 //! identity itself (`securetext_crypto::PersistentProvider`, sharing
 //! `IdentityStore::db_path()` via a second connection to that file) --
@@ -19,8 +24,6 @@
 //!
 //! What this demo does **not** yet include, tracked as a follow-up rather
 //! than silently skipped:
-//! - yamux multiplexing over the Noise session (architecture.md §6) — this
-//!   demo still uses one logical stream per connection.
 //! - Invite links (Phase 2) — the onion address, Noise static public key,
 //!   and MLS key package are exchanged in-process (`demo`) or via manual
 //!   copy-paste (`net-listen`/`net-dial`) instead of a real invite
@@ -29,8 +32,8 @@
 use rusqlite::Connection;
 use securetext_crypto::{Member, PersistentProvider};
 use securetext_identity::IdentityStore;
-use securetext_net::{Client, DataStream, Listener, NoiseTransport};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use securetext_net::{Client, Listener, SecureMux};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Open a *second*, independent connection to `identity_store`'s
 /// underlying SQLite file and wrap it as an MLS storage provider -- see
@@ -105,21 +108,31 @@ async fn run_net_listen() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("listener closed with no connection"))?;
     println!("[listen] dialer connected over the onion service");
 
-    let (mut noise, remote_noise_key) =
+    let (noise, remote_noise_key) =
         securetext_net::handshake_responder(&mut stream, &noise_keys.private).await?;
     println!(
         "[listen] noise handshake complete; dialer's static key: {}",
         to_hex(&remote_noise_key)
     );
 
-    let received = read_framed(&mut stream, &mut noise).await?;
+    // Wraps the Noise-encrypted stream with yamux multiplexing
+    // (architecture.md §6): this side accepts logical streams the dialer
+    // opens, since the dialer (Noise initiator) is yamux::Mode::Client.
+    let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Server);
+    let mut mux_stream = mux
+        .accept()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("dialer never opened a logical stream"))?;
+
+    let received = read_framed(&mut mux_stream).await?;
     println!(
         "[listen] received: {:?}",
         String::from_utf8_lossy(&received)
     );
-    write_framed(&mut stream, &mut noise, &received).await?;
-    stream.shutdown().await?;
-    // A per-stream shutdown() alone isn't enough here: this process exits
+    write_framed(&mut mux_stream, &received).await?;
+    drop(mux_stream);
+    mux.close().await?;
+    // A mux-level close() alone isn't enough here: this process exits
     // right after, which drops the whole TorClient and kills its
     // background reactor tasks almost instantly -- well before the just-
     // flushed echo has actually propagated across a real multi-hop Tor
@@ -146,7 +159,7 @@ async fn run_net_dial(address: &str, expected_noise_pubkey: &[u8]) -> anyhow::Re
     println!("[dial] connected over the onion service (never learned the listener's IP)");
 
     let noise_keys = snow::Builder::new(securetext_net::NOISE_PATTERN.parse()?).generate_keypair()?;
-    let (mut noise, remote_noise_key) =
+    let (noise, remote_noise_key) =
         securetext_net::handshake_initiator(&mut stream, &noise_keys.private).await?;
     anyhow::ensure!(
         remote_noise_key == expected_noise_pubkey,
@@ -157,10 +170,17 @@ async fn run_net_dial(address: &str, expected_noise_pubkey: &[u8]) -> anyhow::Re
     );
     println!("[dial] noise handshake complete; listener's identity verified");
 
-    write_framed(&mut stream, &mut noise, b"hello from a separate process").await?;
-    let echoed = read_framed(&mut stream, &mut noise).await?;
+    // This side dials, so it's yamux::Mode::Client, opening the logical
+    // stream the listener (Mode::Server) accepts.
+    let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Client);
+    let mut mux_stream = mux.open().await?;
+
+    write_framed(&mut mux_stream, b"hello from a separate process").await?;
+    let echoed = read_framed(&mut mux_stream).await?;
     println!("[dial] echo received: {:?}", String::from_utf8_lossy(&echoed));
     anyhow::ensure!(echoed == b"hello from a separate process", "echo mismatch");
+    drop(mux_stream);
+    mux.close().await?;
     println!("[dial] round trip verified; done");
     Ok(())
 }
@@ -209,7 +229,7 @@ async fn run_demo() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("listener closed with no connection"))?;
         println!("[bob] alice connected over the onion service");
 
-        let (mut noise, alice_noise_key) =
+        let (noise, alice_noise_key) =
             securetext_net::handshake_responder(&mut stream, &bob_noise_private).await?;
         // Bob happens to already know alice's expected key in this
         // in-process demo, so verifying both directions demonstrates
@@ -222,25 +242,43 @@ async fn run_demo() -> anyhow::Result<()> {
         );
         println!("[bob] noise handshake complete; alice's identity verified");
 
-        let welcome_bytes = read_framed(&mut stream, &mut noise).await?;
-        let mut bob_group = bob.join_from_welcome(&welcome_bytes)?;
-        println!("[bob] joined the MLS group from alice's Welcome message");
+        // Two logical streams multiplexed over this one Noise-encrypted
+        // onion-service connection (architecture.md §6): a "control"
+        // stream carrying the MLS Welcome, and a separate "chat" stream
+        // for application messages -- proving multiplexing is actually
+        // wired in, not just implemented and unit-tested in isolation.
+        let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Server);
+        let mut control_stream = mux
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("alice never opened the control stream"))?;
+        let mut chat_stream = mux
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("alice never opened the chat stream"))?;
 
-        let ciphertext = read_framed(&mut stream, &mut noise).await?;
+        let welcome_bytes = read_framed(&mut control_stream).await?;
+        let mut bob_group = bob.join_from_welcome(&welcome_bytes)?;
+        println!("[bob] joined the MLS group from alice's Welcome message (control stream)");
+
+        let ciphertext = read_framed(&mut chat_stream).await?;
         let plaintext = bob
             .decrypt(&mut bob_group, &ciphertext)?
             .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
         println!(
-            "[bob] decrypted message from alice: {:?}",
+            "[bob] decrypted message from alice (chat stream): {:?}",
             String::from_utf8_lossy(&plaintext)
         );
 
         let reply = bob.encrypt(&mut bob_group, b"Hi Alice, this came back over Tor!")?;
-        write_framed(&mut stream, &mut noise, &reply).await?;
-        // See run_net_listen's comment: a flush alone doesn't guarantee
-        // the remote side has received the bytes yet, and dropping the
-        // stream (when this task returns) too soon after risks the
-        // circuit being reclaimed before delivery finishes.
+        write_framed(&mut chat_stream, &reply).await?;
+        drop(control_stream);
+        drop(chat_stream);
+        mux.close().await?;
+        // See run_net_listen's comment: mux close() settles the yamux
+        // connection but the process still exits right after, which drops
+        // the whole TorClient -- see tech-stack.md's implementation
+        // findings on why that needs its own grace period too.
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         println!("[bob] sent an encrypted reply");
         Ok(())
@@ -254,7 +292,7 @@ async fn run_demo() -> anyhow::Result<()> {
     let mut stream = securetext_net::dial(&alice_tor, &bob_address, 1).await?;
     println!("[alice] connected to bob over Tor (alice never learned bob's IP)");
 
-    let (mut noise, bob_noise_key) =
+    let (noise, bob_noise_key) =
         securetext_net::handshake_initiator(&mut stream, &alice_noise_private).await?;
     anyhow::ensure!(
         bob_noise_key == bob_public.noise_public_key,
@@ -262,14 +300,18 @@ async fn run_demo() -> anyhow::Result<()> {
     );
     println!("[alice] noise handshake complete; bob's identity verified");
 
-    write_framed(&mut stream, &mut noise, &welcome_bytes).await?;
-    println!("[alice] sent Welcome message to bob");
+    let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Client);
+    let mut control_stream = mux.open().await?;
+    let mut chat_stream = mux.open().await?;
+
+    write_framed(&mut control_stream, &welcome_bytes).await?;
+    println!("[alice] sent Welcome message to bob (control stream)");
 
     let ciphertext = alice.encrypt(&mut alice_group, b"Hello Bob, this is over Tor!")?;
-    write_framed(&mut stream, &mut noise, &ciphertext).await?;
-    println!("[alice] sent an encrypted message to bob");
+    write_framed(&mut chat_stream, &ciphertext).await?;
+    println!("[alice] sent an encrypted message to bob (chat stream, multiplexed with control stream)");
 
-    let reply_ciphertext = read_framed(&mut stream, &mut noise).await?;
+    let reply_ciphertext = read_framed(&mut chat_stream).await?;
     let reply_plaintext = alice
         .decrypt(&mut alice_group, &reply_ciphertext)?
         .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
@@ -277,9 +319,14 @@ async fn run_demo() -> anyhow::Result<()> {
         "[alice] decrypted reply from bob: {:?}",
         String::from_utf8_lossy(&reply_plaintext)
     );
+    drop(control_stream);
+    drop(chat_stream);
+    mux.close().await?;
 
     bob_task.await??;
-    println!("[done] Phase 1 proof complete: identity + MLS + Noise + Tor onion services, end to end.");
+    println!(
+        "[done] Phase 1 proof complete: identity + MLS + Noise + yamux + Tor onion services, end to end."
+    );
     Ok(())
 }
 
@@ -412,19 +459,26 @@ async fn run_bench(n: usize) -> anyhow::Result<()> {
             .accept_next()
             .await?
             .ok_or_else(|| anyhow::anyhow!("listener closed with no connection"))?;
-        let (mut noise, _alice_noise_key) =
+        let (noise, _alice_noise_key) =
             securetext_net::handshake_responder(&mut stream, &bob_noise_private).await?;
+        let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Server);
+        let mut mux_stream = mux
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("alice never opened a stream"))?;
 
-        let welcome_bytes = read_framed(&mut stream, &mut noise).await?;
+        let welcome_bytes = read_framed(&mut mux_stream).await?;
         let mut bob_group = bob.join_from_welcome(&welcome_bytes)?;
 
         for _ in 0..n {
-            let ciphertext = read_framed(&mut stream, &mut noise).await?;
+            let ciphertext = read_framed(&mut mux_stream).await?;
             bob.decrypt(&mut bob_group, &ciphertext)?
                 .ok_or_else(|| anyhow::anyhow!("expected an application message"))?;
             let ack = bob.encrypt(&mut bob_group, b"ack")?;
-            write_framed(&mut stream, &mut noise, &ack).await?;
+            write_framed(&mut mux_stream, &ack).await?;
         }
+        drop(mux_stream);
+        mux.close().await?;
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         Ok(())
     });
@@ -432,25 +486,32 @@ async fn run_bench(n: usize) -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     let mut stream = securetext_net::dial(&alice_tor, &bob_address, 1).await?;
-    let (mut noise, bob_noise_key) =
+    let (noise, bob_noise_key) =
         securetext_net::handshake_initiator(&mut stream, &alice_noise_private).await?;
     anyhow::ensure!(bob_noise_key == bob_public.noise_public_key, "bob's noise key mismatch");
 
-    write_framed(&mut stream, &mut noise, &welcome_bytes).await?;
-    println!("[bench] connection established (identity + MLS + Noise + Tor); starting timed round trips...");
+    let mut mux = SecureMux::new(stream, noise, securetext_net::MuxMode::Client);
+    let mut mux_stream = mux.open().await?;
+
+    write_framed(&mut mux_stream, &welcome_bytes).await?;
+    println!(
+        "[bench] connection established (identity + MLS + Noise + yamux + Tor); starting timed round trips..."
+    );
 
     let mut durations = Vec::with_capacity(n);
     for i in 0..n {
         let msg = format!("bench message {i}");
         let start = std::time::Instant::now();
         let ciphertext = alice.encrypt(&mut alice_group, msg.as_bytes())?;
-        write_framed(&mut stream, &mut noise, &ciphertext).await?;
-        let ack_ciphertext = read_framed(&mut stream, &mut noise).await?;
+        write_framed(&mut mux_stream, &ciphertext).await?;
+        let ack_ciphertext = read_framed(&mut mux_stream).await?;
         alice
             .decrypt(&mut alice_group, &ack_ciphertext)?
             .ok_or_else(|| anyhow::anyhow!("expected an ack"))?;
         durations.push(start.elapsed());
     }
+    drop(mux_stream);
+    mux.close().await?;
 
     bob_task.await??;
 
@@ -490,32 +551,30 @@ async fn bootstrap_for_this_run() -> anyhow::Result<Client> {
     Ok(tor)
 }
 
-/// Encrypt `payload` with the established Noise transport session, then
-/// send it length-prefixed over the raw onion-service stream. This is
-/// still a placeholder for the final wire protocol -- yamux multiplexing
-/// (architecture.md §6) isn't implemented yet, so this remains one logical
-/// stream per connection -- but the Noise encryption itself is real.
-async fn write_framed(stream: &mut DataStream, noise: &mut NoiseTransport, payload: &[u8]) -> anyhow::Result<()> {
-    let ciphertext = noise.encrypt(payload)?;
-    let len = u32::try_from(ciphertext.len())?;
+/// Plain length-prefixed framing over a (already Noise-encrypted, already
+/// multiplexed -- see `SecureMux`) logical stream. No crypto happens at
+/// this layer anymore: encryption is handled transparently one layer down
+/// by the mux's internal Noise pump, so application code (identity + MLS,
+/// here) just needs ordinary message framing over what looks like a plain
+/// byte stream.
+async fn write_framed<S: AsyncWrite + Unpin>(stream: &mut S, payload: &[u8]) -> anyhow::Result<()> {
+    let len = u32::try_from(payload.len())?;
     stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&ciphertext).await?;
-    // DataStream buffers internally to minimize Tor cells sent; without an
-    // explicit flush, written bytes never actually leave the buffer. Easy
-    // to miss (write_all "succeeding" gives no indication data wasn't
-    // sent) -- see tech-stack.md's implementation findings.
+    stream.write_all(payload).await?;
+    // The lesson from tech-stack.md's implementation findings applies at
+    // every layer that buffers: explicit flush, or bytes never actually
+    // leave the buffer.
     stream.flush().await?;
     Ok(())
 }
 
-async fn read_framed(stream: &mut DataStream, noise: &mut NoiseTransport) -> anyhow::Result<Vec<u8>> {
+async fn read_framed<S: AsyncRead + Unpin>(stream: &mut S) -> anyhow::Result<Vec<u8>> {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
-    let mut ciphertext = vec![0u8; len];
-    stream.read_exact(&mut ciphertext).await?;
-    let plaintext = noise.decrypt(&ciphertext)?;
-    Ok(plaintext)
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok(buf)
 }
 
 fn to_hex(bytes: &[u8]) -> String {

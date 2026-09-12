@@ -19,7 +19,7 @@ this is a security-sensitive project where shortcuts compound.
 - **Exit criteria:** all five design docs reviewed, open items resolved or
   explicitly deferred with a rationale, before any Phase 1 code is written.
 
-## Phase 1 — MVP: 1:1 Encrypted Messaging over Tor *(in progress)*
+## Phase 1 — MVP: 1:1 Encrypted Messaging over Tor *(feature-complete and live-verified on Linux; cross-platform pairing verification pending — see exit criteria)*
 - [x] Local identity generation (Ed25519 MLS signing keypair via
       `openmls_basic_credential`), persisted through `openmls_sqlite_storage`
       with whole-file Argon2id + ChaCha20-Poly1305 envelope encryption at
@@ -53,10 +53,14 @@ this is a security-sensitive project where shortcuts compound.
       the peer's presented static key against the expected one obtained
       out-of-band before trusting the connection — real mutual
       authentication, not just "some onion service answered."
-- [ ] yamux multiplexing over the Noise session (architecture.md §6) —
-      not yet implemented; each connection is still one logical stream,
-      framed with a plain length prefix around the Noise ciphertext
-      (tech-stack.md open item #6)
+- [x] yamux multiplexing over the Noise session (architecture.md §6,
+      tech-stack.md open item #6), **live-verified**: `SecureMux`
+      (`crates/securetext-net/src/secure_mux.rs`) multiplexes logical
+      streams over one Noise-encrypted onion-service connection via a
+      background driver task and a "Noise pump." `securetext demo` now
+      opens two multiplexed streams (control + chat) over a single
+      connection, confirmed live against the real Tor network; a local
+      test independently proves 3 concurrent streams work correctly.
 - [x] MLS group state persistence across restarts (tech-stack.md open item
       #5), **verified via a full simulated restart**: `securetext
       restart-demo` seals identity stores to their encrypted files, drops
@@ -67,16 +71,35 @@ this is a security-sensitive project where shortcuts compound.
       established circuit came in at p50=3.09s, avg=3.46s (tech-stack.md
       open item #1) — usable for text chat, consistent with the disclosed
       "slower than Discord" tradeoff in architecture.md §6, not a surprise
-- [ ] Manual address exchange only — invite links come in Phase 2
-- **Exit criteria:** two instances on different machines exchange E2EE
-  messages entirely over Tor, with no direct IP exchange at any point
-  (verified by packet capture / network monitor showing only Tor circuit
-  traffic, never a direct connection to the peer's real IP). Verified
-  across at least one Linux-to-Windows pair (e.g., Fedora ↔ Windows 11) in
-  addition to same-OS pairs, since this is the first phase where
-  cross-platform wire compatibility could silently break. MLS-as-1:1
-  benchmark results recorded and reviewed against chat-speed usability
-  expectations.
+- [ ] Manual address exchange only — invite links come in Phase 2 (this is
+      by design, not a gap: Phase 1's scope was always "prove the crypto
+      and transport stack works," with the invite mechanism explicitly
+      deferred)
+- **Exit criteria — status: functionally complete and live-verified on
+  Linux; cross-platform pairing not yet verified (see below, action
+  needed from you).**
+  - ✅ Two instances exchange E2EE messages entirely over Tor with no
+    direct IP exchange: verified repeatedly, including as two genuinely
+    separate OS processes (`net-listen`/`net-dial`), with the full stack
+    (identity + MLS + Noise + yamux + Tor) exercised together via
+    `securetext demo` against the live Tor network.
+  - ✅ MLS-as-1:1 benchmark results recorded and reviewed: p50=3.09s,
+    avg=3.46s per round trip over an established circuit (tech-stack.md
+    open item #1) — usable for text chat, consistent with the disclosed
+    latency tradeoff.
+  - ❌ **Not verified: a Linux-to-Windows pair (e.g., Fedora ↔ Windows
+    11).** This development session ran entirely inside a single Linux
+    sandbox with no Windows machine available — there was no way to
+    actually test cross-platform wire compatibility, not just an
+    oversight. Nothing in the design is Linux-specific (the whole stack is
+    portable Rust: `arti`, `openmls`, `snow`, `yamux` all support Windows),
+    but "should work" is exactly the kind of claim this phase exists to
+    replace with a real verification. **Action needed:** build
+    `securetext-cli` on a Windows machine (`cargo build -p securetext-cli`
+    — see platform-support.md for the target matrix) and run
+    `net-listen`/`net-dial` against a Linux instance before treating this
+    exit criterion as met. This is the one piece of Phase 1 that
+    genuinely requires hardware/an OS this environment doesn't have.
 
 ## Phase 2 — Invite Links & Bridges
 - Invite-link format encoding onion address + MLS key package/Welcome

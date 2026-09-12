@@ -217,14 +217,34 @@ rather than guessed in advance:
    ("protect the storage backend itself, for example with authenticated
    encryption") for free, since it's reusing `securetext-identity`'s
    already-encrypted file rather than a second, separately-secured store.
-6. **yamux multiplexing over the Noise session** (architecture.md §6) is
-   not yet implemented — the Noise defense-in-depth layer itself
-   (crypto-spec.md §4) is done and live-verified (see the implementation
-   findings above); each connection is still one logical stream, not
-   multiplexed, so a server with multiple channels would currently need
-   one onion-service connection per channel rather than one shared
-   connection carrying several logical streams. This is the remaining
-   piece before the transport layer matches architecture.md §6's design.
+6. ~~**yamux multiplexing over the Noise session**~~ — **done, live-verified.**
+   `securetext-net`'s new `SecureMux` (`secure_mux.rs`) composes a
+   background "Noise pump" task (turns the raw onion-service `DataStream`
+   plus an established `NoiseTransport` into a plain `tokio::io::duplex`
+   pipe, chunking/reassembling across Noise's bounded message size) with a
+   `yamux::Connection` driven over that pipe. Two implementation notes
+   worth keeping for future maintainers:
+   - The `yamux` crate ships no end-to-end usage example; the driving
+     pattern (a dedicated task looping on `poll_next_inbound`, since that's
+     *the only way yamux makes any progress at all* — true even for
+     purely outbound stream I/O) was verified against `rust-libp2p`'s own
+     yamux muxer, the primary real-world consumer of this exact crate.
+   - **The same "flush ≠ delivered" race from the Noise/DataStream layer
+     recurs one level up.** The first version of the local test failed
+     intermittently because dropping a `SecureMux` (which aborts its
+     driver task) immediately after a final write doesn't guarantee that
+     write actually finished propagating through the pump to the raw
+     stream. Fixed with a proper `SecureMux::close()` that drives
+     `yamux::Connection::poll_close()` to settle the connection before the
+     driver task ends, rather than a sleep — confirmed by the test
+     dropping from failing intermittently to passing in ~0.01s consistently
+     (20/20 runs) once `close()` was used instead of a delay.
+   Verified two ways: a local test (`multiple_streams_over_one_connection`,
+   no Tor, opens 3 concurrent logical streams and exchanges independent
+   data on each) and live against the real Tor network via `securetext
+   demo`, which now opens two multiplexed streams (a "control" stream for
+   the MLS Welcome, a "chat" stream for application messages) over one
+   onion-service connection.
 7. **Frontend framework for Tauri** (React vs. Svelte vs. other) — deferred
    to Phase 4, not blocking.
 
