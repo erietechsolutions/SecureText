@@ -20,6 +20,9 @@ pub use provider::PersistentProvider;
 mod message;
 pub use message::AppMessage;
 
+mod capability;
+pub use capability::{Capability, Permission};
+
 /// The one ciphersuite SecureText speaks: X25519 + ChaCha20-Poly1305 +
 /// Ed25519 (crypto-spec.md §7's primitive table).
 pub const CIPHERSUITE: Ciphersuite =
@@ -118,6 +121,25 @@ impl<P: OpenMlsProvider> Member<P> {
     pub fn load_group(&self, group_id: &GroupId) -> Result<Option<MlsGroup>, CryptoError> {
         MlsGroup::load(self.provider.storage(), group_id)
             .map_err(|e| CryptoError::Storage(format!("{e:?}")))
+    }
+
+    /// Issue a signed capability (architecture.md §7) using this member's
+    /// own MLS identity key -- e.g. a server admin granting another
+    /// member permission to post/invite/kick.
+    pub fn issue_capability(
+        &self,
+        group_id: &GroupId,
+        subject_public_key: &[u8],
+        permission: Permission,
+    ) -> Result<Capability, CryptoError> {
+        Capability::issue(&self.signer, group_id.as_slice(), subject_public_key, permission)
+    }
+
+    /// Verify a capability's signature using this member's crypto
+    /// provider. See [`Capability::verify`] for exactly what this does
+    /// and does not prove.
+    pub fn verify_capability(&self, capability: &Capability) -> Result<(), CryptoError> {
+        capability.verify(self.provider.crypto())
     }
 
     /// Add a member (identified by their serialized KeyPackage) to `group`,
@@ -426,6 +448,171 @@ mod tests {
         assert!(
             bob_result.is_err(),
             "removed member must NOT be able to decrypt a post-removal message, got: {bob_result:?}"
+        );
+    }
+
+    /// Ties capability tokens and removal together in a realistic
+    /// moderation scenario: alice (the server's admin) delegates Kick
+    /// authority to charlie without giving up her own membership or
+    /// re-keying anything -- charlie verifies the capability really came
+    /// from alice (architecture.md §7: any peer can check this without a
+    /// central authority) before acting on it, then uses his own MLS
+    /// signing key to actually remove bob (the capability grants
+    /// *authorization*; the removal itself still goes through the normal
+    /// MLS commit machinery, signed by whoever the group's crypto layer
+    /// says performed it).
+    #[test]
+    fn authorized_moderator_can_remove_a_member() {
+        let alice = fresh_member("alice");
+        let bob = fresh_member("bob");
+        let charlie = fresh_member("charlie");
+
+        let mut alice_group = alice.create_group().expect("alice creates group");
+        let bob_key_package = bob.key_package_bytes().expect("bob key package");
+        let (_commit, welcome_for_bob) = alice
+            .add_member(&mut alice_group, &bob_key_package)
+            .expect("alice adds bob");
+        let mut bob_group = bob.join_from_welcome(&welcome_for_bob).expect("bob joins");
+
+        let charlie_key_package = charlie.key_package_bytes().expect("charlie key package");
+        let (commit_for_bob, welcome_for_charlie) = alice
+            .add_member(&mut alice_group, &charlie_key_package)
+            .expect("alice adds charlie");
+        bob.decrypt(&mut bob_group, &commit_for_bob)
+            .expect("bob processes the add-charlie commit");
+        let mut charlie_group = charlie
+            .join_from_welcome(&welcome_for_charlie)
+            .expect("charlie joins");
+
+        // Alice delegates Kick authority over this group to charlie.
+        let kick_capability = alice
+            .issue_capability(alice_group.group_id(), charlie.public_key(), Permission::Kick)
+            .expect("alice issues a Kick capability to charlie");
+
+        // Charlie -- or anyone else who receives this capability -- can
+        // verify it really came from alice without contacting her again.
+        charlie
+            .verify_capability(&kick_capability)
+            .expect("capability verifies");
+        assert_eq!(kick_capability.subject_public_key(), charlie.public_key());
+        assert_eq!(kick_capability.permission(), Permission::Kick);
+        assert_eq!(kick_capability.issued_by(), alice.public_key());
+
+        // Charlie, now authorized, removes bob himself.
+        let removal_commit = charlie
+            .remove_member(&mut charlie_group, bob.public_key())
+            .expect("charlie removes bob");
+        alice
+            .decrypt(&mut alice_group, &removal_commit)
+            .expect("alice processes charlie's removal commit");
+
+        let after_ciphertext = charlie
+            .encrypt(&mut charlie_group, b"bob is gone now")
+            .expect("charlie encrypts after removal");
+        assert_eq!(
+            alice
+                .decrypt(&mut alice_group, &after_ciphertext)
+                .expect("alice decrypts"),
+            Some(b"bob is gone now".to_vec())
+        );
+        assert!(bob.decrypt(&mut bob_group, &after_ciphertext).is_err());
+    }
+
+    /// Channel-level key partitioning (architecture.md §3/§7): proves a
+    /// "private channel" (narrower membership than the server) achieves
+    /// *real* cryptographic exclusion, not just an application-level
+    /// filter -- a server member who isn't in the channel's group plainly
+    /// cannot decrypt the channel's messages, verified directly.
+    ///
+    /// Design note (see tech-stack.md's implementation findings for the
+    /// full reasoning): this models a channel as its own independent MLS
+    /// group with a subset of the server's members, reusing
+    /// create_group/add_member/remove_member as-is, rather than OpenMLS's
+    /// native sub-group branching feature (RFC 9420 §11.3). Branching adds
+    /// real value this doesn't have -- a cryptographic tie to the exact
+    /// parent epoch a channel was created from -- but requires tracking a
+    /// sliding window of `BranchInfo` per parent epoch and careful
+    /// sender/receiver epoch-matching to get right. An independent group
+    /// gives the property this test actually needs (narrower membership,
+    /// real exclusion) with far less correctness risk, at the cost of that
+    /// parent-epoch binding -- a reasonable v1 tradeoff, revisit if a
+    /// concrete need for the branching-specific guarantee shows up.
+    /// Capability tokens scope naturally to this: a channel's `GroupId` is
+    /// just another value `Capability::issue`'s `group_id` can name, so
+    /// "may post in this specific channel" falls out of the existing
+    /// capability mechanism for free.
+    #[test]
+    fn private_channel_excludes_non_members() {
+        let alice = fresh_member("alice");
+        let bob = fresh_member("bob");
+        let charlie = fresh_member("charlie");
+
+        // The "server": all three are members.
+        let mut server_group = alice.create_group().expect("alice creates server group");
+        let bob_key_package = bob.key_package_bytes().expect("bob key package");
+        let (_commit, welcome_for_bob) = alice
+            .add_member(&mut server_group, &bob_key_package)
+            .expect("alice adds bob to the server");
+        let mut bob_server_group = bob.join_from_welcome(&welcome_for_bob).expect("bob joins the server");
+
+        let charlie_key_package = charlie.key_package_bytes().expect("charlie key package");
+        let (commit_for_bob, welcome_for_charlie) = alice
+            .add_member(&mut server_group, &charlie_key_package)
+            .expect("alice adds charlie to the server");
+        bob.decrypt(&mut bob_server_group, &commit_for_bob)
+            .expect("bob processes the add-charlie commit");
+        charlie.join_from_welcome(&welcome_for_charlie).expect("charlie joins the server");
+
+        // A private "mod channel": alice creates a *separate* MLS group
+        // and adds only charlie -- bob, though a server member, is never
+        // added to this group at all.
+        let mut channel_group = alice.create_group().expect("alice creates the channel group");
+        let channel_id = channel_group.group_id().clone();
+        // KeyPackages are single-use (crypto-spec.md §2) -- charlie's
+        // server-join key package was already consumed above, so he needs
+        // a fresh one for this second, independent group.
+        let charlie_channel_key_package = charlie.key_package_bytes().expect("charlie's channel key package");
+        let (_commit, welcome_for_charlie_channel) = alice
+            .add_member(&mut channel_group, &charlie_channel_key_package)
+            .expect("alice adds charlie to the channel");
+        let mut charlie_channel_group = charlie
+            .join_from_welcome(&welcome_for_charlie_channel)
+            .expect("charlie joins the channel");
+
+        // Capability tokens scope to this channel's own GroupId, exactly
+        // like they would for the server.
+        let post_capability = alice
+            .issue_capability(&channel_id, charlie.public_key(), Permission::Post)
+            .expect("alice grants charlie posting rights in the channel");
+        charlie.verify_capability(&post_capability).expect("verifies");
+        assert_eq!(post_capability.group_id(), channel_id.as_slice());
+
+        let channel_ciphertext = alice
+            .encrypt(&mut channel_group, b"mods only: bob is being annoying")
+            .expect("alice encrypts a channel message");
+
+        // Charlie, a real channel member, reads it fine.
+        assert_eq!(
+            charlie
+                .decrypt(&mut charlie_channel_group, &channel_ciphertext)
+                .expect("charlie decrypts"),
+            Some(b"mods only: bob is being annoying".to_vec())
+        );
+
+        // Bob is a server member but was never added to the channel's own
+        // MLS group. He has no group state for the channel at all, so
+        // there's no "bob's channel view" to decrypt with directly -- the
+        // closest real attack is bob (having somehow obtained the
+        // ciphertext bytes, e.g. from a relay) trying to process them
+        // against the only group state he *does* have, his server group.
+        // This must fail: the ciphertext's group ID doesn't match, and
+        // even if it did, his server group is at a completely different
+        // epoch/key schedule than the channel group.
+        assert_ne!(server_group.group_id(), &channel_id, "server and channel are different MLS groups");
+        let bob_attempt = bob.decrypt(&mut bob_server_group, &channel_ciphertext);
+        assert!(
+            bob_attempt.is_err(),
+            "a server member excluded from the channel must NOT be able to decrypt its messages, got: {bob_attempt:?}"
         );
     }
 

@@ -160,9 +160,26 @@ message/group layer, orthogonal to the transport:
   for the group to persist, and no server-side onion service required
   beyond each member's own.
 - **Channels** = key-partitioned sub-scopes within the group, so channel
-  membership can be narrower than server membership.
-- **Roles & permissions** = signed capability tokens issued by admin
-  key(s) (crypto-spec.md §3) — checked locally by every client.
+  membership can be narrower than server membership. **Implemented as
+  independent MLS groups** (a channel's roster is a subset of the server's
+  members, added to that channel's own group the normal way), not
+  OpenMLS's native sub-group branching (RFC 9420 §11.3) — branching
+  cryptographically ties a sub-group to the exact parent epoch it split
+  from, which is real value this design forgoes, but it needs tracking a
+  sliding window of `BranchInfo` per parent epoch and careful
+  sender/receiver epoch-matching to implement correctly. An independent
+  group delivers the actual property needed here (narrower membership,
+  genuine cryptographic exclusion — verified directly in
+  `securetext-crypto`'s `private_channel_excludes_non_members` test: a
+  server member excluded from a channel provably cannot decrypt its
+  messages) with far less correctness risk. Revisit if a concrete need for
+  the parent-epoch binding specifically comes up.
+- **Roles & permissions** = signed capability tokens (`securetext-crypto`'s
+  `Capability`/`Permission`) issued by admin key(s) (crypto-spec.md §3) —
+  checked locally by every client using the group's own signature
+  verification, no central authority contacted. A capability's `group_id`
+  can name either a server or one of its channels, so "may post in this
+  specific channel" uses the exact same mechanism as a server-wide grant.
 - **Admin key management**: v1 assumes a single admin keypair per server
   (the creator); multi-admin/transfer is a Phase 3–4 question.
 

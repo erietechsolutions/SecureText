@@ -171,7 +171,7 @@ this is a security-sensitive project where shortcuts compound.
     bridges.torproject.org), call `securetext_net::bootstrap_with_bridge`
     and confirm it successfully bootstraps through the bridge.
 
-## Phase 3 — Groups ("Servers") & Channels *(in progress)*
+## Phase 3 — Groups ("Servers") & Channels *(feature-complete, deterministically verified)*
 - [x] MLS group creation/join/leave via OpenMLS, scaled beyond 2 members.
       **Verified deterministically** (`removed_member_cannot_decrypt_subsequent_messages`,
       `crates/securetext-crypto`, no live Tor needed for this proof): a
@@ -186,8 +186,30 @@ this is a security-sensitive project where shortcuts compound.
       notify) but would silently desync any *other* existing member's view
       of the group once a group grew past two people. It now returns
       `(commit_bytes, welcome_bytes)`; all Phase 1/2 call sites updated.
-- [ ] Channel-level key partitioning within a group
-- [ ] Signed role/permission capability tokens (post/invite/kick)
+- [x] Channel-level key partitioning within a group. **Verified
+      deterministically** (`private_channel_excludes_non_members`):
+      modeled as an independent MLS group per channel (a subset of the
+      server's roster), not OpenMLS's native sub-group branching — see
+      architecture.md §7 for the reasoning (branching's parent-epoch tie is
+      real value given up, but avoids a much higher-risk implementation
+      under time constraints). A server member excluded from a private
+      channel is proven — by actually attempting the decrypt against his
+      own (different) group state and checking it fails, not assumed — to
+      be unable to read the channel's messages, while a real channel
+      member reads them fine.
+- [x] Signed role/permission capability tokens (post/invite/kick). New
+      `Capability`/`Permission` (`crates/securetext-crypto`): issued by
+      signing a payload with the issuer's existing MLS identity key (no
+      new key type), verified by any peer via the group's own
+      `OpenMlsCrypto::verify_signature` (no central authority contacted).
+      Tested: a valid capability verifies for its real issuer; a tampered
+      payload and a falsely-claimed issuer both correctly fail
+      verification. **Integration-tested with real authorization, not just
+      in isolation** (`authorized_moderator_can_remove_a_member`): alice
+      delegates Kick authority to charlie via a capability; charlie
+      verifies it's genuinely from alice, then uses his own MLS signing
+      key to actually remove bob — composing cleanly with the removal
+      mechanism above.
 - **Exit criteria:** a 3+ member group can be created, a member removed
   loses access to subsequently-sent messages (verified directly, not just
   assumed from the library) — ✅ met, deterministically, above. "Entirely

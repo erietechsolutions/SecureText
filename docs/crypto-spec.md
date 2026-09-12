@@ -61,20 +61,29 @@ for group E2EE, already adopted by Matrix/Element, Wire, Google Messages
 conversations in SecureText (§2 above):
 
 - Each **"server"** in the Discord-like UI maps to one MLS group.
-- Each **channel** within a server maps to a sub-tree/partitioned key
-  derivation within that group, so a member without channel access cannot
-  derive that channel's message keys even though they're a group member.
+- Each **channel** within a server maps to its own, separate MLS group
+  containing a subset of the server's members (implemented and verified —
+  see architecture.md §7 for why this was chosen over OpenMLS's native
+  sub-group branching), so a member without channel access — not added to
+  that channel's group at all — cannot derive that channel's message keys
+  even though they're a member of the server's own group.
 - **Membership changes** (invite, kick, ban, leave) are MLS **Commit**
   messages: signed, ordered, and they trigger a group key rotation. A
   removed member cryptographically cannot decrypt messages sent after their
   removal — this is enforced by the protocol, not just client-side UI
-  filtering.
+  filtering, and verified directly (`securetext-crypto`'s
+  `removed_member_cannot_decrypt_subsequent_messages`: the removed member's
+  decrypt attempt is checked to actually fail, not assumed).
 - **Roles/permissions** (who can post, invite, kick) are separate from MLS
-  group membership: implemented as signed capability tokens issued by an
-  admin key (e.g., "pubkey X may post in channel #general, until epoch N").
-  Any peer can verify a capability token without contacting a central
-  authority — it's just a signature check against the group's known admin
-  key(s).
+  group membership: implemented (`securetext-crypto`'s `Capability`) as
+  signed capability tokens issued by an admin key ("pubkey X may post in
+  channel #general" — a capability's `group_id` names either the server or
+  a specific channel's own group). Any peer can verify a capability token
+  without contacting a central authority — it's just a signature check
+  (`OpenMlsCrypto::verify_signature`) against the claimed issuer's public
+  key; whether that issuer is actually recognized as an admin is a
+  separate, deliberately-not-baked-in application policy decision (see
+  `Capability::verify`'s doc comment).
 
 **Library:** `OpenMLS` (Rust, actively maintained, implements RFC 9420).
 Building the group/channel/role model in application code on top of OpenMLS
