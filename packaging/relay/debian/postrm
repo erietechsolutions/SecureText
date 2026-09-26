@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+# The relay's keys and mailboxes (/var/lib/private/securetext-relay) are
+# kept on remove so a reinstall keeps the same address. `purge` deletes them.
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/private/securetext-relay /var/lib/securetext-relay
+fi
+exit 0

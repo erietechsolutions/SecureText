@@ -50,7 +50,7 @@ serves the "efficient and secure" goal rather than trading against it.
 | Desktop shell | **Tauri** | Rust backend (shares the core directly, no FFI boundary for desktop), web frontend for fast UI iteration, much smaller binary/resource footprint than Electron; ships native installers for all three target OSes (see platform-support.md) |
 | Frontend framework | React or Svelte (pick during Phase 4 UI work, not a Phase 0 blocker) | Either works fine inside Tauri; decision deferred since it doesn't affect the core architecture |
 | Mobile (Phase 10) | **To decide in Phase 10:** Tauri 2 mobile (reuses `desktop/ui` and calls the Rust core directly) vs. a React Native/Flutter shell calling the core via UniFFI (the original plan) | Either way the audited Rust core is reused instead of reimplementing crypto/networking per platform; Tauri mobile became the likely lower-effort option once the desktop client was built on Tauri |
-| Installers & updates (Phase 6) | Tauri bundler + Tauri updater plugin (or equivalent), GitHub Releases, GitHub Actions | Native installers per OS from one codebase. Updates are signature-verified and fetched **over Tor only** (never clearnet, which would reveal who runs SecureText) |
+| Installers & updates (Phase 6) | Tauri bundler, GitHub Releases, GitHub Actions; our own updater (`securetext-update`: Ed25519 via `ed25519-dalek`, TLS via `rustls` + bundled `webpki-roots`, a minimal HTTP/1.1 client) | Native installers per OS from one codebase. Tauri's updater plugin was passed over because it fetches over the clearnet; ours runs only over arti exit streams, and is small enough to audit. Updates are signature-verified against an offline key and fetched **over Tor only** |
 
 ## Infrastructure (minimal, by design)
 

@@ -238,6 +238,27 @@ pub async fn dial(client: &Client, onion_address: &str, port: u16) -> Result<Dat
     Ok(stream)
 }
 
+pub use arti_client::IsolationToken;
+
+/// A stream to an ordinary (non-onion) host, through a Tor exit relay.
+///
+/// Messaging never uses this: peers and relays are onion services only.
+/// It exists for the updater (roadmap Phase 6), which has to reach GitHub
+/// Releases without revealing this machine's IP to GitHub or DNS. The host
+/// name is resolved by the exit, never locally. `isolation` keeps these
+/// streams off circuits used for anything else.
+pub async fn connect_exit(
+    client: &Client,
+    host: &str,
+    port: u16,
+    isolation: IsolationToken,
+) -> Result<DataStream, NetError> {
+    let mut prefs = arti_client::StreamPrefs::new();
+    prefs.set_isolation(isolation);
+    let stream = client.connect_with_prefs((host, port), &prefs).await?;
+    Ok(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

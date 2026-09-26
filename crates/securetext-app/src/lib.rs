@@ -24,6 +24,7 @@ mod node;
 mod relay;
 mod store;
 pub mod transport;
+mod updates;
 pub mod wire;
 
 use std::path::PathBuf;
@@ -37,6 +38,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 pub use node::{fingerprint, MAX_MESSAGE_CHARS};
 use node::{Job, NetEvent, NodeState, Opened, Timing};
 pub use transport::{MemoryNetwork, TorTransport, Transport};
+pub use updates::{tor_https_client, UpdateConfig, UpdateState, UpdateStatus};
+pub use securetext_update as update;
 pub use wire::ConversationKind;
 
 /// The profile file, inside a profile directory.
@@ -72,6 +75,8 @@ pub struct NodeConfig {
     /// How often to check our relay mailbox (if one is set) for messages
     /// left while we were offline.
     pub relay_poll_interval: Duration,
+    /// Automatic updates (desktop builds only; `None` disables them).
+    pub update: Option<UpdateConfig>,
 }
 
 impl NodeConfig {
@@ -85,6 +90,7 @@ impl NodeConfig {
             dial_timeout: Duration::from_secs(120),
             presence_interval: Duration::from_secs(600),
             relay_poll_interval: Duration::from_secs(90),
+            update: None,
         }
     }
 }
@@ -174,6 +180,7 @@ pub enum Event {
     Message { conversation_id: String, message: MessageView },
     MessageStatus { conversation_id: String, id: String, status: String },
     Peer { key: String, online: bool },
+    Update { status: UpdateStatus },
 }
 
 /// A running node. Cheap to clone; every clone talks to the same node.
@@ -214,11 +221,14 @@ impl NodeHandle {
             relay_poll_interval: config.relay_poll_interval,
         };
         let mut state = NodeState::new(opened, events.clone(), net_tx.clone(), timing)?;
+        if let Some(update) = config.update {
+            state.enable_updates(update);
+        }
 
         match config.network {
             NetworkConfig::Memory { network, address } => {
                 let listening = network.listen(&address);
-                state.handle_net(NetEvent::TransportReady { transport: network.transport(&address), listening });
+                state.handle_net(NetEvent::TransportReady { transport: network.transport(&address), listening, exit: None });
             }
             NetworkConfig::Tor { bridge } => {
                 let _ = events.send(Event::Network { state: NetworkState::Bootstrapping });
@@ -232,14 +242,15 @@ impl NodeHandle {
                             Some(bridge) => securetext_net::bootstrap_with_bridge(&state_dir, &cache_dir, &bridge).await?,
                             None => securetext_net::bootstrap_with_dirs(&state_dir, &cache_dir).await?,
                         };
+                        let exit = updates::tor_exit(client.clone());
                         let transport = TorTransport::new(client);
                         let listening = transport.listen("securetext-peer")?;
-                        Ok::<_, anyhow::Error>((transport, listening))
+                        Ok::<_, anyhow::Error>((transport, listening, exit))
                     }
                     .await;
                     let _ = tx.send(match result {
-                        Ok((transport, listening)) => {
-                            NetEvent::TransportReady { transport: Arc::new(transport), listening }
+                        Ok((transport, listening, exit)) => {
+                            NetEvent::TransportReady { transport: Arc::new(transport), listening, exit: Some(exit) }
                         }
                         Err(e) => NetEvent::TransportFailed(format!("{e:#}")),
                     });
@@ -349,6 +360,31 @@ impl NodeHandle {
     /// card; invites created afterwards include it.
     pub async fn set_relay(&self, address: Option<String>) -> anyhow::Result<Option<String>> {
         self.call(move |s| s.set_relay(address.as_deref())).await
+    }
+
+    pub async fn update_status(&self) -> anyhow::Result<Option<UpdateStatus>> {
+        self.call(|s| Ok(s.update_status())).await
+    }
+
+    /// Check GitHub Releases (over Tor) now instead of waiting for the next
+    /// scheduled check.
+    pub async fn check_for_updates(&self) -> anyhow::Result<Option<UpdateStatus>> {
+        self.call(|s| s.check_for_updates()).await
+    }
+
+    /// Download the available update (automatic when auto-updates are on).
+    pub async fn download_update(&self) -> anyhow::Result<Option<UpdateStatus>> {
+        self.call(|s| s.download_update()).await
+    }
+
+    pub async fn set_auto_update(&self, enabled: bool) -> anyhow::Result<Option<UpdateStatus>> {
+        self.call(move |s| s.set_auto_update(enabled)).await
+    }
+
+    /// The downloaded, hash-verified update, for the shell to install:
+    /// (file, the signed asset it must match, how this copy is installed).
+    pub async fn staged_update(&self) -> anyhow::Result<(PathBuf, update::Asset, update::InstallKind)> {
+        self.call(|s| s.staged_update()).await
     }
 
     /// Seal everything to disk and stop. Queued messages stay queued in

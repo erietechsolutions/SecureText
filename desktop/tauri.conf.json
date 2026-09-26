@@ -25,6 +25,30 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.png", "icons/icon.ico"]
+    "publisher": "erietechsolutions",
+    "homepage": "https://github.com/erietechsolutions/SecureText",
+    "license": "MIT OR Apache-2.0",
+    "category": "SocialNetworking",
+    "shortDescription": "Anonymous, end-to-end encrypted chat over Tor",
+    "longDescription": "SecureText is a Discord-style messenger with no accounts and no central server. Every message is end-to-end encrypted (MLS) and travels only over Tor onion services, so nobody can read it or tell who is talking to whom.",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.png", "icons/icon.ico"],
+    "linux": {
+      "deb": {
+        "section": "net"
+      },
+      "rpm": {
+        "release": "1"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
   }
 }

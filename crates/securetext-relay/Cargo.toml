@@ -1,5 +1,6 @@
 [package]
 name = "securetext-relay"
+description = "SecureText offline-delivery relay (Tor onion service)"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -23,3 +24,27 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# `cargo deb -p securetext-relay` / `cargo generate-rpm -p crates/securetext-relay`
+# (roadmap Phase 6: running a relay shouldn't need a Rust toolchain).
+[package.metadata.deb]
+maintainer = "erietechsolutions <erietechsolutions@users.noreply.github.com>"
+copyright = "SecureText contributors"
+extended-description = "A blind store-and-forward mailbox for SecureText, reachable only as a Tor onion service. It holds sealed, padded, anonymous message blobs for users who are offline and can read none of them."
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/securetext-relay", "usr/bin/", "755"],
+    ["../../packaging/relay/securetext-relay.service", "lib/systemd/system/", "644"],
+]
+maintainer-scripts = "../../packaging/relay/debian"
+
+[package.metadata.generate-rpm]
+summary = "SecureText offline-delivery relay (Tor onion service)"
+assets = [
+    { source = "target/release/securetext-relay", dest = "/usr/bin/securetext-relay", mode = "755" },
+    { source = "../../packaging/relay/securetext-relay.service", dest = "/usr/lib/systemd/system/securetext-relay.service", mode = "644" },
+]
+post_install_script = "systemctl daemon-reload >/dev/null 2>&1 || :; systemctl enable --now securetext-relay.service >/dev/null 2>&1 || :"
+pre_uninstall_script = "if [ \"$1\" -eq 0 ]; then systemctl disable --now securetext-relay.service >/dev/null 2>&1 || :; fi"
+post_uninstall_script = "systemctl daemon-reload >/dev/null 2>&1 || :"

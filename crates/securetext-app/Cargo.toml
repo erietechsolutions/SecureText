@@ -11,6 +11,7 @@ securetext-crypto = { path = "../securetext-crypto" }
 securetext-net = { path = "../securetext-net" }
 securetext-invite = { path = "../securetext-invite" }
 securetext-relay = { path = "../securetext-relay" }
+securetext-update = { path = "../securetext-update" }
 openmls.workspace = true
 openmls_traits.workspace = true
 openmls_rust_crypto.workspace = true
@@ -27,6 +28,8 @@ anyhow.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+securetext-update = { path = "../securetext-update", features = ["test-support"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 tempfile.workspace = true
 snow.workspace = true
 base64.workspace = true

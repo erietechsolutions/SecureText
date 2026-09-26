@@ -13,7 +13,7 @@ this is a security-sensitive project where shortcuts compound.
 | 3 | Groups ("servers") & channels | ✅ Verified deterministically |
 | 4 | Desktop client (Tauri) | ✅ Verified through the GUI over live Tor · real-user test pending |
 | 5 | Offline delivery (relays) | ✅ Verified deterministically and over live Tor |
-| 6 | Desktop installers & auto-updates | Next up |
+| 6 | Desktop installers & auto-updates | ✅ Built and verified locally · CI install runs and first signed release pending |
 | 7 | Voice & video (the disclosed exception) | Not started |
 | 8 | Rich features | Not started |
 | 9 | Hardening & third-party audit | Not started · required before any production claim |
@@ -391,48 +391,142 @@ new 6 and 11). Commit messages from before this date use the old numbers.
   storage are verified directly, deterministically and over live Tor. The
   IP property holds by construction, as noted above.
 
-## Phase 6 — Desktop Installers & Auto-Updates *(next)*
+## Phase 6 — Desktop Installers & Auto-Updates *(built and verified locally; CI install runs and first real release pending)*
 Goal: someone can install SecureText without a Rust toolchain and stay up
 to date without doing anything, without weakening the anonymity
 guarantees. This is also what makes Phase 4's pending real-user test
-possible.
-- [ ] Native installers from the Tauri bundler, each built on its own OS
-      (platform-support.md): `.msi`/NSIS `.exe` for Windows 10/11, `.deb`
-      and `.AppImage` for Ubuntu, `.rpm` for Fedora. They should install
-      without admin rights where the platform allows it, add a start-menu/
-      desktop entry, and ship a clean uninstaller that states whether the
-      encrypted profile is kept or removed (never silently deleted).
-- [ ] Release pipeline: GitHub Actions builds every installer on native
-      runners on a version tag, runs `cargo test --workspace` plus the
-      headless GUI E2E (`desktop/e2e/gui_e2e.py`) first, and publishes the
-      artifacts, checksums and signatures to **GitHub Releases**.
-- [ ] Code signing: Windows Authenticode (so SmartScreen doesn't block
-      the installer) and GPG-signed Linux packages. Signing keys are kept
-      out of the repo and out of any single maintainer's laptop.
-- [ ] **Auto-updates linked to GitHub Releases**, via Tauri's updater
-      plugin (a `latest.json` manifest attached to each release) or an
-      equivalent. It must meet these requirements:
-  - Update checks and downloads go **over Tor**, through the app's own
-    arti client, never the clearnet. A plain HTTPS request to github.com
-    would tell GitHub, and anyone watching the network, that this IP runs
-    SecureText and when. That's exactly the linkage the app exists to
-    prevent.
-  - Every update is signed with a dedicated update-signing key (separate
-    from the code-signing keys, public half pinned in the app) and verified
-    before anything is installed. No downgrades.
-  - The user is told what's changing and chooses when to restart. Checks
-    are randomised in time so they don't create a fingerprintable pattern.
-    Updates can be turned off.
-  - The repo (or a separate public releases repo) must be **public** for
-    unauthenticated update checks. Today the repo is private.
-- [ ] Relay packaging: `securetext-relay` as `.deb`/`.rpm` with a systemd
-      unit (and optionally a container image), so running one doesn't
-      require building from source.
+possible. Full procedure: releasing.md. Design: architecture.md §10.
+- [x] Native installers from the Tauri bundler (`desktop/tauri.conf.json`):
+      NSIS `.exe` (per-user, no admin) and `.msi` for Windows, `.deb` and
+      `.AppImage` for Ubuntu, `.rpm` for Fedora, with a start-menu/desktop
+      entry. The NSIS uninstaller's "delete app data" box is off by
+      default, and package removal never touches the profile, so the
+      encrypted profile is never silently deleted. The Linux package name is
+      `secure-text` (Tauri derives it from the product name); the app is
+      "SecureText" everywhere users see it.
+- [x] Release pipeline (`.github/workflows/release.yml`), run on a version
+      tag:
+  - checks the tag matches the app version;
+  - runs `cargo test --workspace` on Linux and Windows;
+  - builds each installer natively (Ubuntu 22.04 for the oldest supported
+    glibc, a Fedora 44 container, Windows);
+  - **installs each one on a fresh runner** (Ubuntu 22.04 and 24.04,
+    Fedora 44, Windows NSIS and MSI) and checks the app starts and stays
+    up, then uninstalls;
+  - publishes everything plus `SHA256SUMS` as a **draft** GitHub Release.
+  
+  The two-window GUI test over live Tor is an opt-in job. `ci.yml` runs
+  the tests, a desktop build and a `cargo-deny` audit on every push.
+- [x] **Auto-updates linked to GitHub Releases**, built as our own small
+      updater (`crates/securetext-update` + `securetext-app/src/updates.rs`)
+      rather than Tauri's updater plugin, which fetches over the clearnet.
+      Each requirement is met as follows:
+  - **Over Tor only.** Checks and downloads use Tor exit streams from the
+    app's own arti client (`securetext_net::connect_exit`), with an
+    isolation token per check. The host name is resolved at the exit. The
+    HTTPS client has no socket code of its own, so there's no path to a
+    direct connection.
+  - **Signed with a dedicated key, verified before install.** An Ed25519
+    signature (domain separated) covers the manifest's exact bytes. The
+    public key is pinned in `desktop/update-signing.pub`, and more than one
+    can be listed for rotation. Each installer's SHA-256 and size come from
+    the signed manifest. They're checked while downloading and again right
+    before installing.
+  - **No downgrades.** Only strictly newer versions are offered, and
+    pre-releases only to pre-release users.
+  - **User control.** The release notes are shown, and nothing installs
+    until the user clicks "Restart to update". Checks come at a random time
+    10 minutes to 3 hours after start, then about daily with ±25% jitter.
+    They can be turned off in Settings.
+  - **The signing key is kept away from CI entirely.** CI only makes a
+    draft. `scripts/sign-release.sh` signs the manifest offline with a
+    passphrase-encrypted key (Argon2id + ChaCha20-Poly1305) and publishes.
+    A GitHub account compromise therefore can't ship an update, which is
+    stronger than the "key in a CI secret" the plan first described.
+  - **Applying an update**, by install type:
+    - AppImage: swapped atomically in place, then restarted.
+    - NSIS: runs the new installer passively (`/P /R /UPDATE`), which
+      relaunches the app.
+    - MSI: `msiexec /passive`.
+    - deb/rpm: handed to the system's software installer, which asks for
+      the admin password. The app never asks for root itself.
+    - Source builds: told a release exists, never updated.
+    
+    The install type comes from the bundle type Tauri stamps into the
+    binary.
+- [ ] Code signing: no Windows Authenticode certificate yet, so SmartScreen
+      will warn. The workflow marks the step. There's no GPG signature over
+      `SHA256SUMS` for manual installs yet.
+- [x] Relay packaging:
+  - `securetext-relay` as `.deb` (cargo-deb) and `.rpm`
+    (cargo-generate-rpm) with a sandboxed systemd unit (`DynamicUser`,
+    `ProtectSystem=strict`, no capabilities, syscall filter), enabled on
+    install;
+  - `--version`;
+  - the relay address written to `<dir>/address`;
+  - a container image (`packaging/relay/Containerfile`).
+- **Verification:**
+  - ✅ `crates/securetext-update` (14 tests), all run against a local TLS
+    stand-in for GitHub:
+    - a manifest altered in any way, or signed by another key, is refused;
+    - a manifest for another product is refused;
+    - version policy (no downgrades, pre-release rules);
+    - key rotation;
+    - the passphrase-encrypted key file is useless without its passphrase;
+    - URL parsing is strict (https only, no credentials, no
+      protocol-relative redirects);
+    - a GitHub-style redirect to the CDN host is followed, and both
+      `Content-Length` and chunked bodies work;
+    - oversized bodies, redirects to foreign hosts and certificates from
+      the wrong CA are refused;
+    - a download that doesn't match its signed hash is deleted;
+    - an AppImage swap is atomic, executable, and leaves no temp file.
+  - ✅ `securetext-app/tests/update_flow.rs`, through a running node:
+    - a scheduled check finds, downloads and verifies an update, and
+      announces it by event, but doesn't install it;
+    - turning auto-updates off persists across restarts and stops
+      scheduled checks, while manual checks still work (a build without
+      the auto-update guard was confirmed to fail this test);
+    - a release signed by an unpinned key is reported and never
+      downloaded.
+  - ✅ **Live over Tor:** the updater's real client fetched a real GitHub
+    release asset, including the redirect to GitHub's CDN host, through a
+    Tor exit in 6.7 s (`fetches_a_real_github_release_asset_over_tor_live`).
+  - ✅ The `.deb` and `.rpm` were built locally and inspected: files,
+    permissions, desktop entry, icons and dependencies
+    (`libwebkit2gtk-4.1-0`/`libgtk-3-0`; RPM requires the sonames). The
+    RPM's requirements were confirmed resolvable from Fedora 44's repos.
+    The relay's packages were inspected the same way. The packaged relay
+    binary was run live: it published its onion service and wrote its
+    address file.
+  - ✅ The release CLI, end to end with a throwaway key:
+    - keygen writes a 0600 encrypted key file;
+    - it signs a manifest over the real installers;
+    - verify passes;
+    - the wrong passphrase and a wrong public key are both refused.
+  - ✅ `cargo-deny` found a real advisory in rustls (RUSTSEC-2026-0285,
+    TLS 1.3 message-boundary handling; low severity). Fixed by upgrading
+    to 0.23.45 and requiring it in the updater. The remaining findings are
+    documented as not applicable in `deny.toml`.
+  - ⏳ **Not yet run:**
+    - the release workflow's builds and clean-machine installs (the
+      workflow files need a token with the `workflow` scope to push);
+    - Windows installers built or installed at all;
+    - an actual update applied to an installed copy (that needs the
+      production signing key and a public repository);
+    - a packet capture of update traffic (it's Tor-only by construction:
+      the updater's only connector is the Tor exit one);
+    - the relay's systemd unit under real systemd.
 - **Exit criteria:** on clean Windows 10, Windows 11, Ubuntu and Fedora
   machines, a non-developer installs from a GitHub Release, the app runs,
   and an update published afterwards is detected, verified and applied
   over Tor. A packet capture confirms the update traffic never touches the
-  clearnet. A tampered or wrongly signed update is refused.
+  clearnet. A tampered or wrongly signed update is refused. **Partly met:**
+  - refusing tampered and wrongly signed updates is verified;
+  - the Tor-only fetch is verified live;
+  - installs on clean machines are automated in CI but haven't run yet;
+  - the end-to-end update needs the maintainer's key (releasing.md) and a
+    public repository.
 
 ## Phase 7 — Voice & Video (the disclosed exception)
 - WebRTC integration for calls and screen share, keyed from the existing

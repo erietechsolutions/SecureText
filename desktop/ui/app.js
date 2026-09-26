@@ -92,6 +92,7 @@
     msgs: {},
     unread: {},
     members: [],
+    update: null,
   };
 
   const conv = (id) => state.convs.find((c) => c.id === id);
@@ -162,7 +163,7 @@
   async function enterApp() {
     $('#app').hidden = false;
     onEvent(handleEvent);
-    await Promise.all([refreshStatus(), refreshConvs(), refreshContacts()]);
+    await Promise.all([refreshStatus(), refreshConvs(), refreshContacts(), refreshUpdate()]);
     const open = params.get('open');
     if (open && conv(open)) await select(conv(open));
     else render();
@@ -181,6 +182,15 @@
     renderNet();
     // The home screen's "get my invite link" depends on Tor being ready.
     if (before !== state.status.network.state && !state.view.convId) renderMain();
+  }
+
+  async function refreshUpdate() {
+    try {
+      state.update = await call('update_status');
+    } catch (e) {
+      state.update = null;
+    }
+    renderUpdate();
   }
 
   async function refreshConvs() {
@@ -268,6 +278,10 @@
         }
         break;
       }
+      case 'update':
+        state.update = ev.status;
+        renderUpdate();
+        break;
       case 'peer':
         if (ev.online) state.online.add(ev.key);
         else state.online.delete(ev.key);
@@ -506,6 +520,65 @@
   }
 
   // ------------------------------------------------------------------
+  // Updates (fetched over Tor, signature-checked by the node)
+  // ------------------------------------------------------------------
+  const RELEASES_URL = 'https://github.com/erietechsolutions/SecureText/releases';
+
+  function updateLine(u) {
+    if (!u) return 'Automatic updates aren’t available in this build.';
+    switch (u.state) {
+      case 'idle': return u.auto ? 'Checks automatically, over Tor, about once a day.' : 'Automatic checks are off.';
+      case 'checking': return 'Checking for updates over Tor…';
+      case 'up_to_date': return `Up to date (checked ${fmtTime(u.checked_at)}).`;
+      case 'available': return u.installable
+        ? `Version ${u.version} is available.`
+        : `Version ${u.version} is available. This copy can’t update itself; get it from ${RELEASES_URL}`;
+      case 'downloading': return `Downloading version ${u.version} over Tor…`;
+      case 'ready': return `Version ${u.version} is downloaded and verified.`;
+      case 'failed': return `The last check failed: ${u.error}`;
+    }
+    return '';
+  }
+
+  function renderUpdate() {
+    const u = state.update;
+    const banner = $('#update-banner');
+    if (!u || !(u.state === 'ready' || (u.state === 'available' && !u.auto))) {
+      banner.hidden = true;
+      return;
+    }
+    banner.hidden = false;
+    const action = u.state === 'ready'
+      ? `<button class="btn small primary" data-action="apply-update">${u.system_installer ? 'Install…' : 'Restart to update'}</button>`
+      : '<button class="btn small" data-action="settings">Details</button>';
+    banner.innerHTML = `<span class="grow">SecureText ${esc(u.version)} ${u.state === 'ready' ? 'is ready to install.' : 'is available.'}</span>
+      <button class="btn small ghost" data-action="update-notes">What’s new</button>${action}`;
+  }
+
+  function showUpdateNotes() {
+    const u = state.update;
+    if (!u || !u.version) return;
+    modal(`<h3>What’s new in ${esc(u.version)}</h3>
+      <div class="notes">${esc(u.notes || 'No release notes.')}</div>
+      <p class="fineprint">Signed by the SecureText release key and checked on this device before installing. Downloaded over Tor.</p>
+      <div class="actions"><button class="btn primary" data-close>Close</button></div>`);
+  }
+
+  async function applyUpdate(btn) {
+    if (btn) busy(btn, true);
+    try {
+      const r = await host('apply_update');
+      if (r.outcome === 'system_installer') {
+        toast('Your system’s software installer will finish the update. Restart SecureText afterwards.');
+      }
+    } catch (e) {
+      toast(errText(e), 'error');
+    } finally {
+      if (btn) busy(btn, false);
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Modals
   // ------------------------------------------------------------------
   function modal(html, mount) {
@@ -554,6 +627,62 @@
         </dl>
       </div>
       <div class="actions"><button class="btn primary" data-close>Got it</button></div>`);
+  }
+
+  function showSettings() {
+    const s = state.status || {};
+    const u = state.update;
+    modal(`<h3>Settings</h3>
+      <div class="settings-section">
+        <h4>Offline delivery</h4>
+        <p class="sub">${esc(s.relay ? 'Using a relay: messages sent while you’re away wait there.' : 'No relay: messages reach you only while you’re online at the same time as the sender.')}</p>
+        <button class="btn small" id="s-relay">${s.relay ? 'Change relay…' : 'Set up a relay…'}</button>
+      </div>
+      <div class="settings-section">
+        <h4>Updates</h4>
+        <p class="sub" id="s-update-line">${esc(updateLine(u))}</p>
+        ${u ? `<p class="sub">This is version ${esc(u.current_version)}.</p>
+        <label class="check"><input type="checkbox" id="s-auto" ${u.auto ? 'checked' : ''}> Check for updates automatically</label>
+        <p class="fineprint">Checks go to GitHub Releases through Tor, at random times, so they don’t reveal your IP address or form a pattern. An update is installed only if it’s signed by the SecureText release key, and only when you choose to restart.</p>
+        <div class="row">
+          <button class="btn small" id="s-check">Check now</button>
+          ${u.state === 'available' && u.installable && !u.auto ? '<button class="btn small primary" id="s-download">Download</button>' : ''}
+          ${u.state === 'ready' ? `<button class="btn small primary" data-action="apply-update">${u.system_installer ? 'Install…' : 'Restart to update'}</button>` : ''}
+        </div>` : ''}
+      </div>
+      <p class="form-error" id="m-err"></p>
+      <div class="actions"><button class="btn primary" data-close>Done</button></div>`,
+    (root, close) => {
+      $('#s-relay', root).addEventListener('click', () => { close(); showRelaySettings(); });
+      const auto = $('#s-auto', root);
+      if (auto) auto.addEventListener('change', async () => {
+        try {
+          state.update = await call('set_auto_update', { enabled: auto.checked });
+          $('#s-update-line', root).textContent = updateLine(state.update);
+          renderUpdate();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+        }
+      });
+      const check = $('#s-check', root);
+      if (check) check.addEventListener('click', async () => {
+        try {
+          state.update = await call('check_for_updates');
+          $('#s-update-line', root).textContent = updateLine(state.update);
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+        }
+      });
+      const dl = $('#s-download', root);
+      if (dl) dl.addEventListener('click', async () => {
+        try {
+          state.update = await call('download_update');
+          $('#s-update-line', root).textContent = updateLine(state.update);
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+        }
+      });
+    });
   }
 
   function showRelaySettings() {
@@ -778,12 +907,15 @@
       case 'new-server': return showNewServer();
       case 'new-channel': return showNewChannel();
       case 'invite-server': return showInviteToServer();
+      case 'settings': return showSettings();
+      case 'update-notes': return showUpdateNotes();
+      case 'apply-update': return applyUpdate(t);
     }
   });
   $('#rail-home').addEventListener('click', goHome);
   $('#rail-add').addEventListener('click', showNewServer);
   $('#net-pill').addEventListener('click', showNetworkModal);
-  $('#me-settings').addEventListener('click', showRelaySettings);
+  $('#me-settings').addEventListener('click', showSettings);
 
   const input = $('#composer-input');
   function autosize() {

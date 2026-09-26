@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 use crate::relay::{self, MyRelay};
 use crate::store::{ConversationRow, MessageRow, PeerRow, Store};
 use crate::transport::{BoxedStream, Listening, Transport};
+use crate::updates::{ExitFactory, UpdateConfig, UpdateEvent, UpdateStatus, Updater};
 use crate::wire::{
     self, to_hex, ContactCard, ConversationInfo, ConversationKind, Payload, SignedCard, WireMessage,
 };
@@ -56,7 +57,10 @@ pub(crate) enum NetEvent {
     TransportReady {
         transport: Arc<dyn Transport>,
         listening: Listening,
+        /// Tor exit streams for the updater (none on the test network).
+        exit: Option<ExitFactory>,
     },
+    Update(UpdateEvent),
     TransportFailed(String),
     Incoming(BoxedStream),
     Connected {
@@ -175,6 +179,7 @@ pub(crate) struct NodeState {
     events: broadcast::Sender<Event>,
     net_tx: mpsc::UnboundedSender<NetEvent>,
     timing: Timing,
+    updater: Option<Updater>,
     dirty: bool,
     pub(crate) stopping: bool,
 }
@@ -244,6 +249,7 @@ impl NodeState {
             events,
             net_tx,
             timing,
+            updater: None,
             dirty: false,
             stopping: false,
         })
@@ -283,7 +289,10 @@ impl NodeState {
 
     pub(crate) fn handle_net(&mut self, event: NetEvent) {
         match event {
-            NetEvent::TransportReady { transport, mut listening } => {
+            NetEvent::TransportReady { transport, mut listening, exit } => {
+                if let Some(updater) = &mut self.updater {
+                    updater.network_ready(exit);
+                }
                 self.my_onion = Some(listening.onion_address.clone());
                 if let Err(e) = self.refresh_my_card() {
                     self.set_network(NetworkState::Error(e.to_string()));
@@ -306,6 +315,12 @@ impl NodeState {
                 self.maybe_collect();
             }
             NetEvent::TransportFailed(error) => self.set_network(NetworkState::Error(error)),
+            NetEvent::Update(event) => {
+                if let Some(updater) = &mut self.updater {
+                    updater.on_event(event, &mut self.tasks, &self.net_tx);
+                }
+                self.emit_update();
+            }
             NetEvent::Incoming(stream) => self.spawn_accept(stream),
             NetEvent::Connected { peer_key, card, conn_id, tx } => {
                 self.on_connected(peer_key, card, conn_id, tx)
@@ -373,7 +388,64 @@ impl NodeState {
             }
             self.maybe_collect();
         }
+        if let Some(updater) = &mut self.updater {
+            let before = updater.status();
+            updater.tick(&mut self.tasks, &self.net_tx);
+            if updater.status() != before {
+                self.emit_update();
+            }
+        }
         self.seal_if_dirty();
+    }
+
+    // =====================================================================
+    // Updates (Phase 6)
+    // =====================================================================
+
+    pub(crate) fn enable_updates(&mut self, config: UpdateConfig) {
+        // On unless the user turned them off.
+        let auto = self.store.get_setting("auto_update").ok().flatten().as_deref() != Some("0");
+        self.updater = Some(Updater::new(config, auto));
+    }
+
+    fn emit_update(&self) {
+        if let Some(updater) = &self.updater {
+            self.emit(Event::Update { status: updater.status() });
+        }
+    }
+
+    pub(crate) fn update_status(&self) -> Option<UpdateStatus> {
+        self.updater.as_ref().map(Updater::status)
+    }
+
+    pub(crate) fn check_for_updates(&mut self) -> anyhow::Result<Option<UpdateStatus>> {
+        let updater = self.updater.as_mut().ok_or_else(|| anyhow::anyhow!("updates are not available in this build"))?;
+        updater.start_check(&mut self.tasks, &self.net_tx);
+        self.emit_update();
+        Ok(self.update_status())
+    }
+
+    pub(crate) fn download_update(&mut self) -> anyhow::Result<Option<UpdateStatus>> {
+        let updater = self.updater.as_mut().ok_or_else(|| anyhow::anyhow!("updates are not available in this build"))?;
+        updater.start_download(&mut self.tasks, &self.net_tx)?;
+        self.emit_update();
+        Ok(self.update_status())
+    }
+
+    pub(crate) fn set_auto_update(&mut self, enabled: bool) -> anyhow::Result<Option<UpdateStatus>> {
+        let updater = self.updater.as_mut().ok_or_else(|| anyhow::anyhow!("updates are not available in this build"))?;
+        updater.set_auto(enabled);
+        self.store.set_setting("auto_update", if enabled { "1" } else { "0" })?;
+        self.dirty = true;
+        self.emit_update();
+        Ok(self.update_status())
+    }
+
+    pub(crate) fn staged_update(&self) -> anyhow::Result<(std::path::PathBuf, securetext_update::Asset, securetext_update::InstallKind)> {
+        self.updater
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("updates are not available in this build"))?
+            .staged()
     }
 
     /// A connection whose peer hasn't acknowledged something for longer

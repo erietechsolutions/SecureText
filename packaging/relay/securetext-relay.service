@@ -1,0 +1,47 @@
+# systemd unit for the SecureText offline-delivery relay (roadmap Phase 5/6).
+# The relay is reachable only as a Tor onion service and opens no listening
+# socket of its own, so it needs no firewall changes. Its address is
+# written to /var/lib/securetext-relay/address once Tor is up.
+[Unit]
+Description=SecureText offline-delivery relay (Tor onion service)
+Documentation=https://github.com/erietechsolutions/SecureText
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=securetext-relay
+StateDirectoryMode=0700
+ExecStart=/usr/bin/securetext-relay --dir /var/lib/securetext-relay
+Restart=on-failure
+RestartSec=15
+UMask=0077
+
+# Sandboxing: the relay only needs its state directory and outbound TCP to
+# the Tor network.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+[Install]
+WantedBy=multi-user.target

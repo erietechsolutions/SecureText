@@ -114,6 +114,17 @@ pub async fn dispatch(node: &NodeHandle, cmd: &str, args: Value) -> Result<Value
             let a: Relay = parse(args)?;
             to_value(node.set_relay(a.address).await.map_err(err)?)
         }
+        "update_status" => to_value(node.update_status().await.map_err(err)?),
+        "check_for_updates" => to_value(node.check_for_updates().await.map_err(err)?),
+        "download_update" => to_value(node.download_update().await.map_err(err)?),
+        "set_auto_update" => {
+            #[derive(Deserialize)]
+            struct Enabled {
+                enabled: bool,
+            }
+            let a: Enabled = parse(args)?;
+            to_value(node.set_auto_update(a.enabled).await.map_err(err)?)
+        }
         other => Err(format!("unknown command: {other}")),
     }
 }

@@ -42,6 +42,8 @@ it belongs in v1.
 | Casual metadata correlation (e.g. "these two usernames talk a lot," visible to a relay operator) | Opaque routing IDs distinct from long-term identity keys; rotate where practical |
 | IP address / device correlation with a message or identity | All text/group/relay traffic routed over Tor v3 onion services (architecture.md §1); no component in the system ever sees a peer's real IP address |
 | Tor being blocked or throttled on the user's network | Pluggable transport (obfs4) support via arti, built in from Phase 1, not a later add-on (architecture.md §5) |
+| A malicious or tampered update (compromised GitHub account, CI, CDN, or Tor exit) | Updates install only if their manifest is signed by an offline key pinned in the app; hashes checked before install; no downgrades (architecture.md §10) |
+| Update checks revealing who runs SecureText | Checks and downloads go over Tor exits only, at randomised times, on isolated circuits; no DNS leaves the machine (architecture.md §10) |
 
 ## Explicitly out of scope for v1 (be honest about this)
 

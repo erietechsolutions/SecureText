@@ -25,7 +25,7 @@ exception to the anonymity guarantee — see
 | 3 | Groups ("servers") & channels | ✅ Verified deterministically |
 | 4 | Desktop client (Tauri) | ✅ Verified through the GUI over live Tor · real-user test pending |
 | 5 | Offline delivery (relays) | ✅ Verified deterministically and over live Tor |
-| 6 | Desktop installers & auto-updates | Next up |
+| 6 | Desktop installers & auto-updates | ✅ Built and verified locally · first signed release pending |
 | 7 | Voice & video | Not started |
 | 8 | Rich features (files, reactions, threads…) | Not started |
 | 9 | Hardening & third-party audit | Not started |
@@ -54,13 +54,17 @@ each phase's verification did and didn't cover.
 - **Confirmed delivery.** A message counts as sent only once the
   recipient's app acknowledges it.
 
-Not yet: installers and updates, calls, file sharing, reactions/threads,
-mobile apps. See the status table above.
+- **Automatic updates, privately.** The app checks GitHub Releases over
+  Tor at random times and installs only updates signed by the SecureText
+  release key, when you choose to restart (Settings → Updates).
 
 ## Getting SecureText
 
-There are **no installers yet**; they come with Phase 6, along with
-automatic updates from GitHub Releases. For now, build from source.
+Installers (Windows `.exe`/`.msi`, Ubuntu `.deb`/`.AppImage`, Fedora
+`.rpm`) are built by the release pipeline and published on
+[GitHub Releases](https://github.com/erietechsolutions/SecureText/releases).
+No release has been published yet. Until the first one is, build from
+source. How releases are made and signed: [docs/releasing.md](docs/releasing.md).
 
 ### Building from source
 
@@ -89,7 +93,10 @@ example, to run two profiles side by side).
 
 ### Running an offline-delivery relay
 
-A relay is a blind mailbox reachable only as a Tor onion service:
+A relay is a blind mailbox reachable only as a Tor onion service. Install
+the `securetext-relay` `.deb`/`.rpm` from a release (it runs as a sandboxed
+systemd service; the address is in `/var/lib/securetext-relay/address`),
+use `packaging/relay/Containerfile`, or run it from source:
 
 ```sh
 cargo run --release -p securetext-relay -- --dir /var/lib/securetext-relay
@@ -118,8 +125,10 @@ running it headlessly.
 - `crates/securetext-invite`: invite links
 - `crates/securetext-app`: the application core (node, storage, peer protocol, relay client)
 - `crates/securetext-relay`: store-and-forward relay server
+- `crates/securetext-update`: signed, Tor-only updates (and the `securetext-release` signing tool)
 - `crates/securetext-cli`: proof-of-integration CLI and live-Tor demos
 - `desktop/`: Tauri desktop client (own Cargo workspace), its web UI, and the GUI end-to-end test
+- `packaging/`, `scripts/`, `.github/workflows/`: installers, relay packaging, release pipeline
 
 ## Supported platforms
 
@@ -140,6 +149,7 @@ See [docs/platform-support.md](docs/platform-support.md) for details.
 - [docs/architecture.md](docs/architecture.md) — networking, invites, offline delivery, server/channel model
 - [docs/tech-stack.md](docs/tech-stack.md) — libraries and tools chosen, with rationale and implementation findings
 - [docs/platform-support.md](docs/platform-support.md) — supported platforms, packaging and CI notes
+- [docs/releasing.md](docs/releasing.md) — installers, the release pipeline, and signing updates
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and verification status
 
 ## License

@@ -21,6 +21,7 @@ fn config(dir: &std::path::Path, name: &str, network: &MemoryNetwork) -> NodeCon
         dial_timeout: Duration::from_secs(5),
         presence_interval: Duration::from_secs(3600),
         relay_poll_interval: Duration::from_millis(200),
+        update: None,
     }
 }
 

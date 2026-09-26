@@ -238,3 +238,50 @@ real-time media over Tor.
 - This design is a placeholder for Phase 7 — the exact mechanism should be
   re-validated against threat-model.md's disclosed-exception language once
   Phase 7 actually starts.
+
+## 10. Updates (Phase 6)
+
+The app updates itself from GitHub Releases without weakening the
+anonymity guarantee (full procedure: releasing.md).
+
+- **Over Tor, through an exit.** GitHub isn't an onion service, so the
+  updater (`crates/securetext-update`) makes ordinary HTTPS requests over
+  Tor *exit* streams from the app's own arti client
+  (`securetext_net::connect_exit`). The host name is resolved by the exit,
+  so no DNS query leaves the machine. GitHub sees a Tor exit fetching a
+  public file, and the exit sees a TLS connection to github.com, so
+  neither learns who is checking. The HTTPS client has no socket code of
+  its own: it runs over whatever connector it's given, and the app gives
+  it Tor and nothing else. There is no direct-connection fallback. This is
+  the only use of exit streams; messaging stays onion-service only.
+- **Isolated circuits.** Each check uses a fresh arti isolation token, so
+  update traffic never shares a circuit with anything else.
+- **Unpredictable timing.** The first check is a random 10 minutes to 3
+  hours after Tor comes up. Later checks are about every 24 hours with
+  ±25% jitter. Checks can be turned off.
+- **Signed manifest, pinned key.** Only a manifest signed (Ed25519, domain
+  separated) by a key pinned into the build is believed. It names the
+  version and each installer's SHA-256 and size. A download that doesn't
+  match both is deleted before anything runs it, and the hash is checked
+  again right before installing. TLS is checked against the Mozilla roots
+  bundled in the binary, not the OS store. That doesn't carry the security
+  (the signature does), but it keeps a hostile exit from reading or
+  tampering with the transfer.
+- **No downgrades.** Only strictly newer versions are offered, so a
+  replayed old manifest (still validly signed) can't roll anyone back.
+  Pre-releases are offered only to people already on a pre-release.
+- **The key never touches CI.** CI builds and tests installers into a
+  *draft* release. The manifest is signed offline by a maintainer. A
+  GitHub account compromise can't ship an update.
+- **The user decides when.** Updates download in the background and are
+  verified, but are installed only when the user clicks *Restart to
+  update*. `.deb`/`.rpm` updates are handed to the system's software
+  installer, which asks for the admin password itself.
+- **Known limits:**
+  - An attacker who controls the release channel can *withhold* updates (a
+    freeze attack) by serving an old but validly signed manifest. The app
+    shows when it last checked, but doesn't yet warn about a manifest that
+    is suspiciously old.
+  - The same key signs every platform's installers.
+  - The update key's custody is only as good as the maintainer's handling
+    of it (releasing.md).

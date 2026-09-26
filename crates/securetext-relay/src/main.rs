@@ -4,8 +4,10 @@
 //! Everything lives under `--dir`: the relay's Noise key, its mailbox
 //! database, and its Tor state (which holds the onion service key, so the
 //! address stays the same across restarts). On start it prints the relay
-//! address that users paste into SecureText's offline-delivery setting.
-//! The relay never opens a clearnet listener.
+//! address that users paste into SecureText's offline-delivery setting,
+//! and writes it to `<dir>/address` (where packaged installs find it:
+//! `/var/lib/securetext-relay/address`). The relay never opens a clearnet
+//! listener.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,6 +19,10 @@ const NICKNAME: &str = "securetext-relay";
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version") {
+        println!("securetext-relay {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let dir = args
         .iter()
         .position(|a| a == "--dir")
@@ -33,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let mut listener = securetext_net::Listener::launch(&tor, NICKNAME)?;
     let address = RelayAddress { onion_address: listener.onion_address()?, noise_public_key: noise_public };
     println!("{}", address.to_link());
+    std::fs::write(dir.join("address"), format!("{}\n", address.to_link()))?;
     eprintln!("[securetext-relay] serving. Give the address above to SecureText users (Settings > Offline delivery).");
 
     let prune_store = store.clone();

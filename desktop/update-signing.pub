@@ -1,0 +1,8 @@
+# SecureText update-signing public key (Ed25519, base64), pinned into the
+# desktop app at build time. Only releases whose manifest is signed by the
+# matching private key are ever installed.
+#
+# No key has been generated yet, so builds from this tree have automatic
+# updates switched off. To create one (see docs/releasing.md):
+#   cargo run -p securetext-update --bin securetext-release -- keygen \
+#       /path/to/offline/update-signing.key desktop/update-signing.pub

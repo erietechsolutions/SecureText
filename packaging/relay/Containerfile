@@ -1,0 +1,20 @@
+# SecureText relay as a container image (roadmap Phase 6).
+#   podman build -f packaging/relay/Containerfile -t securetext-relay .
+#   podman run -d --name securetext-relay -v securetext-relay:/data securetext-relay
+#   podman exec securetext-relay cat /data/address
+# The volume holds the relay's keys and Tor state (its onion address); keep
+# it across upgrades or the address changes.
+FROM docker.io/library/rust:1-slim-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p securetext-relay
+
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --home-dir /data --shell /usr/sbin/nologin relay \
+    && mkdir /data && chown relay:relay /data && chmod 700 /data
+COPY --from=build /src/target/release/securetext-relay /usr/bin/securetext-relay
+USER relay
+VOLUME /data
+ENTRYPOINT ["/usr/bin/securetext-relay", "--dir", "/data"]

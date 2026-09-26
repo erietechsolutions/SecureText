@@ -1,0 +1,32 @@
+# cargo-deny policy (CI: .github/workflows/ci.yml; roadmap Phase 9).
+# Checked: known vulnerabilities (RustSec), yanked crates, and that every
+# dependency comes from crates.io.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+# Each ignore says why it doesn't apply. Revisit on every dependency bump.
+ignore = [
+    # rsa: Marvin timing attack on RSA *private-key* operations. arti only
+    # uses RSA to verify Tor relays' legacy identity signatures (public-key
+    # operations); SecureText holds no RSA private keys. No fixed version.
+    { id = "RUSTSEC-2023-0071", reason = "only RSA public-key verification inside arti; no private-key operations" },
+    # paste / proc-macro-error2: unmaintained compile-time macro helpers
+    # pulled in transitively (arti, openmls). No runtime code, no fix.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro crate, transitive, no runtime exposure" },
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time macro crate, transitive, no runtime exposure" },
+]
+
+[bans]
+# Duplicate versions are common in a tree this size (arti, openmls);
+# report them without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
