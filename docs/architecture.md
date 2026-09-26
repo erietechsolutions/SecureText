@@ -99,6 +99,19 @@ Unchanged in spirit from the original design, adapted to onion services:
   client polls and retrieves them. A relay never sees a real IP (clients
   reach it only through Tor) and never sees plaintext (crypto-spec.md §6).
 
+  **As built:** each user may pick one relay (a `securetext-relay1:` address
+  that pins the relay's Noise key) as their mailbox host. Their contact
+  card and invite links then carry a relay card: address, mailbox ID, and
+  a mailbox key for sealing. When a direct dial fails, the sender seals
+  everything queued for that person into signed envelopes and deposits
+  them. The recipient polls their mailbox, verifies and applies what they
+  collect exactly as if it came over a direct connection, and deletes it.
+  This covers first contact too: an invite can be accepted while the
+  inviter is offline. Relays enforce a per-blob size cap, per-mailbox and
+  global quotas, and a 14-day TTL. Deposits are open to anyone holding a
+  mailbox ID, so the quotas are the spam bound; reading or deleting needs
+  the mailbox secret, which never leaves the owner's device.
+
 ## 5. Circumventing Tor blocking: pluggable transports (bridges)
 
 Some networks and countries block or throttle Tor itself. Since the

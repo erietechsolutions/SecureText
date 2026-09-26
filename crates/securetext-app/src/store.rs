@@ -11,6 +11,8 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use securetext_invite::RelayCard;
+
 use crate::wire::{ConversationInfo, ConversationKind, SignedCard, WireMessage};
 
 pub struct Store {
@@ -24,6 +26,8 @@ pub struct PeerRow {
     pub onion_address: String,
     pub noise_key: Vec<u8>,
     pub is_contact: bool,
+    /// Where to leave messages for them while they're offline.
+    pub relay: Option<RelayCard>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +87,8 @@ impl Store {
                 onion_address TEXT NOT NULL,
                 noise_key BLOB NOT NULL,
                 card_json TEXT,
-                is_contact INTEGER NOT NULL DEFAULT 0
+                is_contact INTEGER NOT NULL DEFAULT 0,
+                relay_json TEXT
             );
             CREATE TABLE IF NOT EXISTS app_conversations (
                 group_id BLOB PRIMARY KEY,
@@ -119,7 +124,26 @@ impl Store {
                 created_at INTEGER NOT NULL
             );",
         )?;
+        // Profiles created before Phase 5 lack the relay column.
+        let has_relay_column = conn
+            .prepare("SELECT relay_json FROM app_peers LIMIT 0")
+            .is_ok();
+        if !has_relay_column {
+            conn.execute_batch("ALTER TABLE app_peers ADD COLUMN relay_json TEXT;")?;
+        }
         Ok(Self { conn })
+    }
+
+    pub fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM app_settings WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn delete_setting(&self, key: &str) -> anyhow::Result<()> {
+        self.conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+        Ok(())
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -135,22 +159,25 @@ impl Store {
 
     pub fn upsert_peer(&self, peer: &PeerRow, card: Option<&SignedCard>) -> anyhow::Result<()> {
         let card_json = card.map(|c| serde_json::to_string(c).expect("SignedCard serializes"));
+        let relay_json = peer.relay.as_ref().map(|r| serde_json::to_string(r).expect("RelayCard serializes"));
         self.conn.execute(
-            "INSERT INTO app_peers (mls_key, label, onion_address, noise_key, card_json, is_contact)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO app_peers (mls_key, label, onion_address, noise_key, card_json, is_contact, relay_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(mls_key) DO UPDATE SET
                 label = excluded.label,
                 onion_address = excluded.onion_address,
                 noise_key = excluded.noise_key,
                 card_json = COALESCE(excluded.card_json, app_peers.card_json),
-                is_contact = MAX(app_peers.is_contact, excluded.is_contact)",
+                is_contact = MAX(app_peers.is_contact, excluded.is_contact),
+                relay_json = excluded.relay_json",
             params![
                 peer.mls_key,
                 peer.label,
                 peer.onion_address,
                 peer.noise_key,
                 card_json,
-                peer.is_contact as i64
+                peer.is_contact as i64,
+                relay_json
             ],
         )?;
         Ok(())
@@ -160,7 +187,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT mls_key, label, onion_address, noise_key, is_contact FROM app_peers WHERE mls_key = ?1",
+                "SELECT mls_key, label, onion_address, noise_key, is_contact, relay_json FROM app_peers WHERE mls_key = ?1",
                 params![mls_key],
                 peer_from_row,
             )
@@ -180,7 +207,7 @@ impl Store {
 
     pub fn peers(&self) -> anyhow::Result<Vec<PeerRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT mls_key, label, onion_address, noise_key, is_contact FROM app_peers ORDER BY label COLLATE NOCASE",
+            "SELECT mls_key, label, onion_address, noise_key, is_contact, relay_json FROM app_peers ORDER BY label COLLATE NOCASE",
         )?;
         let rows = stmt.query_map([], peer_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -383,6 +410,9 @@ fn peer_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRow> {
         onion_address: r.get(2)?,
         noise_key: r.get(3)?,
         is_contact: r.get::<_, i64>(4)? != 0,
+        relay: r
+            .get::<_, Option<String>>(5)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 

@@ -14,7 +14,9 @@ the anonymity guarantee — see [docs/threat-model.md](docs/threat-model.md).
 
 Phases 0–3 (design, 1:1 messaging over Tor, invite links, groups and
 channels) are implemented in the Rust crates under `crates/`. Phase 4, the
-desktop client, is in `desktop/` on top of the `securetext-app` core. See
+desktop client, is in `desktop/` on top of the `securetext-app` core. Phase
+5, offline delivery through store-and-forward relays, is in
+`securetext-relay` and the app core. See
 [docs/roadmap.md](docs/roadmap.md) for exactly what's verified and what's
 still pending for each phase. **This is pre-audit software (Phase 8 hasn't
 happened). Don't rely on it for anything that matters yet.**
@@ -25,7 +27,8 @@ happened). Don't rely on it for anything that matters yet.**
 - `crates/securetext-crypto`: MLS (OpenMLS) groups, capabilities
 - `crates/securetext-net`: Tor onion services (arti), Noise_XX, yamux
 - `crates/securetext-invite`: invite links
-- `crates/securetext-app`: the application core (node, storage, peer protocol)
+- `crates/securetext-app`: the application core (node, storage, peer protocol, offline relay client)
+- `crates/securetext-relay`: store-and-forward relay server for offline delivery (Phase 5)
 - `crates/securetext-cli`: proof-of-integration CLI and live-Tor demos
 - `desktop/`: Tauri desktop client (own Cargo workspace) and its web UI
 
@@ -38,6 +41,15 @@ cargo test --workspace            # core crates; no system GUI deps needed
 # (Fedora: sudo dnf install webkit2gtk4.1-devel libsoup3-devel gtk3-devel)
 cd desktop && cargo run
 ```
+
+To run an offline-delivery relay (reachable only as a Tor onion service):
+
+```sh
+cargo run --release -p securetext-relay -- --dir /var/lib/securetext-relay
+```
+
+It prints a `securetext-relay1:…` address. Paste it into the desktop app's
+offline-delivery setting (⚙ next to your name).
 
 The desktop app keeps its profile under the platform app-data directory.
 Set `SECURETEXT_PROFILE_DIR` to use a different one (e.g. to run two

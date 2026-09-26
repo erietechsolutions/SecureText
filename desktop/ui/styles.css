@@ -221,7 +221,7 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
   padding: 10px 12px;
   background: var(--bg-rail);
 }
-.me-text { min-width: 0; }
+.me-text { min-width: 0; flex: 1; }
 .me-name { font-weight: 700; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .me-fp { font: 11.5px var(--mono); color: var(--text-3); }
 
@@ -302,6 +302,7 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
 .msg .body { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
 .msg .status { font-size: 12px; color: var(--text-3); margin-top: 1px; }
 .msg .status.pending { color: var(--warn); }
+.msg .status.relayed { color: var(--onion); }
 .msg.pending .body { opacity: 0.7; }
 .day-sep {
   display: flex; align-items: center; gap: 10px;
@@ -421,3 +422,4 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
   .rail-btn { width: 42px; height: 42px; }
   .net-pill .label { display: none; }
 }
+.explain code { font: 12.5px var(--mono); background: var(--bg-active); padding: 1px 5px; border-radius: 4px; }

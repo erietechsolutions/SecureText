@@ -21,6 +21,7 @@
 
 pub mod api;
 mod node;
+mod relay;
 mod store;
 pub mod transport;
 pub mod wire;
@@ -68,6 +69,9 @@ pub struct NodeConfig {
     pub dial_timeout: Duration,
     /// How often to reconnect to everyone we share a conversation with.
     pub presence_interval: Duration,
+    /// How often to check our relay mailbox (if one is set) for messages
+    /// left while we were offline.
+    pub relay_poll_interval: Duration,
 }
 
 impl NodeConfig {
@@ -80,6 +84,7 @@ impl NodeConfig {
             retry_interval: Duration::from_secs(20),
             dial_timeout: Duration::from_secs(120),
             presence_interval: Duration::from_secs(600),
+            relay_poll_interval: Duration::from_secs(90),
         }
     }
 }
@@ -107,6 +112,8 @@ pub struct StatusView {
     pub onion_address: Option<String>,
     pub network: NetworkState,
     pub online_peers: usize,
+    /// Our offline-delivery relay address, if one is set.
+    pub relay: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -132,7 +139,8 @@ pub struct MessageView {
     pub sent_at: i64,
     pub outgoing: bool,
     /// "pending" (queued for at least one recipient), "sent" (written to
-    /// every recipient's connection), or "received".
+    /// every recipient's connection), "relayed" (the last undelivered copy
+    /// was left at a recipient's relay mailbox), or "received".
     pub status: String,
 }
 
@@ -203,6 +211,7 @@ impl NodeHandle {
             retry_interval: config.retry_interval,
             dial_timeout: config.dial_timeout,
             presence_interval: config.presence_interval,
+            relay_poll_interval: config.relay_poll_interval,
         };
         let mut state = NodeState::new(opened, events.clone(), net_tx.clone(), timing)?;
 
@@ -332,6 +341,14 @@ impl NodeHandle {
 
     pub async fn contacts(&self) -> anyhow::Result<Vec<ContactView>> {
         self.call(|s| s.contacts()).await
+    }
+
+    /// Use the relay at `address` (a `securetext-relay1:` link) as this
+    /// profile's offline mailbox, or stop using one (`None`). Returns the
+    /// relay now in use. Contacts learn the change through our contact
+    /// card; invites created afterwards include it.
+    pub async fn set_relay(&self, address: Option<String>) -> anyhow::Result<Option<String>> {
+        self.call(move |s| s.set_relay(address.as_deref())).await
     }
 
     /// Seal everything to disk and stop. Queued messages stay queued in

@@ -270,6 +270,7 @@ async fn run_invite(dir: &std::path::Path, label: &str, passphrase: &str) -> any
         onion_address: onion_address.clone(),
         noise_public_key: public_identity.noise_public_key.clone(),
         mls_key_package: key_package,
+        relay: None,
     };
     println!("[invite] share this link:");
     println!("{}", invite.to_link());

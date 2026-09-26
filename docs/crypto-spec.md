@@ -128,12 +128,20 @@ Being upfront about residual metadata is part of not overpromising
   circuit path* even though Tor hides the endpoints from each other and
   from outside observers — padding/timing obfuscation beyond what Tor
   itself provides is possible later hardening, not a v1 commitment.
-- A relay node handling store-and-forward delivery (Phase 5) sees *that* a
-  blob addressed to routing-ID Y exists and roughly when it was
-  deposited/collected, even though it cannot read the blob and never learns
-  the depositing/collecting peer's real IP (it's reached only via its own
-  onion service). Routing IDs should be distinct from long-term identity
-  keys and ideally rotated to limit correlation.
+- A relay node handling store-and-forward delivery (Phase 5, as built in
+  `securetext-relay` and `securetext-app/src/relay.rs`) sees *that* a blob
+  arrived for mailbox ID Y, its size rounded up to 1 KiB, and roughly when
+  it was deposited and collected (stored only to the hour). It cannot read
+  the blob, can't tell who deposited it, and never learns anyone's IP (it's
+  reachable only as an onion service). The mailbox ID is `SHA-256(context ||
+  secret)` and unrelated to any identity key. Every relay connection uses
+  a fresh throwaway Noise key, so deposits and collections can't be linked
+  to each other or to an identity by key. The mailbox ID *is* stable until
+  the user changes relay, so the relay can tell that one mailbox gets mail
+  and when; rotating it is future hardening. Separately, a contact who
+  colludes with the relay could open the outer envelope layer (every
+  contact holds the mailbox key) and see which of the user's contacts sent
+  what when. The contents stay MLS-encrypted.
 - Voice/video calls (Phase 6) are the one feature where IP-level exposure
   is accepted by design — see threat-model.md's disclosed exception.
 

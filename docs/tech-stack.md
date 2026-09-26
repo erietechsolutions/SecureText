@@ -374,6 +374,29 @@ rather than guessed in advance:
   admin's client asks for more and tells the user to retry once the
   contact has been online. This isn't a hard failure.
 
+## Phase 5 implementation findings
+
+- **New direct dependency: `sha2` 0.10 (RustCrypto)**, used for relay
+  mailbox IDs. Vetting per the standing rule below: it was already in the
+  build as a transitive dependency of `openmls_rust_crypto` (same version
+  line), it comes from the same RustCrypto organisation as the
+  already-adopted `chacha20poly1305` and `argon2`, it's MIT/Apache-2.0,
+  and it's actively maintained. Making it direct adds no new code to the
+  binary.
+- **Relay-connection Noise keys must be throwaway.** The obvious
+  implementation, reusing the identity's Noise key (the way peer
+  connections do), would give the relay a stable identifier linking
+  every deposit and collection a user makes. The relay client generates a
+  fresh key per connection, and `relay_flows.rs` checks that no key
+  repeats.
+- **Sign the bytes you send, not a re-serialization.** Envelope signatures
+  cover the frames' exact JSON string (carried as a string), not a value
+  re-serialized by the receiver. Otherwise any serializer difference
+  between versions would make valid envelopes fail verification.
+- **Verify the verifier.** The relay-storage inspection test was checked by
+  temporarily making the client deposit plaintext. It failed as it should
+  ("relay storage contains the sender's label"), so a pass means something.
+
 ## Standing rule: crypto/network-adjacent dependency vetting
 
 Prompted by how noisy a crates.io search for Signal-protocol-adjacent

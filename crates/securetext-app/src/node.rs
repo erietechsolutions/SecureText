@@ -20,8 +20,10 @@ use securetext_identity::{IdentityStore, PublicIdentity};
 use securetext_invite::Invite;
 use securetext_net::{MuxMode, SecureMux};
 use tokio::sync::{broadcast, mpsc};
+use securetext_relay::{client as relay_client, RelayAddress, Request as RelayRequest, Response as RelayResponse, StoredBlob};
 use tokio::task::JoinSet;
 
+use crate::relay::{self, MyRelay};
 use crate::store::{ConversationRow, MessageRow, PeerRow, Store};
 use crate::transport::{BoxedStream, Listening, Transport};
 use crate::wire::{
@@ -45,6 +47,8 @@ const MAX_PENDING_TRIES: u8 = 8;
 pub const MAX_MESSAGE_CHARS: usize = 4000;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+/// Blobs fetched from our relay mailbox per round trip.
+const COLLECT_BATCH: u32 = 50;
 
 pub(crate) type Job = Box<dyn FnOnce(&mut NodeState) + Send>;
 
@@ -76,6 +80,22 @@ pub(crate) enum NetEvent {
         peer_key: Vec<u8>,
         error: String,
     },
+    /// Queued frames for `peer_key` were left at their relay.
+    Relayed {
+        peer_key: Vec<u8>,
+        outbox_ids: Vec<i64>,
+    },
+    RelayDepositFailed {
+        peer_key: Vec<u8>,
+        error: String,
+    },
+    /// Blobs collected from our own relay mailbox.
+    RelayCollected {
+        items: Vec<StoredBlob>,
+    },
+    RelayCollectFailed {
+        error: String,
+    },
 }
 
 pub(crate) struct Outgoing {
@@ -99,6 +119,7 @@ pub(crate) struct Timing {
     pub retry_interval: Duration,
     pub dial_timeout: Duration,
     pub presence_interval: Duration,
+    pub relay_poll_interval: Duration,
 }
 
 pub(crate) struct NodeState {
@@ -115,6 +136,8 @@ pub(crate) struct NodeState {
     transport: Option<Arc<dyn Transport>>,
     listening_guard: Option<Box<dyn Send + Sync>>,
     my_card: Option<SignedCard>,
+    my_onion: Option<String>,
+    my_relay: Option<MyRelay>,
 
     connections: HashMap<Vec<u8>, Conn>,
     /// Cards presented by peers on connections they opened to us, for
@@ -125,6 +148,10 @@ pub(crate) struct NodeState {
     backoff: HashMap<Vec<u8>, (Instant, u32)>,
     pending: HashMap<Vec<u8>, Vec<Pending>>,
     last_presence: Option<Instant>,
+    /// Peers whose queue is currently being deposited at their relay.
+    relaying: HashSet<Vec<u8>>,
+    collecting: bool,
+    last_collect: Option<Instant>,
     next_conn_id: u64,
     tasks: JoinSet<()>,
 
@@ -160,6 +187,7 @@ impl NodeState {
         provider.run_migrations()?;
         let member = Member::new(&public.label, member_signer, provider);
         let store = Store::open(identity.db_path())?;
+        let my_relay = MyRelay::load(&store)?;
 
         let mut groups = HashMap::new();
         for conversation in store.conversations()? {
@@ -181,12 +209,17 @@ impl NodeState {
             transport: None,
             listening_guard: None,
             my_card: None,
+            my_onion: None,
+            my_relay,
             connections: HashMap::new(),
             presented_cards: HashMap::new(),
             dialing: HashSet::new(),
             backoff: HashMap::new(),
             pending: HashMap::new(),
             last_presence: None,
+            relaying: HashSet::new(),
+            collecting: false,
+            last_collect: None,
             next_conn_id: 0,
             tasks: JoinSet::new(),
             events,
@@ -232,18 +265,10 @@ impl NodeState {
     pub(crate) fn handle_net(&mut self, event: NetEvent) {
         match event {
             NetEvent::TransportReady { transport, mut listening } => {
-                let card = ContactCard {
-                    label: self.public.label.clone(),
-                    mls_public_key: self.public.public_key.clone(),
-                    onion_address: listening.onion_address.clone(),
-                    noise_public_key: self.public.noise_public_key.clone(),
-                };
-                match SignedCard::sign(card, &self.signer) {
-                    Ok(card) => self.my_card = Some(card),
-                    Err(e) => {
-                        self.set_network(NetworkState::Error(e.to_string()));
-                        return;
-                    }
+                self.my_onion = Some(listening.onion_address.clone());
+                if let Err(e) = self.refresh_my_card() {
+                    self.set_network(NetworkState::Error(e.to_string()));
+                    return;
                 }
                 let _ = self.store.set_setting("onion_address", &listening.onion_address);
                 let incoming_tx = self.net_tx.clone();
@@ -259,6 +284,7 @@ impl NodeState {
                 self.transport = Some(transport);
                 self.set_network(NetworkState::Ready);
                 self.presence_sweep();
+                self.maybe_collect();
             }
             NetEvent::TransportFailed(error) => self.set_network(NetworkState::Error(error)),
             NetEvent::Incoming(stream) => self.spawn_accept(stream),
@@ -288,6 +314,25 @@ impl NodeState {
                 entry.0 = Instant::now();
                 entry.1 = entry.1.saturating_add(1);
                 eprintln!("[securetext] could not reach {}: {error}", short(&peer_key));
+                self.maybe_deposit(&peer_key);
+            }
+            NetEvent::Relayed { peer_key, outbox_ids } => {
+                self.relaying.remove(&peer_key);
+                for id in outbox_ids {
+                    if let Ok(Some((msg_ref, 0))) = self.store.outbox_delivered(id) {
+                        self.set_message_status(&msg_ref, "relayed");
+                    }
+                }
+                self.dirty = true;
+            }
+            NetEvent::RelayDepositFailed { peer_key, error } => {
+                self.relaying.remove(&peer_key);
+                eprintln!("[securetext] could not leave messages at {}'s relay: {error}", short(&peer_key));
+            }
+            NetEvent::RelayCollected { items } => self.on_collected(items),
+            NetEvent::RelayCollectFailed { error } => {
+                self.collecting = false;
+                eprintln!("[securetext] could not check the relay mailbox: {error}");
             }
         }
     }
@@ -311,8 +356,224 @@ impl NodeState {
             if presence_due {
                 self.presence_sweep();
             }
+            self.maybe_collect();
         }
         self.seal_if_dirty();
+    }
+
+    // =====================================================================
+    // Relay (Phase 5): deposit for unreachable peers, collect our own mail
+    // =====================================================================
+
+    /// (Re)build and sign our contact card from our current onion address
+    /// and relay mailbox.
+    fn refresh_my_card(&mut self) -> anyhow::Result<()> {
+        let Some(onion) = self.my_onion.clone() else { return Ok(()) };
+        let card = ContactCard {
+            label: self.public.label.clone(),
+            mls_public_key: self.public.public_key.clone(),
+            onion_address: onion,
+            noise_public_key: self.public.noise_public_key.clone(),
+            relay: self.my_relay.as_ref().map(MyRelay::card),
+        };
+        self.my_card = Some(SignedCard::sign(card, &self.signer)?);
+        Ok(())
+    }
+
+    /// A direct connection to `peer_key` just failed. If they have a relay
+    /// mailbox, leave everything queued for them there instead of waiting
+    /// for both of us to be online at the same time.
+    fn maybe_deposit(&mut self, peer_key: &[u8]) {
+        if self.relaying.contains(peer_key) || self.connections.contains_key(peer_key) {
+            return;
+        }
+        let (Some(transport), Some(my_card)) = (self.transport.clone(), self.my_card.clone()) else { return };
+        let Ok(Some(peer)) = self.store.peer(peer_key) else { return };
+        let Some(relay_card) = peer.relay else { return };
+        let Ok(address) = RelayAddress::parse(&relay_card.address) else { return };
+        let Ok(rows) = self.store.outbox_for(peer_key) else { return };
+        if rows.is_empty() {
+            return;
+        }
+
+        let mut blobs = Vec::new();
+        for batch in relay::batch(rows.into_iter().map(|r| (r.id, r.frame)).collect()) {
+            let (ids, frames): (Vec<i64>, Vec<WireMessage>) = batch.into_iter().unzip();
+            match relay::seal(&my_card, &self.signer, peer_key, &frames, &relay_card) {
+                Ok(blob) => blobs.push((ids, blob)),
+                Err(e) => {
+                    eprintln!("[securetext] could not seal messages for the relay: {e:#}");
+                    return;
+                }
+            }
+        }
+
+        self.relaying.insert(peer_key.to_vec());
+        let net_tx = self.net_tx.clone();
+        let timeout = self.timing.dial_timeout;
+        let peer_key = peer_key.to_vec();
+        self.tasks.spawn(async move {
+            let outcome = tokio::time::timeout(timeout, async {
+                let stream = transport.dial(&address.onion_address).await?;
+                let requests = blobs
+                    .iter()
+                    .map(|(_, blob)| RelayRequest::Deposit { mailbox: relay_card.mailbox.clone(), blob: blob.clone() })
+                    .collect();
+                let responses = relay_client::exchange(stream, &address.noise_public_key, requests).await?;
+                // Only what the relay accepted counts as delivered; the
+                // rest stays queued.
+                let mut delivered = Vec::new();
+                let mut refused = None;
+                for ((ids, _), response) in blobs.into_iter().zip(responses) {
+                    match response {
+                        RelayResponse::Deposited => delivered.extend(ids),
+                        RelayResponse::Error { reason } => refused = Some(reason),
+                        _ => refused = Some("unexpected reply".into()),
+                    }
+                }
+                Ok::<_, anyhow::Error>((delivered, refused))
+            })
+            .await;
+            let event = match outcome {
+                Ok(Ok((delivered, None))) => NetEvent::Relayed { peer_key, outbox_ids: delivered },
+                Ok(Ok((delivered, Some(reason)))) => {
+                    if !delivered.is_empty() {
+                        let _ = net_tx.send(NetEvent::Relayed { peer_key: peer_key.clone(), outbox_ids: delivered });
+                    }
+                    NetEvent::RelayDepositFailed { peer_key, error: format!("relay refused: {reason}") }
+                }
+                Ok(Err(e)) => NetEvent::RelayDepositFailed { peer_key, error: format!("{e:#}") },
+                Err(_) => NetEvent::RelayDepositFailed { peer_key, error: "timed out".into() },
+            };
+            let _ = net_tx.send(event);
+        });
+    }
+
+    /// Check our own mailbox, if we have one and it's time.
+    fn maybe_collect(&mut self) {
+        if self.collecting || self.stopping {
+            return;
+        }
+        let (Some(transport), Some(mine)) = (self.transport.clone(), self.my_relay.clone()) else { return };
+        if self.last_collect.is_some_and(|t| t.elapsed() < self.timing.relay_poll_interval) {
+            return;
+        }
+        self.collecting = true;
+        self.last_collect = Some(Instant::now());
+        let net_tx = self.net_tx.clone();
+        let timeout = self.timing.dial_timeout;
+        self.tasks.spawn(async move {
+            let outcome = tokio::time::timeout(timeout, async {
+                let stream = transport.dial(&mine.address.onion_address).await?;
+                let request = RelayRequest::Fetch { secret: mine.secret.clone(), limit: COLLECT_BATCH };
+                let mut responses = relay_client::exchange(stream, &mine.address.noise_public_key, vec![request]).await?;
+                match responses.pop() {
+                    Some(RelayResponse::Blobs { items }) => Ok(items),
+                    Some(RelayResponse::Error { reason }) => anyhow::bail!("relay refused: {reason}"),
+                    _ => anyhow::bail!("unexpected reply from relay"),
+                }
+            })
+            .await;
+            let _ = net_tx.send(match outcome {
+                Ok(Ok(items)) => NetEvent::RelayCollected { items },
+                Ok(Err(e)) => NetEvent::RelayCollectFailed { error: format!("{e:#}") },
+                Err(_) => NetEvent::RelayCollectFailed { error: "timed out".into() },
+            });
+        });
+    }
+
+    fn on_collected(&mut self, items: Vec<StoredBlob>) {
+        self.collecting = false;
+        let Some(mine) = self.my_relay.clone() else { return };
+        if items.is_empty() {
+            return;
+        }
+        let full_batch = items.len() as u32 >= COLLECT_BATCH;
+        let ids: Vec<i64> = items.iter().map(|b| b.id).collect();
+        for item in items {
+            match relay::open(&item.blob, &mine, &self.public.public_key, &self.crypto) {
+                Ok((card, frames)) => {
+                    let from = card.card.mls_public_key.clone();
+                    if from == self.public.public_key {
+                        continue;
+                    }
+                    self.accept_card(&from, &card);
+                    for frame in frames {
+                        if let Err(e) = self.on_frame(&from, frame) {
+                            eprintln!("[securetext] dropped a relayed frame from {}: {e:#}", short(&from));
+                        }
+                    }
+                }
+                // Junk, or sealed for an older mailbox: nothing to do but
+                // clear it out.
+                Err(e) => eprintln!("[securetext] discarded an unreadable relay blob: {e:#}"),
+            }
+        }
+        self.dirty = true;
+
+        // Everything fetched has been handled (or was unreadable), so
+        // delete it from the relay. Frames already applied above are safe
+        // to lose from the relay even if this ack fails: a re-delivery is
+        // deduplicated (MLS rejects replays; chat ids are unique).
+        let Some(transport) = self.transport.clone() else { return };
+        self.tasks.spawn(async move {
+            if let Ok(stream) = transport.dial(&mine.address.onion_address).await {
+                let _ = relay_client::exchange(
+                    stream,
+                    &mine.address.noise_public_key,
+                    vec![RelayRequest::Ack { secret: mine.secret.clone(), ids }],
+                )
+                .await;
+            }
+        });
+        if full_batch {
+            self.last_collect = None; // more waiting; collect again next tick
+        }
+    }
+
+    /// Adopt a verified card presented by `from` (on a connection or in a
+    /// relay envelope): remembered for a later Welcome, and applied right
+    /// away if they're already known.
+    fn accept_card(&mut self, from: &[u8], card: &SignedCard) {
+        if let Ok(Some(existing)) = self.store.peer(from) {
+            let row = PeerRow {
+                mls_key: from.to_vec(),
+                label: clamp_chars(&card.card.label, MAX_NAME_CHARS),
+                onion_address: card.card.onion_address.clone(),
+                noise_key: card.card.noise_public_key.clone(),
+                is_contact: existing.is_contact,
+                relay: card.card.relay.clone(),
+            };
+            let _ = self.store.upsert_peer(&row, Some(card));
+            self.dirty = true;
+        }
+        self.presented_cards.insert(from.to_vec(), card.clone());
+    }
+
+    pub(crate) fn set_relay(&mut self, link: Option<&str>) -> anyhow::Result<Option<String>> {
+        match link.map(str::trim).filter(|l| !l.is_empty()) {
+            Some(link) => {
+                let mine = MyRelay::new(link)?;
+                mine.save(&self.store)?;
+                self.my_relay = Some(mine);
+            }
+            None => {
+                MyRelay::clear(&self.store)?;
+                self.my_relay = None;
+            }
+        }
+        self.dirty = true;
+        self.last_collect = None;
+        self.refresh_my_card()?;
+        // Tell everyone we're connected to right away; others pick up the
+        // new card the next time we connect to them.
+        if let Some(card) = self.my_card.clone() {
+            for conn in self.connections.values() {
+                let _ = conn.tx.send(Outgoing { outbox_id: None, message: WireMessage::Hello { card: card.clone() } });
+            }
+        }
+        self.maybe_collect();
+        Ok(self.my_relay.as_ref().map(|r| r.link.clone()))
     }
 
     /// Connect to everyone we share an active conversation with, so their
@@ -448,18 +709,7 @@ impl NodeState {
             // A verified card from a known peer is authoritative for how
             // to reach them. Unknown peers are only remembered once they
             // send something that makes them known (a Welcome).
-            if let Ok(Some(existing)) = self.store.peer(&peer_key) {
-                let row = PeerRow {
-                    mls_key: peer_key.clone(),
-                    label: card.card.label.clone(),
-                    onion_address: card.card.onion_address.clone(),
-                    noise_key: card.card.noise_public_key.clone(),
-                    is_contact: existing.is_contact,
-                };
-                let _ = self.store.upsert_peer(&row, Some(&card));
-                self.dirty = true;
-            }
-            self.presented_cards.insert(peer_key.clone(), card);
+            self.accept_card(&peer_key, &card);
         }
 
         // Anything queued while they were unreachable goes out now, in order.
@@ -474,7 +724,18 @@ impl NodeState {
 
     fn on_frame(&mut self, from: &[u8], message: WireMessage) -> anyhow::Result<()> {
         match message {
-            WireMessage::Hello { .. } => Ok(()), // only meaningful as a connection's first frame
+            // Mid-connection, a Hello is a card update (e.g. they changed
+            // relay). It must be theirs and keep the Noise key this
+            // connection was authenticated with.
+            WireMessage::Hello { card } => {
+                card.verify(&self.crypto)?;
+                anyhow::ensure!(card.card.mls_public_key == from, "Hello card is for someone else");
+                if let Some(peer) = self.store.peer(from)? {
+                    anyhow::ensure!(card.card.noise_public_key == peer.noise_key, "Hello card changes the Noise key");
+                }
+                self.accept_card(from, &card);
+                Ok(())
+            }
             WireMessage::Welcome { welcome, info, roster } => self.on_welcome(from, &welcome, info, roster),
             WireMessage::Mls { group_id, message } => {
                 self.on_mls(from, group_id, message, 0);
@@ -578,6 +839,7 @@ impl NodeState {
             onion_address: card.card.onion_address.clone(),
             noise_key: card.card.noise_public_key.clone(),
             is_contact,
+            relay: card.card.relay.clone(),
         };
         self.store.upsert_peer(&row, Some(card))?;
         self.dirty = true;
@@ -741,6 +1003,7 @@ impl NodeState {
             onion_address: self.my_card.as_ref().map(|c| c.card.onion_address.clone()),
             network: self.network.clone(),
             online_peers: self.connections.len(),
+            relay: self.my_relay.as_ref().map(|r| r.link.clone()),
         }
     }
 
@@ -753,6 +1016,7 @@ impl NodeState {
             onion_address: card.card.onion_address.clone(),
             noise_public_key: self.public.noise_public_key.clone(),
             mls_key_package: self.member.key_package_bytes()?,
+            relay: self.my_relay.as_ref().map(MyRelay::card),
         };
         self.dirty = true; // the key package's private half was just stored
         Ok(invite.to_link())
@@ -794,6 +1058,7 @@ impl NodeState {
                 onion_address: invite.onion_address.clone(),
                 noise_key: invite.noise_public_key.clone(),
                 is_contact: true,
+                relay: invite.relay.clone(),
             },
             None,
         )?;

@@ -34,6 +34,11 @@ pub struct ContactCard {
     pub onion_address: String,
     #[serde(with = "b64")]
     pub noise_public_key: Vec<u8>,
+    /// Their offline-delivery mailbox, if they have one (Phase 5). Left out
+    /// of the serialized card when unset, so cards without one sign and
+    /// verify exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<securetext_invite::RelayCard>,
 }
 
 /// A [`ContactCard`] signed by the MLS identity key it names.
@@ -294,6 +299,7 @@ mod tests {
             mls_public_key: signer.to_public_vec(),
             onion_address: "example.onion".into(),
             noise_public_key: vec![7; 32],
+            relay: None,
         }
     }
 

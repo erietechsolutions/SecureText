@@ -4069,6 +4069,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "chacha20poly1305",
  "futures",
  "openmls",
  "openmls_basic_credential",
@@ -4080,8 +4081,10 @@ dependencies = [
  "securetext-identity",
  "securetext-invite",
  "securetext-net",
+ "securetext-relay",
  "serde",
  "serde_json",
+ "snow",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -4169,6 +4172,23 @@ dependencies = [
  "tor-hsservice",
  "tor-rtcompat",
  "yamux",
+]
+
+[[package]]
+name = "securetext-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "rusqlite",
+ "securetext-net",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "snow",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

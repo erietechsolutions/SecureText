@@ -410,12 +410,14 @@
       if (!prev || !sameDay(prev.sent_at, m.sent_at)) html += `<div class="day-sep">${esc(fmtDay(m.sent_at))}</div>`;
       const first = !prev || prev.sender_key !== m.sender_key || m.sent_at - prev.sent_at > 5 * 60 * 1000 || !sameDay(prev.sent_at, m.sent_at);
       const pending = m.outgoing && m.status === 'pending';
+      const relayed = m.outgoing && m.status === 'relayed';
       html += `<div class="msg ${first ? 'first' : ''} ${pending ? 'pending' : ''}">
         <div class="gutter">${first ? avatar(m.sender_label, m.sender_key, undefined) : `<span class="time-hover">${esc(fmtTime(m.sent_at))}</span>`}</div>
         <div>
           ${first ? `<div class="head"><span class="who">${esc(m.sender_label)}</span><span class="when">${esc(fmtTime(m.sent_at))}</span></div>` : ''}
           <div class="body">${esc(m.body)}</div>
           ${pending ? `<div class="status pending">◷ Queued on this device — sends automatically when ${c.kind === 'dm' ? esc(c.name) + ' is' : 'members are'} reachable over Tor</div>` : ''}
+          ${relayed ? `<div class="status relayed">✓ Left at ${c.kind === 'dm' ? esc(c.name) + '’s' : 'an offline member’s'} relay — delivered when they’re next online</div>` : ''}
         </div></div>`;
       prev = m;
     }
@@ -537,10 +539,45 @@
           <dt>Tor</dt><dd>${esc(net.state === 'ready' ? 'Connected' : net.state === 'error' ? 'Unavailable: ' + (net.detail || '') : 'Connecting…')}</dd>
           <dt>Your address</dt><dd>${esc(s.onion_address || 'not published yet')}</dd>
           <dt>Connected peers</dt><dd>${esc(s.online_peers ?? 0)}</dd>
+          <dt>Offline relay</dt><dd>${esc(s.relay || 'none — messages to you wait until you’re both online')}</dd>
           <dt>Your key</dt><dd>${esc(s.public_key || '')}</dd>
         </dl>
       </div>
       <div class="actions"><button class="btn primary" data-close>Got it</button></div>`);
+  }
+
+  function showRelaySettings() {
+    const current = (state.status && state.status.relay) || '';
+    modal(`<h3>Offline delivery</h3>
+      <p class="lead">Without a relay, a message only arrives when you and the sender are online at the same time. A relay is a mailbox on the Tor network that holds messages for you until you’re back.</p>
+      <div class="explain">
+        <p><strong>It can’t read anything.</strong> Messages are sealed before they reach it, and it only knows an anonymous mailbox number, never who you are or who wrote to you. It’s reachable only over Tor, so it never sees anyone’s IP address.</p>
+        <p><strong>Use one you trust to stay up.</strong> Anyone can run one with <code>securetext-relay</code>. Your contacts learn your relay automatically; changing it starts a fresh, empty mailbox.</p>
+      </div>
+      <label>Relay address<input id="m-relay" spellcheck="false" placeholder="securetext-relay1:…" value="${esc(current)}"></label>
+      <p class="form-error" id="m-err"></p>
+      <div class="actions">
+        ${current ? '<button class="btn ghost" id="m-clear">Stop using a relay</button>' : ''}
+        <button class="btn ghost" data-close>Cancel</button>
+        <button class="btn primary" id="m-go">Save</button>
+      </div>`,
+    (root, close) => {
+      const save = async (btn, address) => {
+        busy(btn, true);
+        try {
+          await call('set_relay', { address });
+          close();
+          await refreshStatus();
+          toast(address ? 'Relay saved. Messages sent to you while you’re away will wait there.' : 'Relay removed.');
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+          busy(btn, false);
+        }
+      };
+      $('#m-go', root).addEventListener('click', (e) => save(e.target, $('#m-relay', root).value.trim() || null));
+      const clear = $('#m-clear', root);
+      if (clear) clear.addEventListener('click', (e) => save(e.target, null));
+    });
   }
 
   function showAddContact() {
@@ -736,6 +773,7 @@
   $('#rail-home').addEventListener('click', goHome);
   $('#rail-add').addEventListener('click', showNewServer);
   $('#net-pill').addEventListener('click', showNetworkModal);
+  $('#me-settings').addEventListener('click', showRelaySettings);
 
   const input = $('#composer-input');
   function autosize() {

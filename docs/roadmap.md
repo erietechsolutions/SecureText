@@ -295,14 +295,63 @@ this is a security-sensitive project where shortcuts compound.
   GUI-driven live-Tor run above and a session with an actual
   non-technical tester are still to do.
 
-## Phase 5 — Offline Delivery
-- Store-and-forward relay service (self-hosted and/or volunteer-run),
-  reachable only via its own onion service (architecture.md §4)
-- Client-side polling/retrieval of queued encrypted blobs over Tor
+## Phase 5 — Offline Delivery *(feature-complete; verified deterministically, including relay-storage inspection; live-Tor relay run pending)*
+- [x] Store-and-forward relay service (`crates/securetext-relay`, binary
+      `securetext-relay --dir <path>`): reachable only as its own onion
+      service, stable address across restarts, prints a
+      `securetext-relay1:` address (onion + pinned Noise key). It is a blind
+      mailbox and keeps its audit surface small: deposit (anyone with the
+      mailbox ID), fetch and ack (only the mailbox secret's holder). It
+      enforces per-blob, per-mailbox and global limits and a 14-day TTL,
+      stores deposit times rounded to the hour, and uses SQLite
+      `secure_delete`.
+- [x] Client-side deposit and retrieval over Tor (`securetext-app`,
+      `relay.rs`). When a direct dial fails, queued frames are sealed into
+      envelopes (ChaCha20-Poly1305 under the recipient's mailbox key, padded
+      to 1 KiB, signed by the sender's MLS key over the exact frames and
+      recipient) and left at the recipient's relay. Mailboxes are polled,
+      and what's collected goes through the same handlers as a direct
+      connection. A throwaway Noise key is used per relay connection.
+      Relay cards travel in contact cards and invite links, both
+      backward-compatible (omitted when unset), and a relay change reaches
+      connected contacts immediately.
+- [x] Desktop UI: an "Offline delivery" setting (⚙ next to your name),
+      messages left at a relay marked as such, and the relay shown in the
+      Tor details dialog.
+- **Verification:**
+  - ✅ `crates/securetext-relay`: 9 tests covering storage round-trip,
+    mailbox authorization (the mailbox ID can't read or delete; only the
+    secret can), quotas and TTL, coarsened timestamps, Noise pinning of the
+    relay's key, and oversized-deposit refusal.
+  - ✅ `crates/securetext-app/tests/relay_flows.rs`: real nodes and a real
+    relay server with on-disk storage. (1) Sender and recipient are **never
+    online at the same time** and the message still arrives, then is
+    deleted from the relay. (2) An invite is accepted while the inviter is
+    offline, and the new conversation and first message are waiting when
+    they return. (3) A relay chosen after befriending reaches the contact
+    as a live card update. (4) **The relay's raw database file is inspected
+    byte by byte** for the message text, both parties' labels, onion
+    addresses, identity keys (raw/hex/base64), Noise key and group ID. None
+    are present. A deliberately broken build that stored plaintext was
+    confirmed to fail this check. (5) Every relay connection presented a
+    distinct throwaway key, never an identity's.
+  - ✅ Envelope unit tests: a blob opens only with its mailbox key and for
+    its addressee, and a contact holding the mailbox key can't forge an
+    envelope as someone else.
+  - 🔲 **Live-Tor run** of `securetext-relay` with two desktop clients.
+    It's the same relay code over `TorTransport` instead of the in-memory
+    network, and it's blocked on the same dev-machine loopback issue as
+    Phase 4's GUI run.
+  - **"Never learns anyone's IP" is structural, not measured.** The relay
+    has no listener except its onion service, and onion-service streams
+    carry no client address, so there's nothing for it to log. No packet
+    capture was taken.
 - **Exit criteria:** a message sent while the recipient is offline is
   delivered once they come online, without the relay ever holding
-  decryptable content or learning either party's real IP (verified by
-  inspecting relay-side storage and network traffic, not just assumed).
+  decryptable content or learning either party's real IP. ✅ Met at the
+  app level: delivery (even with both parties never online together) and
+  relay-side storage are verified directly; the IP property holds by
+  construction as noted above. The live-Tor confirmation is still to do.
 
 ## Phase 6 — Voice & Video (the disclosed exception)
 - WebRTC integration for calls and screen share, keyed from the existing

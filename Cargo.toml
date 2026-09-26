@@ -5,6 +5,7 @@ members = [
     "crates/securetext-crypto",
     "crates/securetext-net",
     "crates/securetext-invite",
+    "crates/securetext-relay",
     "crates/securetext-app",
     "crates/securetext-cli",
 ]
@@ -39,6 +40,7 @@ refinery = "0.9"
 tempfile = "3"
 
 snow = "0.10"
+sha2 = "0.10"
 yamux = "0.14"
 base64 = "0.23"
 tokio-util = { version = "0.7", features = ["compat"] }

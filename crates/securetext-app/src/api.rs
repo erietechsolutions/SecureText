@@ -105,6 +105,15 @@ pub async fn dispatch(node: &NodeHandle, cmd: &str, args: Value) -> Result<Value
             to_value(node.members(a.conversation_id).await.map_err(err)?)
         }
         "contacts" => to_value(node.contacts().await.map_err(err)?),
+        "set_relay" => {
+            #[derive(Deserialize)]
+            struct Relay {
+                #[serde(default)]
+                address: Option<String>,
+            }
+            let a: Relay = parse(args)?;
+            to_value(node.set_relay(a.address).await.map_err(err)?)
+        }
         other => Err(format!("unknown command: {other}")),
     }
 }

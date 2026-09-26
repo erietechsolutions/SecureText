@@ -58,6 +58,29 @@ pub struct Invite {
     /// existing MLS group.
     #[serde(with = "as_base64")]
     pub mls_key_package: Vec<u8>,
+    /// Where to leave messages for the inviter while they're offline
+    /// (Phase 5's store-and-forward relay, architecture.md §4). Omitted
+    /// from the link entirely when unset, so links without one are
+    /// unchanged from Phase 2's format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayCard>,
+}
+
+/// Everything someone needs to leave sealed messages for you at your
+/// relay: the relay's address (a `securetext-relay1:` link, which pins the
+/// relay's own key), your mailbox ID there, and the key senders seal
+/// envelopes with so the relay can't read them.
+///
+/// Hand this only to people you'd accept messages from. It lets them
+/// deposit into your mailbox, but not read or delete from it (that takes
+/// the mailbox *secret*, which never leaves your device).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayCard {
+    pub address: String,
+    #[serde(with = "as_base64")]
+    pub mailbox: Vec<u8>,
+    #[serde(with = "as_base64")]
+    pub key: Vec<u8>,
 }
 
 /// Serializes a `Vec<u8>` field as a base64 string instead of serde_json's
@@ -113,6 +136,7 @@ mod tests {
                 .to_string(),
             noise_public_key: vec![1, 2, 3, 4, 5],
             mls_key_package: vec![9, 9, 9, 8, 8, 8, 7],
+            relay: None,
         };
 
         let link = invite.to_link();
@@ -120,6 +144,32 @@ mod tests {
 
         let parsed = Invite::from_link(&link).expect("parse");
         assert_eq!(parsed, invite);
+    }
+
+    #[test]
+    fn relay_card_is_optional_and_round_trips() {
+        let mut invite = Invite {
+            label: "alice".to_string(),
+            onion_address: "example.onion".to_string(),
+            noise_public_key: vec![1; 32],
+            mls_key_package: vec![2; 8],
+            relay: None,
+        };
+        // Without a relay the link carries no trace of the field, so it's
+        // exactly the Phase 2 format.
+        let plain = invite.to_link();
+        assert!(!String::from_utf8(
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &plain[SCHEME_PREFIX.len()..]).unwrap()
+        )
+        .unwrap()
+        .contains("relay"));
+
+        invite.relay = Some(RelayCard {
+            address: "securetext-relay1:relay.onion#key".to_string(),
+            mailbox: vec![3; 32],
+            key: vec![4; 32],
+        });
+        assert_eq!(Invite::from_link(&invite.to_link()).unwrap(), invite);
     }
 
     #[test]
