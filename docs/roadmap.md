@@ -3,7 +3,29 @@
 Each phase's exit criteria should be checked before starting the next —
 this is a security-sensitive project where shortcuts compound.
 
-## Phase 0 — Spec & Threat Model *(current phase)*
+## At a glance
+
+| Phase | Scope | Status |
+|---|---|---|
+| 0 | Spec & threat model | ✅ Complete |
+| 1 | 1:1 encrypted messaging over Tor | ✅ Live-verified on Linux · Windows pairing pending |
+| 2 | Invite links & bridges | ✅ Live-verified on Linux · obfs4 bridge live test pending |
+| 3 | Groups ("servers") & channels | ✅ Verified deterministically |
+| 4 | Desktop client (Tauri) | ✅ Verified through the GUI over live Tor · real-user test pending |
+| 5 | Offline delivery (relays) | ✅ Verified deterministically and over live Tor |
+| 6 | Desktop installers & auto-updates | Next up |
+| 7 | Voice & video (the disclosed exception) | Not started |
+| 8 | Rich features | Not started |
+| 9 | Hardening & third-party audit | Not started · required before any production claim |
+| 10 | Mobile core compatibility | Not started |
+| 11 | Android app, export & updates | Not started |
+
+**Renumbering note (2026-09-26):** Phases 6–11 were reorganised to add
+installers/auto-updates and Android. Old → new: Voice & Video 6 → 7, Rich
+Features 7 → 8, Hardening & Audit 8 → 9, Mobile Clients 9 → 10 (plus the
+new 6 and 11). Commit messages from before this date use the old numbers.
+
+## Phase 0 — Spec & Threat Model *(complete; remaining open items deferred to the phases that need them)*
 - [x] Threat model (`threat-model.md`)
 - [x] Cryptographic design (`crypto-spec.md`)
 - [x] Network architecture (`architecture.md`)
@@ -369,7 +391,50 @@ this is a security-sensitive project where shortcuts compound.
   storage are verified directly, deterministically and over live Tor. The
   IP property holds by construction, as noted above.
 
-## Phase 6 — Voice & Video (the disclosed exception)
+## Phase 6 — Desktop Installers & Auto-Updates *(next)*
+Goal: someone can install SecureText without a Rust toolchain and stay up
+to date without doing anything, without weakening the anonymity
+guarantees. This is also what makes Phase 4's pending real-user test
+possible.
+- [ ] Native installers from the Tauri bundler, each built on its own OS
+      (platform-support.md): `.msi`/NSIS `.exe` for Windows 10/11, `.deb`
+      and `.AppImage` for Ubuntu, `.rpm` for Fedora. They should install
+      without admin rights where the platform allows it, add a start-menu/
+      desktop entry, and ship a clean uninstaller that states whether the
+      encrypted profile is kept or removed (never silently deleted).
+- [ ] Release pipeline: GitHub Actions builds every installer on native
+      runners on a version tag, runs `cargo test --workspace` plus the
+      headless GUI E2E (`desktop/e2e/gui_e2e.py`) first, and publishes the
+      artifacts, checksums and signatures to **GitHub Releases**.
+- [ ] Code signing: Windows Authenticode (so SmartScreen doesn't block
+      the installer) and GPG-signed Linux packages. Signing keys are kept
+      out of the repo and out of any single maintainer's laptop.
+- [ ] **Auto-updates linked to GitHub Releases**, via Tauri's updater
+      plugin (a `latest.json` manifest attached to each release) or an
+      equivalent. It must meet these requirements:
+  - Update checks and downloads go **over Tor**, through the app's own
+    arti client, never the clearnet. A plain HTTPS request to github.com
+    would tell GitHub, and anyone watching the network, that this IP runs
+    SecureText and when. That's exactly the linkage the app exists to
+    prevent.
+  - Every update is signed with a dedicated update-signing key (separate
+    from the code-signing keys, public half pinned in the app) and verified
+    before anything is installed. No downgrades.
+  - The user is told what's changing and chooses when to restart. Checks
+    are randomised in time so they don't create a fingerprintable pattern.
+    Updates can be turned off.
+  - The repo (or a separate public releases repo) must be **public** for
+    unauthenticated update checks. Today the repo is private.
+- [ ] Relay packaging: `securetext-relay` as `.deb`/`.rpm` with a systemd
+      unit (and optionally a container image), so running one doesn't
+      require building from source.
+- **Exit criteria:** on clean Windows 10, Windows 11, Ubuntu and Fedora
+  machines, a non-developer installs from a GitHub Release, the app runs,
+  and an update published afterwards is detected, verified and applied
+  over Tor. A packet capture confirms the update traffic never touches the
+  clearnet. A tampered or wrongly signed update is refused.
+
+## Phase 7 — Voice & Video (the disclosed exception)
 - WebRTC integration for calls and screen share, keyed from the existing
   MLS session material, using the forced-relay design from
   architecture.md §9 (never a direct peer connection for media)
@@ -380,45 +445,97 @@ this is a security-sensitive project where shortcuts compound.
   peer-to-peer) so participants don't learn each other's raw IP; the
   disclosure UI is reviewed for clarity, not just presence.
 
-## Phase 7 — Rich Features
+## Phase 8 — Rich Features
 - Encrypted file/image sharing, reactions, threads, presence/status,
   disappearing messages — all over the Tor transport from Phase 1
 - **Exit criteria:** feature parity checklist against the "Discord-like"
   goal from the original vision, each new feature re-checked against
   threat-model.md for new metadata leakage before shipping.
 
-## Phase 8 — Hardening & Third-Party Audit
+## Phase 9 — Hardening & Third-Party Audit
 - Independent security audit covering: the crypto implementation and
   protocol composition (MLS-for-1:1 included, since it's a less-common
   usage pattern than MLS-for-groups-only), and the Tor integration
   specifically (onion-service key handling, bridge configuration, the
-  Phase 6 calls exception's actual exposure).
+  Phase 7 calls exception's actual exposure). The **update and release
+  chain from Phase 6** is in scope too: signing-key handling, update
+  verification, and Tor-only update fetching. A compromised updater
+  bypasses every other protection.
 - Address findings before any "production-ready" claim is made.
 - **Exit criteria:** audit complete, critical/high findings remediated.
   **This phase is not optional and should not be skipped or compressed
   under schedule pressure** — see crypto-spec.md §8.
 
-## Phase 9 — Mobile Clients
-- React Native or Flutter mobile clients calling the Rust core via UniFFI
-- Mobile-specific Tor integration considerations (background circuit
-  maintenance under mobile OS power management, which is known to be
-  harder than desktop — flag as a research spike early in this phase
-  rather than assuming desktop's approach ports directly)
-- **Exit criteria:** mobile clients pass the same Phase 1/3 correctness
-  checks as desktop, including the "no direct IP exchange" verification.
+## Phase 10 — Mobile Core Compatibility
+Goal: make the Rust core run correctly on mobile before building a mobile
+app on it.
+- [ ] Decide the mobile shell. Options: **Tauri 2's mobile support**
+      (reuses `desktop/ui` and calls `securetext-app` directly with no FFI
+      layer; the lowest-effort path now that the desktop app is Tauri), or
+      the original plan of React Native/Flutter calling the core through
+      UniFFI (tech-stack.md). Record the decision and why in tech-stack.md.
+- [ ] Build the core crates for Android targets (`aarch64-linux-android`,
+      `armv7-linux-androideabi`, `x86_64-linux-android` for emulators), and
+      keep them building in CI.
+- [ ] Mobile Tor research spike: arti on Android, keeping the onion
+      service reachable under Doze/app-standby. Candidate designs: a
+      foreground service with a persistent notification while "online",
+      and relay-first delivery (Phase 5) while backgrounded, where the app
+      collects from its mailbox when opened or on a scheduled job instead
+      of being continuously reachable. Measure battery and data cost.
+- [ ] Mobile-safe storage: the encrypted profile under app-private
+      storage, with the key material optionally wrapped by the Android
+      Keystore, which never weakens the passphrase model.
+- [ ] Responsive UI: the desktop layout adapted to phone screens (single
+      column with navigation between servers, channels, chat and members),
+      touch targets, and the on-screen keyboard.
+- **Exit criteria:** the core passes the same Phase 1/3/5 correctness
+  checks on an Android device or emulator as on desktop, including the
+  "no direct IP exchange" verification, and the background-reachability
+  design is chosen with measured numbers.
+
+## Phase 11 — Android App, Export & Updates
+- [ ] Android client on the Phase 10 decisions, with feature parity with
+      desktop for text, servers, channels, invites and offline delivery
+      (calls follow Phase 7's design once it exists).
+- [ ] **Exports:** signed release builds as `.apk` (direct install) and
+      `.aab` (store upload), built in the Phase 6 GitHub Actions pipeline
+      and published to GitHub Releases next to the desktop installers. The
+      release signing key is kept offline, and its loss or leak is planned
+      for (Android can't change an app's signing key casually).
+- [ ] Distribution: GitHub Releases first; then F-Droid (reproducible
+      builds, fits the project's privacy stance) and/or Obtainium users
+      tracking GitHub Releases. Google Play is optional: weigh its
+      account-identity requirements and Play Services dependencies against
+      the threat model before choosing it.
+- [ ] **Android updates:** Android doesn't allow silent self-updates of
+      sideloaded apps. The app checks GitHub Releases **over Tor**
+      (same rules as Phase 6), verifies the signed APK, and hands it to the
+      system installer with the user's confirmation. Store-installed copies
+      update through their store instead.
+- [ ] Invite links shareable via Android's share sheet and QR codes
+      (camera scan to add a contact), since phones are where people
+      exchange them in person.
+- **Exit criteria:** a signed APK installs on a stock Android phone,
+  creates a profile, and chats with a desktop user through invites,
+  servers and offline delivery over Tor. An in-app update from a newer
+  GitHub Release installs correctly and a tampered APK is refused. A
+  follow-up audit covers the Android-specific code before any production
+  claim.
 
 ## Cross-cutting, ongoing throughout all phases
 
 - **Every phase's exit criteria must be verified on Ubuntu, Fedora, and
   Windows 10/11** (see `platform-support.md`), not just the OS the code
-  happened to be written on. macOS is not an official v1 target.
+  happened to be written on, and on Android once Phase 11 ships. macOS and
+  iOS are not official v1 targets.
 - **No feature ships that creates a direct IP exchange for text/group/file
   traffic**, per the mandatory-anonymity requirement in threat-model.md —
   this is a standing constraint to check new features against, not just a
   Phase 1 concern.
 - Revisit `threat-model.md` whenever a new feature changes what data
   leaves a device unencrypted, or whenever a feature might reintroduce IP
-  exposure outside the Phase 6 disclosed exception.
+  exposure outside the Phase 7 disclosed exception.
 - No custom cryptographic protocol changes ship without review against
   `crypto-spec.md`'s "use a library, not a paper" rule.
 - No new crypto/network-adjacent dependency is added without the vetting

@@ -58,11 +58,11 @@ it belongs in v1.
   against a global adversary (that's mixnet-level research territory,
   out of scope).
 - **Voice/video call IP exposure (explicit, disclosed exception).** Per the
-  Phase 6 design decision, calls use a separate, faster transport than text
+  Phase 7 design decision, calls use a separate, faster transport than text
   messaging to keep call quality usable — this means a call participant's
   IP is exposed to the relay/TURN-equivalent infrastructure handling the
   call, and potentially to the other participant depending on the final
-  Phase 6 design, for the *duration of that call only*. Text, group, and
+  Phase 7 design, for the *duration of that call only*. Text, group, and
   file messaging are unaffected and remain fully Tor-routed. **This must be
   disclosed clearly in the calling UI** (e.g., "starting a call uses a
   faster, non-anonymous connection") so users aren't misled about a
@@ -127,11 +127,11 @@ opt out into.
 This document should be revisited (not just the code) whenever:
 - A new feature changes what data leaves a device unencrypted (e.g., typing
   indicators, read receipts, presence — each is a metadata leak to evaluate).
-- Multi-device support is designed (Phase 7) — it changes the trust
+- Multi-device support is designed (Phase 8) — it changes the trust
   boundary of "identity == one device."
 - The relay/store-and-forward design (Phase 5) is finalized — relay
   operators are a new class of adversary this doc currently treats abstractly.
-- The Phase 6 voice/video transport design is finalized — the disclosed
+- The Phase 7 voice/video transport design is finalized — the disclosed
   exception above is a placeholder until the actual mechanism (direct
   WebRTC, forced-TURN-relay, etc.) is decided, and the exact exposure it
   creates must be re-described precisely once it is.

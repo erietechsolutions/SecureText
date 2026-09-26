@@ -207,7 +207,7 @@ is orthogonal to the transport choice — see threat-model.md's non-goals):
 - **Client-side moderation bots**: just another member with elevated
   signed capabilities.
 
-## 9. Voice & video (Phase 6) — the disclosed exception
+## 9. Voice & video (Phase 7) — the disclosed exception
 
 Per the explicit design decision (see threat-model.md's disclosed
 exception): calls use a **separate, faster path than text messaging**,
@@ -235,6 +235,6 @@ real-time media over Tor.
 - **UI requirement:** the calling UI must disclose that starting a call
   uses a faster, non-anonymous connection, so users don't assume the
   always-on text anonymity guarantee extends to calls (threat-model.md).
-- This design is a placeholder for Phase 6 — the exact mechanism should be
+- This design is a placeholder for Phase 7 — the exact mechanism should be
   re-validated against threat-model.md's disclosed-exception language once
-  Phase 6 actually starts.
+  Phase 7 actually starts.

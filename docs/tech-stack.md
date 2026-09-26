@@ -4,7 +4,7 @@ Core language decision: **Rust**, confirmed for this project. Rationale:
 best-in-class crypto and Tor ecosystem (OpenMLS, RustCrypto crates, `arti`),
 memory safety without a garbage collector (relevant for a security-sensitive
 app handling key material), and a Rust core compiles cleanly to a shared
-library that mobile clients (Phase 9) can call into via UniFFI — avoiding a
+library that mobile clients (Phase 10) can call into via UniFFI — avoiding a
 second implementation of the crypto/networking layer for mobile.
 
 **Target platforms:** Ubuntu, Fedora, and Windows 10/11 (see
@@ -33,7 +33,7 @@ question) — both are now settled below.
 | Symmetric crypto primitives | `RustCrypto` crates (`chacha20poly1305`, `ed25519-dalek`, `x25519-dalek`) | Widely used, individually audited primitive crates rather than a monolithic library |
 | Password/passphrase KDF | `argon2` crate (Argon2id) | Memory-hard, current best practice over PBKDF2/bcrypt |
 | Local storage | SQLite via `rusqlite` + SQLCipher | Encrypted at rest; SQL is sufficient for message/channel/member metadata at this scale |
-| Voice/video | WebRTC via `webrtc-rs` | Native Rust WebRTC implementation; used only for the Phase 6 calls exception (architecture.md §9), which is deliberately outside the Tor transport |
+| Voice/video | WebRTC via `webrtc-rs` | Native Rust WebRTC implementation; used only for the Phase 7 calls exception (architecture.md §9), which is deliberately outside the Tor transport |
 | Invite link encoding | `base64` (`marshallpierce/rust-base64`) | Extremely widely used (1.5B+ downloads), MIT/Apache-2.0, actively maintained — vetted per this doc's own standing rule below; used to keep byte fields (keys, key packages) compact within an invite link's JSON payload instead of serde_json's default number-array encoding |
 
 **Dropped from the stack:** `rust-libp2p`. It was chosen when the network
@@ -49,13 +49,14 @@ serves the "efficient and secure" goal rather than trading against it.
 |---|---|---|
 | Desktop shell | **Tauri** | Rust backend (shares the core directly, no FFI boundary for desktop), web frontend for fast UI iteration, much smaller binary/resource footprint than Electron; ships native installers for all three target OSes (see platform-support.md) |
 | Frontend framework | React or Svelte (pick during Phase 4 UI work, not a Phase 0 blocker) | Either works fine inside Tauri; decision deferred since it doesn't affect the core architecture |
-| Mobile (Phase 9) | React Native or Flutter shell, calling the Rust core via UniFFI | Reuses the audited Rust core instead of reimplementing crypto/networking per platform |
+| Mobile (Phase 10) | **To decide in Phase 10:** Tauri 2 mobile (reuses `desktop/ui` and calls the Rust core directly) vs. a React Native/Flutter shell calling the core via UniFFI (the original plan) | Either way the audited Rust core is reused instead of reimplementing crypto/networking per platform; Tauri mobile became the likely lower-effort option once the desktop client was built on Tauri |
+| Installers & updates (Phase 6) | Tauri bundler + Tauri updater plugin (or equivalent), GitHub Releases, GitHub Actions | Native installers per OS from one codebase. Updates are signature-verified and fetched **over Tor only** (never clearnet, which would reveal who runs SecureText) |
 
 ## Infrastructure (minimal, by design)
 
 | Concern | Choice | Why |
 |---|---|---|
-| Call relay (Phase 6 only) | `coturn` (self-hostable) or a small custom Rust TURN-compatible relay | Standard, well-understood software; only used for the disclosed calls exception (architecture.md §9), never for text/group traffic |
+| Call relay (Phase 7 only) | `coturn` (self-hostable) or a small custom Rust TURN-compatible relay | Standard, well-understood software; only used for the disclosed calls exception (architecture.md §9), never for text/group traffic |
 | Store-and-forward relay (Phase 5) | Custom minimal Rust service, reachable only via its own onion service | No existing off-the-shelf "blind encrypted mailbox" server fits exactly; keep it deliberately simple (store blob, TTL, opaque routing ID lookup) to minimize audit surface |
 | Pluggable transport (bridges) | `obfs4proxy` (external binary, invoked by `arti` per its documented pluggable-transport config) | Same mechanism the reference C Tor implementation uses; no need to reimplement obfs4 |
 
@@ -188,7 +189,7 @@ rather than guessed in advance:
    state, not a blocker.
 3. **`webrtc-rs` vs. FFI to `libwebrtc`** — `webrtc-rs` is younger than
    Google's `libwebrtc`; verify it covers everything needed (in particular
-   ICE/TURN interop for the forced-relay calling mode) before Phase 6, or
+   ICE/TURN interop for the forced-relay calling mode) before Phase 7, or
    plan an FFI fallback.
 4. **Bridge configuration UX** — auto-detect-and-prompt vs. explicit
    settings toggle for obfs4 bridges (architecture.md §5); needs a decision
@@ -254,7 +255,7 @@ rather than guessed in advance:
    third-party code running next to decrypted messages, pulled from a
    registry with a long supply-chain-incident history. This keeps that
    surface at zero. Revisit if the UI grows past what hand-written DOM
-   code handles cleanly (Phase 7's threads/reactions are the likely
+   code handles cleanly (Phase 8's threads/reactions are the likely
    trigger).
 
 ## Phase 2 implementation findings

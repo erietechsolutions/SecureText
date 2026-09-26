@@ -7,8 +7,13 @@
 | Ubuntu | 22.04 LTS and newer |
 | Fedora | Current release at time of build (tracks Fedora's own support window) |
 | Windows | Windows 10 (21H2+) and Windows 11 |
+| Android | *Planned* (roadmap Phases 10–11); minimum version decided in Phase 10 |
 
-**macOS is not an official v1 target.** Tauri's cross-platform nature means
+**Current verification (2026-09-26):** everything through Phase 5 has been
+built and verified on Fedora 44 only. Ubuntu and Windows are supported
+targets but not yet tested (roadmap.md tracks this per phase).
+
+**macOS is not an official v1 target** (nor is iOS). Tauri's cross-platform nature means
 it will likely build and largely work on macOS, but it is untested and
 unsupported until explicitly prioritized — don't spend design effort
 accommodating macOS-specific behavior in v1.
@@ -76,7 +81,7 @@ OS.
 - Both Ubuntu (22.04+) and Fedora default to **Wayland**. Tauri's Linux
   webview backend (WebKitGTK) handles Wayland and X11, but this must be
   explicitly verified rather than assumed — particularly for clipboard
-  behavior and, later, screen sharing (Phase 6), since Wayland's screen
+  behavior and, later, screen sharing (Phase 7), since Wayland's screen
   capture portals behave differently from X11's and Fedora/Ubuntu may ship
   different portal backends (e.g., GNOME's `xdg-desktop-portal-gnome` vs.
   KDE's `xdg-desktop-portal-kde`).
@@ -91,6 +96,12 @@ build each target on its native OS rather than cross-compiling installers:
 | Ubuntu | `.deb` and/or `.AppImage` |
 | Fedora | `.rpm` |
 | Windows | `.msi` (WiX) or NSIS `.exe` |
+| Android | signed `.apk` (direct install / F-Droid) and `.aab` (store upload), Phase 11 |
+
+Installers and updates ship through **GitHub Releases** (roadmap Phase 6).
+Auto-update checks and downloads must go over Tor, never the clearnet: a
+direct request to github.com would reveal that an IP runs SecureText.
+Updates are signature-verified before installing.
 
 ## CI matrix
 
@@ -121,5 +132,5 @@ pass per release, not just CI.
    (Ubuntu default), KWallet (Fedora KDE spin), a headless/no-Secret-Service
    environment, and Windows Credential Manager, before depending on it in
    Phase 1's identity storage.
-3. **Wayland screen-share portals** (Phase 6, deferred but worth flagging
+3. **Wayland screen-share portals** (Phase 7, deferred but worth flagging
    now) — GNOME vs. KDE portal differences on Fedora/Ubuntu.
