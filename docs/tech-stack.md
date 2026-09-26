@@ -346,21 +346,27 @@ rather than guessed in advance:
   file pointing at copies of them was enough to link. The binary then
   runs inside that runtime. On a normal Fedora machine, `sudo dnf install
   webkit2gtk4.1-devel` replaces all of this.
-- **Test in the real engine, not just a browser.** The first WebKitGTK
-  render collapsed the lock screen to a ~60px sliver: `width: min(420px,
-  100%)` on a child of a `place-items: center` grid resolves against an
-  indefinite size in WebKit. Chrome renders the same CSS correctly. Fixed
-  by using flex plus `max-width`. The general lesson: Tauri on Linux *is*
-  WebKitGTK, so UI checks have to run there.
-- **Headless GUI runs:** GTK's Broadway backend (`GDK_BACKEND=broadway`)
-  renders a real window into a web page, so the actual desktop binary can
-  be launched and screenshotted with no display. `TAURI_WEBVIEW_AUTOMATION=true`
-  plus `WebKitWebDriver` (both shipped in the GNOME runtime) allows full
-  WebDriver control of the real app (`desktop/e2e/gui_e2e.py`). One
-  sandbox-specific trap: GTK 4.x-era image loading goes through glycin,
-  which spawns loaders through the Flatpak portal, and that portal rejects
-  a bare runtime launched with `flatpak run <runtime>` ("Key file does not
-  have group Application"). It works only inside an app context.
+- **Correction: there was no WebKit layout bug.** The Phase 4 commit
+  reported that the lock screen "collapsed to a sliver" in WebKitGTK
+  because of `width: min(420px, 100%)` in a centered grid, and switched it
+  to flex + `max-width`. Later diagnosis inside the running WebView showed
+  `innerWidth = -115200` and `devicePixelRatio = -1/96`: GTK's Broadway
+  backend was giving WebKit a garbage scale factor, so *every* layout was
+  broken, not that one rule. Under a real (virtual) compositor the page
+  renders correctly. The CSS change is harmless and stays. The lesson:
+  confirm a rendering environment is sane (check `innerWidth`/DPR) before
+  blaming the page.
+- **Headless GUI runs that work:** KWin's virtual backend
+  (`dbus-run-session -- kwin_wayland --virtual --socket <name>`, on a
+  private D-Bus session so it can't touch the real desktop) gives the real
+  Tauri binary a genuine Wayland display with nothing on screen.
+  `TAURI_WEBVIEW_AUTOMATION=true` plus `WebKitWebDriver` (both in the GNOME
+  runtime) then allows full WebDriver control, including native clicks and
+  typing (`desktop/e2e/gui_e2e.py`). Broadway doesn't work for this (see
+  above). One sandbox-specific trap: GTK image loading goes through
+  glycin, which spawns loaders via the Flatpak portal, and the portal
+  rejects a bare `flatpak run <runtime>` ("Key file does not have group
+  Application"); it needs an app context.
 - **Single-owner state.** The node is one task owning the identity store,
   every `MlsGroup`, and the app database. UI calls are closures sent to
   that task. This rules out the worst MLS failure mode (two concurrent
@@ -396,6 +402,62 @@ rather than guessed in advance:
 - **Verify the verifier.** The relay-storage inspection test was checked by
   temporarily making the client deposit plaintext. It failed as it should
   ("relay storage contains the sender's label"), so a pass means something.
+
+## Phase 4/5 live-run findings
+
+Driving the real desktop app over live Tor (`desktop/e2e/gui_e2e.py`) found
+four bugs that every in-memory test had passed over. Each is now fixed and
+has a deterministic regression test that fails without the fix (checked by
+temporarily reverting it).
+
+1. **Data loss in the Noise pump under simultaneous traffic (Phase 1
+   code).** `SecureMux`'s pump `select!`ed between "read from the app" and
+   "read a length-prefixed frame from the network". That read takes
+   several `read` calls, and when the other branch won mid-frame, the
+   bytes already read were dropped. The stream then desynced, decryption
+   failed, and the connection died silently. In-memory pipes deliver whole
+   frames at once, so it never showed locally. Over Tor it lost messages
+   whenever both sides sent at the same moment (e.g. a reply crossing a
+   key-package top-up). Fixed by running each direction as its own loop
+   over its own half of the stream. Test:
+   `simultaneous_traffic_over_a_fragmenting_transport`, over a transport
+   that hands out 5 bytes per read. It stalled with the old pump and
+   passes in milliseconds with the new one. This is the general cancel-safety trap:
+   never put a multi-step read inside a `select!` loop that can drop it.
+2. **"Written to the socket" is not "delivered".** A peer that vanishes
+   without closing its connection leaves the Tor stream accepting writes
+   for a long time. Messages were marked sent, dropped from the outbox, and
+   lost; the relay fallback never ran because nothing looked undelivered.
+   Queued frames now carry their outbox ID and stay queued until the
+   receiving *node* acknowledges them (`WireMessage::Tracked`/`Ack`). A
+   connection with unacknowledged frames older than the dial timeout is
+   treated as dead, which triggers redial and then the relay. Acks are
+   checked against the acknowledging peer, so one contact can't clear
+   another's queue. Test: `a_peer_that_vanishes_mid_connection_still_gets_mail_via_relay`
+   (the in-memory network can now make a node vanish without closing
+   anything).
+3. **Frames can arrive out of order across connections.** Two peers often
+   end up with two connections at once over Tor (both dial), and frames
+   resent on the newer one can overtake the older one. A channel's Welcome
+   that beat its server's Welcome was rejected, and because joining
+   consumes a single-use key package, it could never succeed later. The
+   server check now happens *before* joining, and early channel Welcomes
+   are held until their server arrives. Used key packages are also recorded,
+   so a late duplicate can't be reused. Test:
+   `a_channel_welcome_that_overtakes_its_server_welcome_still_joins`.
+4. **UI: a toast covered the Send button** for its 4.5 seconds right after
+   adding a contact (found because the WebDriver click was "intercepted").
+   Toasts now sit below the header and never take clicks. Screenshots from
+   the same runs also caught the home screen's invite button staying on
+   "Waiting for Tor…" after Tor connected, and a removed member's stale
+   member list. Both fixed.
+
+Test-environment notes, so nobody repeats them: the dev machine's
+loopback interface had gone down after a KDE network toggle
+(NetworkManager doesn't bring `lo` back); the virtual KWin started its
+own lock screen unless given `--no-lockscreen`; and WebKitWebDriver
+doesn't pass the app's stderr through, so the E2E script dumps each node's
+state through the app's own API when a step fails.
 
 ## Standing rule: crypto/network-adjacent dependency vetting
 

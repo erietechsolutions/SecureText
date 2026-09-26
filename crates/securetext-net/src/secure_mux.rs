@@ -165,33 +165,57 @@ impl Drop for SecureMux {
     }
 }
 
-fn spawn_noise_pump<S>(mut raw_stream: S, mut noise: NoiseTransport) -> tokio::io::DuplexStream
+fn spawn_noise_pump<S>(raw_stream: S, noise: NoiseTransport) -> tokio::io::DuplexStream
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (app_side, mut pump_side) = tokio::io::duplex(64 * 1024);
+    let (app_side, pump_side) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
-        let mut read_buf = vec![0u8; MAX_PLAINTEXT_CHUNK];
-        loop {
-            tokio::select! {
-                n = pump_side.read(&mut read_buf) => {
-                    let n = match n {
-                        Ok(0) | Err(_) => break, // app (yamux) side closed
-                        Ok(n) => n,
-                    };
-                    let Ok(ciphertext) = noise.encrypt(&read_buf[..n]) else { break };
-                    if write_length_prefixed(&mut raw_stream, &ciphertext).await.is_err() {
-                        break;
-                    }
-                }
-                frame = read_length_prefixed(&mut raw_stream) => {
-                    let Ok(ciphertext) = frame else { break };
-                    let Ok(plaintext) = noise.decrypt(&ciphertext) else { break };
-                    if pump_side.write_all(&plaintext).await.is_err() {
-                        break;
-                    }
+        // Two independent loops, one per direction. An earlier version
+        // used one loop that `select!`ed between "read from the app" and
+        // "read a frame from the network". Reading a length-prefixed frame
+        // takes several reads, and when the other branch won the select
+        // mid-frame, the bytes already read were silently discarded. The
+        // stream then desynced and the connection died. Over an in-memory
+        // pipe whole frames arrive at once, so it never showed; over Tor,
+        // which delivers in fragments, it lost messages whenever both sides
+        // sent at once (`simultaneous_traffic_over_a_fragmenting_transport`
+        // reproduces it). Here each loop owns its half and is only ever
+        // cancelled as a whole, when the connection is ending anyway.
+        //
+        // Noise keeps separate cipher states per direction, so sharing the
+        // transport behind a lock that's never held across an await is safe.
+        let noise = std::sync::Arc::new(std::sync::Mutex::new(noise));
+        let (mut raw_read, mut raw_write) = tokio::io::split(raw_stream);
+        let (mut pump_read, mut pump_write) = tokio::io::split(pump_side);
+
+        let outbound_noise = noise.clone();
+        let outbound = async move {
+            let mut buf = vec![0u8; MAX_PLAINTEXT_CHUNK];
+            loop {
+                let n = match pump_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => break, // app (yamux) side closed
+                    Ok(n) => n,
+                };
+                let Ok(ciphertext) = outbound_noise.lock().unwrap().encrypt(&buf[..n]) else { break };
+                if write_length_prefixed(&mut raw_write, &ciphertext).await.is_err() {
+                    break;
                 }
             }
+            let _ = raw_write.shutdown().await;
+        };
+        let inbound = async move {
+            loop {
+                let Ok(ciphertext) = read_length_prefixed(&mut raw_read).await else { break };
+                let Ok(plaintext) = noise.lock().unwrap().decrypt(&ciphertext) else { break };
+                if pump_write.write_all(&plaintext).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            _ = outbound => {}
+            _ = inbound => {}
         }
     });
     app_side
@@ -275,5 +299,112 @@ mod tests {
         }
 
         server_task.await.expect("server task");
+    }
+
+    /// A transport that hands over at most a few bytes per read and makes
+    /// every other read wait, the way a real Tor stream delivers data in
+    /// fragments. An in-memory pipe delivers each whole write at once,
+    /// which hides bugs where a half-read frame gets thrown away.
+    struct Trickle<S> {
+        inner: S,
+        stall: bool,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Trickle<S> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.stall = !self.stall;
+            if self.stall {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            let mut small = [0u8; 5];
+            let limit = buf.remaining().min(small.len());
+            let mut small_buf = tokio::io::ReadBuf::new(&mut small[..limit]);
+            let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut small_buf);
+            if let std::task::Poll::Ready(Ok(())) = &result {
+                buf.put_slice(small_buf.filled());
+            }
+            result
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Trickle<S> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let n = data.len().min(5);
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, &data[..n])
+        }
+        fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Regression test for a lost-data bug seen only over live Tor: both
+    /// sides sending at once over a stream that delivers in fragments.
+    #[tokio::test]
+    async fn simultaneous_traffic_over_a_fragmenting_transport() {
+        const N: usize = 200;
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let mut a = Trickle { inner: a, stall: false };
+        let mut b = Trickle { inner: b, stall: false };
+        let keys = || {
+            snow::Builder::new(crate::noise::NOISE_PATTERN.parse().unwrap())
+                .generate_keypair()
+                .unwrap()
+        };
+        let (ka, kb) = (keys(), keys());
+        let (na, nb) = tokio::join!(
+            crate::noise::handshake_initiator(&mut a, &ka.private),
+            crate::noise::handshake_responder(&mut b, &kb.private)
+        );
+        let client = SecureMux::new(a, na.unwrap().0, yamux::Mode::Client);
+        let mut server = SecureMux::new(b, nb.unwrap().0, yamux::Mode::Server);
+
+        let client_stream = client.open().await.unwrap();
+        // yamux only announces a stream once data flows on it.
+        let (client_read, mut client_write) = tokio::io::split(client_stream);
+        client_write.write_all(b"hi").await.unwrap();
+        client_write.flush().await.unwrap();
+        let server_stream = server.accept().await.unwrap();
+        let (mut server_read, server_write) = tokio::io::split(server_stream);
+        let mut hi = [0u8; 2];
+        server_read.read_exact(&mut hi).await.unwrap();
+
+        let message = |side: &str, i: usize| format!("{side} message {i:04} with some padding to span reads\n");
+        let send = |mut w: tokio::io::WriteHalf<MuxStream>, side: &'static str| async move {
+            for i in 0..N {
+                w.write_all(message(side, i).as_bytes()).await.unwrap();
+                w.flush().await.unwrap();
+            }
+            w
+        };
+        let recv = |mut r: tokio::io::ReadHalf<MuxStream>, side: &'static str| async move {
+            let expected: String = (0..N).map(|i| message(side, i)).collect();
+            let mut got = vec![0u8; expected.len()];
+            r.read_exact(&mut got).await.expect("all bytes arrive");
+            assert_eq!(String::from_utf8(got).unwrap(), expected);
+        };
+        let run = async {
+            tokio::join!(
+                send(client_write, "client"),
+                send(server_write, "server"),
+                recv(server_read, "client"),
+                recv(client_read, "server"),
+            )
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("traffic stalled: bytes were lost in transit");
+        drop(client);
     }
 }

@@ -116,6 +116,13 @@ impl Store {
                 peer_key BLOB NOT NULL,
                 key_package BLOB NOT NULL
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS app_peer_key_packages_unique
+                ON app_peer_key_packages (key_package);
+            -- Key packages already used, so a late duplicate delivery of one
+            -- can't put it back in the pool (they're single-use).
+            CREATE TABLE IF NOT EXISTS app_used_key_packages (
+                key_package BLOB PRIMARY KEY
+            );
             CREATE TABLE IF NOT EXISTS app_outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 peer_key BLOB NOT NULL,
@@ -317,7 +324,8 @@ impl Store {
 
     pub fn add_peer_key_package(&self, peer_key: &[u8], key_package: &[u8]) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT INTO app_peer_key_packages (peer_key, key_package) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO app_peer_key_packages (peer_key, key_package)
+             SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM app_used_key_packages WHERE key_package = ?2)",
             params![peer_key, key_package],
         )?;
         Ok(())
@@ -346,6 +354,10 @@ impl Store {
         Ok(match row {
             Some((id, kp)) => {
                 self.conn.execute("DELETE FROM app_peer_key_packages WHERE id = ?1", params![id])?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO app_used_key_packages (key_package) VALUES (?1)",
+                    params![kp],
+                )?;
                 Some(kp)
             }
             None => None,
@@ -381,14 +393,21 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Delete a delivered outbox entry. Returns its `msg_ref` and how many
-    /// entries for that same message are still undelivered.
-    pub fn outbox_delivered(&self, id: i64) -> anyhow::Result<Option<(String, u32)>> {
+    /// Delete a delivered outbox entry, if it's one queued for `peer_key`
+    /// (so one peer can't acknowledge away what's queued for another).
+    /// Returns its `msg_ref` and how many entries for that same message
+    /// are still undelivered.
+    pub fn outbox_delivered(&self, id: i64, peer_key: &[u8]) -> anyhow::Result<Option<(String, u32)>> {
         let msg_ref: Option<Option<String>> = self
             .conn
-            .query_row("SELECT msg_ref FROM app_outbox WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT msg_ref FROM app_outbox WHERE id = ?1 AND peer_key = ?2",
+                params![id, peer_key],
+                |r| r.get(0),
+            )
             .optional()?;
-        self.conn.execute("DELETE FROM app_outbox WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM app_outbox WHERE id = ?1 AND peer_key = ?2", params![id, peer_key])?;
         match msg_ref.flatten() {
             Some(msg_ref) => {
                 let remaining: u32 = self.conn.query_row(

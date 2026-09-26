@@ -250,6 +250,35 @@ async fn relay_holds_nothing_readable_and_cannot_link_senders() {
     wait_for_message(&bob, &dm, "second note").await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_vanishes_mid_connection_still_gets_mail_via_relay() {
+    // Bob's machine drops off the network without closing anything. Alice's
+    // connection to him still accepts writes, so "written" must not count
+    // as delivered: without an acknowledgement, the message has to fall
+    // back to Bob's relay.
+    let dir = tempfile::tempdir().unwrap();
+    let net = MemoryNetwork::new();
+    let relay = spawn_relay(&net, dir.path());
+    let mut alice_cfg = config(dir.path(), "alice", &net);
+    alice_cfg.dial_timeout = Duration::from_secs(2);
+    let alice = NodeHandle::start(alice_cfg).await.unwrap();
+    let bob = start(dir.path(), "bob", &net).await;
+    bob.set_relay(Some(relay.link.clone())).await.unwrap();
+    let dm = befriend(&alice, &bob).await;
+    bob.send_message(dm.clone(), "still connected".into()).await.unwrap();
+    wait_for_message(&alice, &dm, "still connected").await;
+
+    net.vanish("bob.onion");
+    alice.send_message(dm.clone(), "into the void?".into()).await.unwrap();
+    wait_for_status(&alice, &dm, "into the void?", "relayed").await;
+
+    // Bob comes back (on a fresh process) and collects it.
+    bob.shutdown().await;
+    net.set_reachable("bob.onion", true);
+    let bob = start(dir.path(), "bob", &net).await;
+    wait_for_message(&bob, &dm, "into the void?").await;
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }

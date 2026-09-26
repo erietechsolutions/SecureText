@@ -29,3 +29,6 @@ desktop/gen/
 # Env files
 .env
 .env.*
+
+# Python
+__pycache__/

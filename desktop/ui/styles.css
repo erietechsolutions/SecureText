@@ -402,7 +402,7 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
 .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; color: var(--text); }
 
 /* ---------- toasts ---------- */
-.toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 20; }
+.toasts { position: fixed; right: 16px; top: 64px; display: grid; gap: 8px; z-index: 20; pointer-events: none; }
 .toast {
   max-width: 380px;
   background: var(--bg-raised); border: 1px solid var(--line); border-left: 4px solid var(--accent);

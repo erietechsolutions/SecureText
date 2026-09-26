@@ -220,7 +220,7 @@ this is a security-sensitive project where shortcuts compound.
   extensively live-verified in Phases 1-2, so this is about confirming the
   3-member case specifically, not a new transport risk.
 
-## Phase 4 — Discord-like Client UI *(feature-complete; app logic verified deterministically, real desktop binary verified launching in WebKitGTK; full GUI-driven run over live Tor pending, see exit criteria)*
+## Phase 4 — Discord-like Client UI *(feature-complete; verified end to end through the real GUI over live Tor on Linux)*
 - [x] Application core, UI-agnostic (`crates/securetext-app`): a long-running
       node per profile that owns the encrypted identity store, every MLS
       group, and an app database (peers, conversations, message history,
@@ -280,22 +280,30 @@ this is a security-sensitive project where shortcuts compound.
   - ✅ The real `securetext-desktop` binary built against WebKitGTK 4.1
     and launched headlessly (GTK Broadway backend, screenshot taken). The
     frontend loaded and its first call into Rust (`profile_info`)
-    succeeded. That run also caught a WebKit-only layout bug, now fixed.
-  - 🔲 **A full GUI-driven run of the exit criterion over live Tor.**
-    `desktop/e2e/gui_e2e.py` drives two real app windows through WebDriver
-    (WebKitWebDriver, what `tauri-driver` uses on Linux): create profiles,
-    share and accept an invite, DM, create a server, invite, chat in
-    #general, create a private channel, remove a member. Its first run was
-    blocked by the dev machine's loopback interface going down (a network
-    toggle outside this project), not by the app.
+    succeeded. (That run also appeared to show a WebKit layout bug; it was
+    later traced to the headless Broadway display reporting a broken scale
+    factor, not the app. See tech-stack.md's correction.)
+  - ✅ **Full GUI-driven run of the exit criterion over live Tor.**
+    `desktop/e2e/gui_e2e.py` drives two real `securetext-desktop` windows
+    through WebDriver (WebKitWebDriver, what `tauri-driver` uses on Linux)
+    on a headless virtual display: create both profiles, share and accept
+    an invite, DM both ways, create a server, invite, chat in #general,
+    create a private channel the friend can't see, remove the friend (who
+    is told). **PASSED in about 60 seconds**, most of it Tor bootstrap; a
+    first message on a fresh circuit took about 8–10s, later ones under 1s.
+    Getting there found and fixed four real bugs no in-memory test had
+    caught (tech-stack.md, "Phase 4/5 live-run findings"). The worst was a
+    data-loss bug in Phase 1's Noise pump under simultaneous traffic.
 - **Exit criteria:** a non-technical tester can create a server, invite a
   friend, and chat, without touching a CLI, and understands from the UI
   alone that their connection is Tor-routed. Every step of that is
-  implemented in the GUI. It's verified at the app-logic level; the
-  GUI-driven live-Tor run above and a session with an actual
-  non-technical tester are still to do.
+  implemented in the GUI and has been verified through the GUI over live
+  Tor (above). ✅ for the technical criterion. Still to do: a session with
+  an actual non-technical tester (a scripted run can't judge
+  understandability), and the cross-platform runs (Windows) required for
+  every phase.
 
-## Phase 5 — Offline Delivery *(feature-complete; verified deterministically, including relay-storage inspection; live-Tor relay run pending)*
+## Phase 5 — Offline Delivery *(feature-complete; verified deterministically and end to end over live Tor)*
 - [x] Store-and-forward relay service (`crates/securetext-relay`, binary
       `securetext-relay --dir <path>`): reachable only as its own onion
       service, stable address across restarts, prints a
@@ -338,20 +346,28 @@ this is a security-sensitive project where shortcuts compound.
   - ✅ Envelope unit tests: a blob opens only with its mailbox key and for
     its addressee, and a contact holding the mailbox key can't forge an
     envelope as someone else.
-  - 🔲 **Live-Tor run** of `securetext-relay` with two desktop clients.
-    It's the same relay code over `TorTransport` instead of the in-memory
-    network, and it's blocked on the same dev-machine loopback issue as
-    Phase 4's GUI run.
+  - ✅ **Live-Tor run** with the real `securetext-relay` binary on its own
+    onion service and two real desktop clients (the relay stage of
+    `gui_e2e.py`). Bob sets the relay in the GUI and quits. Alice's message
+    is marked "Left at Bob's relay". Alice quits. Bob reopens and collects
+    it: **the two were never online at the same time.** The live relay's
+    database file was then scanned and held none of the message text,
+    names, onion addresses or server name. One uncollected blob remained;
+    the relay can't say whose, which is the point, and it expires under
+    the TTL.
+  - ✅ A peer that vanishes *without closing its connection* (crash,
+    sleep, network loss): found live, now covered by
+    `a_peer_that_vanishes_mid_connection_still_gets_mail_via_relay`.
   - **"Never learns anyone's IP" is structural, not measured.** The relay
     has no listener except its onion service, and onion-service streams
     carry no client address, so there's nothing for it to log. No packet
     capture was taken.
 - **Exit criteria:** a message sent while the recipient is offline is
   delivered once they come online, without the relay ever holding
-  decryptable content or learning either party's real IP. ✅ Met at the
-  app level: delivery (even with both parties never online together) and
-  relay-side storage are verified directly; the IP property holds by
-  construction as noted above. The live-Tor confirmation is still to do.
+  decryptable content or learning either party's real IP. ✅ Met:
+  delivery (with both parties never online together) and relay-side
+  storage are verified directly, deterministically and over live Tor. The
+  IP property holds by construction, as noted above.
 
 ## Phase 6 — Voice & Video (the disclosed exception)
 - WebRTC integration for calls and screen share, keyed from the existing

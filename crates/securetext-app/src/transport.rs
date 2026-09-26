@@ -7,7 +7,10 @@
 //! only the bottom layer changes.
 
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -106,6 +109,9 @@ pub struct MemoryNetwork {
 struct MemoryInner {
     listeners: HashMap<String, mpsc::UnboundedSender<BoxedStream>>,
     unreachable: HashSet<String>,
+    /// Per address: once set, that address's existing connections go
+    /// silent (see [`MemoryNetwork::vanish`]).
+    vanished: HashMap<String, Arc<AtomicBool>>,
 }
 
 impl MemoryNetwork {
@@ -115,7 +121,10 @@ impl MemoryNetwork {
 
     pub fn listen(&self, address: &str) -> Listening {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.inner.lock().unwrap().listeners.insert(address.to_string(), tx);
+        let mut inner = self.inner.lock().unwrap();
+        inner.listeners.insert(address.to_string(), tx);
+        inner.vanished.insert(address.to_string(), Arc::new(AtomicBool::new(false)));
+        drop(inner);
         Listening {
             onion_address: address.to_string(),
             incoming: rx,
@@ -134,25 +143,91 @@ impl MemoryNetwork {
         }
     }
 
-    pub fn transport(&self) -> Arc<dyn Transport> {
-        Arc::new(self.clone())
+    /// Simulate `address` dropping off the network without closing
+    /// anything: its open connections stop delivering in both directions
+    /// while still accepting writes (what a crashed or suspended peer's Tor
+    /// stream looks like from the other end), and new dials fail.
+    pub fn vanish(&self, address: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.unreachable.insert(address.to_string());
+        if let Some(flag) = inner.vanished.get(address) {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A dialer for the node listening at `own_address` (relays and other
+    /// dial-only users can pass any name). Knowing both ends lets
+    /// [`Self::vanish`] silence a connection whichever side opened it.
+    pub fn transport(&self, own_address: &str) -> Arc<dyn Transport> {
+        Arc::new(MemoryDialer { network: self.clone(), own_address: own_address.to_string() })
+    }
+
+    fn flag(inner: &MemoryInner, address: &str) -> Arc<AtomicBool> {
+        inner.vanished.get(address).cloned().unwrap_or_default()
     }
 }
 
-impl Transport for MemoryNetwork {
+struct MemoryDialer {
+    network: MemoryNetwork,
+    own_address: String,
+}
+
+impl Transport for MemoryDialer {
     fn dial<'a>(&'a self, onion_address: &'a str) -> BoxFuture<'a, anyhow::Result<BoxedStream>> {
         Box::pin(async move {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.network.inner.lock().unwrap();
             anyhow::ensure!(!inner.unreachable.contains(onion_address), "{onion_address} is unreachable");
             let listener = inner
                 .listeners
                 .get(onion_address)
                 .ok_or_else(|| anyhow::anyhow!("no such address: {onion_address}"))?;
+            let flags = [MemoryNetwork::flag(&inner, onion_address), MemoryNetwork::flag(&inner, &self.own_address)];
             let (ours, theirs) = tokio::io::duplex(256 * 1024);
             listener
-                .send(Box::new(theirs))
+                .send(Box::new(Silenceable { inner: theirs, silenced: flags.clone() }))
                 .map_err(|_| anyhow::anyhow!("{onion_address} is not accepting connections"))?;
-            Ok(Box::new(ours) as BoxedStream)
+            Ok(Box::new(Silenceable { inner: ours, silenced: flags }) as BoxedStream)
         })
+    }
+}
+
+/// An in-memory stream that can be made to go silent: reads never
+/// complete and writes are discarded, without either end seeing a close.
+struct Silenceable<S> {
+    inner: S,
+    /// Silenced if either endpoint has vanished.
+    silenced: [Arc<AtomicBool>; 2],
+}
+
+impl<S> Silenceable<S> {
+    fn is_silenced(&self) -> bool {
+        self.silenced.iter().any(|f| f.load(Ordering::SeqCst))
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Silenceable<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if self.is_silenced() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Silenceable<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+        if self.is_silenced() {
+            return Poll::Ready(Ok(data.len()));
+        }
+        Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.is_silenced() {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

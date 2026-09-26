@@ -60,7 +60,7 @@
   }
   function initials(name) {
     const parts = String(name || '?').trim().split(/\s+/).filter(Boolean);
-    const letters = parts.length > 1 ? parts[0][0] + parts[1][0] : (parts[0] || '?').slice(0, 2);
+    const letters = parts.length > 1 ? parts[0][0] + parts[1][0] : (parts[0] || '?')[0];
     return letters.toUpperCase();
   }
   function avatar(name, key, online, small) {
@@ -171,6 +171,7 @@
   }
 
   async function refreshStatus() {
+    const before = state.status && state.status.network.state;
     try {
       state.status = await call('status');
     } catch (e) {
@@ -178,6 +179,8 @@
     }
     renderMe();
     renderNet();
+    // The home screen's "get my invite link" depends on Tor being ready.
+    if (before !== state.status.network.state && !state.view.convId) renderMain();
   }
 
   async function refreshConvs() {
@@ -447,13 +450,20 @@
     }
     const server = c.server_id ? conv(c.server_id) : null;
     const canKick = server && server.is_admin && !server.removed;
+    const showAdmin = c.kind !== 'dm'; // a DM's "admin" is just whoever started it
+    const scopeRemoved = c.removed || (server && server.removed);
+    if (scopeRemoved) {
+      $('#members-title').textContent = 'Members';
+      panel.innerHTML = '<div class="empty-note">You were removed, so this list is no longer kept up to date.</div>';
+      return;
+    }
     const online = state.members.filter((m) => m.online).length;
     $('#members-title').textContent = `Members — ${online}/${state.members.length} connected`;
     panel.innerHTML = state.members.map((m) => `
       <div class="member ${m.online ? '' : 'offline'}">
         ${avatar(m.label, m.key, m.online, true)}
         <div class="grow">
-          <div class="name">${esc(m.label)}${m.is_me ? ' <span class="sub">(you)</span>' : ''} ${m.is_admin ? '<span class="crown" title="Server admin">♛</span>' : ''}</div>
+          <div class="name">${esc(m.label)}${m.is_me ? ' <span class="sub">(you)</span>' : ''} ${showAdmin && m.is_admin ? '<span class="crown" title="Server admin">♛</span>' : ''}</div>
           <div class="sub" title="Identity key fingerprint">${esc(m.fingerprint)}</div>
         </div>
         ${canKick && !m.is_me ? `<button class="btn small ghost kick" data-kick="${esc(m.key)}" data-name="${esc(m.label)}" title="Remove from server">Remove</button>` : ''}

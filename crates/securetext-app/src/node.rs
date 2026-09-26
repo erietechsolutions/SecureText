@@ -69,9 +69,6 @@ pub(crate) enum NetEvent {
         peer_key: Vec<u8>,
         message: WireMessage,
     },
-    Written {
-        outbox_id: i64,
-    },
     Disconnected {
         peer_key: Vec<u8>,
         conn_id: u64,
@@ -107,6 +104,18 @@ struct Conn {
     id: u64,
     tx: mpsc::UnboundedSender<Outgoing>,
 }
+
+struct PendingWelcome {
+    from: Vec<u8>,
+    welcome: Vec<u8>,
+    info: ConversationInfo,
+    roster: Vec<SignedCard>,
+    received: Instant,
+}
+
+/// How many early channel Welcomes are held, and for how long.
+const MAX_PENDING_WELCOMES: usize = 64;
+const PENDING_WELCOME_TTL: Duration = Duration::from_secs(3600);
 
 struct Pending {
     from: Vec<u8>,
@@ -147,6 +156,14 @@ pub(crate) struct NodeState {
     dialing: HashSet<Vec<u8>>,
     backoff: HashMap<Vec<u8>, (Instant, u32)>,
     pending: HashMap<Vec<u8>, Vec<Pending>>,
+    /// Channel Welcomes that arrived before their server's Welcome. Over
+    /// Tor two peers often end up with two connections at once, and frames
+    /// resent on the newer one can overtake the older one, so ordering
+    /// across frames isn't guaranteed.
+    pending_welcomes: Vec<PendingWelcome>,
+    /// Outbox entries sent on a live connection and not yet acknowledged:
+    /// id -> (peer, when sent).
+    awaiting_ack: HashMap<i64, (Vec<u8>, Instant)>,
     last_presence: Option<Instant>,
     /// Peers whose queue is currently being deposited at their relay.
     relaying: HashSet<Vec<u8>>,
@@ -216,6 +233,8 @@ impl NodeState {
             dialing: HashSet::new(),
             backoff: HashMap::new(),
             pending: HashMap::new(),
+            pending_welcomes: Vec::new(),
+            awaiting_ack: HashMap::new(),
             last_presence: None,
             relaying: HashSet::new(),
             collecting: false,
@@ -296,12 +315,6 @@ impl NodeState {
                     eprintln!("[securetext] dropped a frame from {}: {e:#}", short(&peer_key));
                 }
             }
-            NetEvent::Written { outbox_id } => {
-                if let Ok(Some((msg_ref, 0))) = self.store.outbox_delivered(outbox_id) {
-                    self.set_message_status(&msg_ref, "sent");
-                }
-                self.dirty = true;
-            }
             NetEvent::Disconnected { peer_key, conn_id } => {
                 if self.connections.get(&peer_key).is_some_and(|c| c.id == conn_id) {
                     self.connections.remove(&peer_key);
@@ -319,7 +332,8 @@ impl NodeState {
             NetEvent::Relayed { peer_key, outbox_ids } => {
                 self.relaying.remove(&peer_key);
                 for id in outbox_ids {
-                    if let Ok(Some((msg_ref, 0))) = self.store.outbox_delivered(id) {
+                    self.awaiting_ack.remove(&id);
+                    if let Ok(Some((msg_ref, 0))) = self.store.outbox_delivered(id, &peer_key) {
                         self.set_message_status(&msg_ref, "relayed");
                     }
                 }
@@ -344,6 +358,7 @@ impl NodeState {
 
     pub(crate) fn tick(&mut self) {
         while self.tasks.try_join_next().is_some() {}
+        self.drop_silent_connections();
         if self.transport.is_some() {
             if let Ok(peers) = self.store.peers_with_outbox() {
                 for peer in peers {
@@ -359,6 +374,29 @@ impl NodeState {
             self.maybe_collect();
         }
         self.seal_if_dirty();
+    }
+
+    /// A connection whose peer hasn't acknowledged something for longer
+    /// than a dial is allowed to take is treated as dead, even if it hasn't
+    /// been closed: a peer that vanished (crash, sleep, network loss) can
+    /// leave a Tor stream open for a long time. Dropping it sends the
+    /// queued frames back through redial and, failing that, the relay.
+    fn drop_silent_connections(&mut self) {
+        let timeout = self.timing.dial_timeout;
+        let stale: HashSet<Vec<u8>> = self
+            .awaiting_ack
+            .values()
+            .filter(|(_, sent)| sent.elapsed() > timeout)
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        for peer in stale {
+            self.awaiting_ack.retain(|_, (p, _)| *p != peer);
+            if self.connections.remove(&peer).is_some() {
+                eprintln!("[securetext] {} stopped acknowledging; reconnecting", short(&peer));
+                self.emit(Event::Peer { key: to_hex(&peer), online: false });
+            }
+            self.ensure_dial(&peer);
+        }
     }
 
     // =====================================================================
@@ -715,6 +753,7 @@ impl NodeState {
         // Anything queued while they were unreachable goes out now, in order.
         if let Ok(rows) = self.store.outbox_for(&peer_key) {
             for row in rows {
+                self.awaiting_ack.insert(row.id, (peer_key.clone(), Instant::now()));
                 let _ = tx.send(Outgoing { outbox_id: Some(row.id), message: row.frame });
             }
         }
@@ -750,6 +789,26 @@ impl NodeState {
                 self.dirty = true;
                 Ok(())
             }
+            WireMessage::Tracked { id, message } => {
+                if matches!(*message, WireMessage::Tracked { .. } | WireMessage::Ack { .. }) {
+                    anyhow::bail!("nested tracking frame");
+                }
+                // Acknowledge even if processing fails: a frame we can't use
+                // now won't become usable by being resent forever.
+                let result = self.on_frame(from, *message);
+                if let Some(conn) = self.connections.get(from) {
+                    let _ = conn.tx.send(Outgoing { outbox_id: None, message: WireMessage::Ack { id } });
+                }
+                result
+            }
+            WireMessage::Ack { id } => {
+                self.awaiting_ack.remove(&id);
+                if let Some((msg_ref, 0)) = self.store.outbox_delivered(id, from)? {
+                    self.set_message_status(&msg_ref, "sent");
+                }
+                self.dirty = true;
+                Ok(())
+            }
             WireMessage::NeedKeyPackages { count } => {
                 anyhow::ensure!(self.store.peer(from)?.is_some(), "key package request from an unknown peer");
                 self.send_key_packages(from, (count as usize).min(INITIAL_KEY_PACKAGES))
@@ -764,6 +823,28 @@ impl NodeState {
         info: ConversationInfo,
         roster: Vec<SignedCard>,
     ) -> anyhow::Result<()> {
+        // A channel's Welcome can overtake its server's. Check before
+        // joining: joining consumes our single-use key package, so a
+        // Welcome rejected afterwards could never be retried.
+        if info.kind == ConversationKind::Channel {
+            let server_known = match info.server_group_id.as_deref() {
+                Some(id) => self.store.conversation(id)?.is_some(),
+                None => anyhow::bail!("channel without a server"),
+            };
+            if !server_known {
+                self.pending_welcomes.retain(|p| p.received.elapsed() < PENDING_WELCOME_TTL);
+                if self.pending_welcomes.len() < MAX_PENDING_WELCOMES {
+                    self.pending_welcomes.push(PendingWelcome {
+                        from: from.to_vec(),
+                        welcome: welcome.to_vec(),
+                        info,
+                        roster,
+                        received: Instant::now(),
+                    });
+                }
+                return Ok(());
+            }
+        }
         let group = self.member.join_from_welcome(welcome)?;
         let gid = group.group_id().as_slice().to_vec();
         if self.store.conversation(&gid)?.is_some() {
@@ -827,8 +908,23 @@ impl NodeState {
         self.send_key_packages(from, count)?;
 
         self.retry_pending(&gid);
+        if info.kind == ConversationKind::Server {
+            self.retry_pending_welcomes(&gid);
+        }
         self.emit(Event::ConversationsChanged);
         Ok(())
+    }
+
+    fn retry_pending_welcomes(&mut self, server_gid: &[u8]) {
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_welcomes)
+            .into_iter()
+            .partition(|p| p.info.server_group_id.as_deref() == Some(server_gid));
+        self.pending_welcomes = waiting;
+        for p in ready {
+            if let Err(e) = self.on_welcome(&p.from, &p.welcome, p.info, p.roster) {
+                eprintln!("[securetext] dropped a held channel invitation: {e:#}");
+            }
+        }
     }
 
     fn remember_card(&mut self, card: &SignedCard, is_contact: bool) -> anyhow::Result<()> {
@@ -939,6 +1035,7 @@ impl NodeState {
         self.dirty = true;
         match self.connections.get(peer_key) {
             Some(conn) => {
+                self.awaiting_ack.insert(id, (peer_key.to_vec(), Instant::now()));
                 if conn.tx.send(Outgoing { outbox_id: Some(id), message: frame }).is_err() {
                     self.connections.remove(peer_key);
                     self.ensure_dial(peer_key);
@@ -1507,11 +1604,12 @@ async fn run_connection(
             _ = &mut read_task => break,
             outgoing = rx.recv() => {
                 let Some(outgoing) = outgoing else { break };
-                if wire::write_frame(&mut writer, &outgoing.message).await.is_err() {
+                let frame = match outgoing.outbox_id {
+                    Some(id) => WireMessage::Tracked { id, message: Box::new(outgoing.message) },
+                    None => outgoing.message,
+                };
+                if wire::write_frame(&mut writer, &frame).await.is_err() {
                     break;
-                }
-                if let Some(outbox_id) = outgoing.outbox_id {
-                    let _ = net_tx.send(NetEvent::Written { outbox_id });
                 }
             }
         }
@@ -1561,4 +1659,77 @@ fn validate_name(name: &str) -> anyhow::Result<String> {
 
 fn clamp_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A node with no network, whose outgoing frames we carry by hand.
+    fn offline_node(dir: &std::path::Path, name: &str) -> NodeState {
+        let (identity, public) =
+            IdentityStore::create(&dir.join(format!("{name}.enc")), name, "passphrase").unwrap();
+        let (events, _) = broadcast::channel(64);
+        let (net_tx, _net_rx) = mpsc::unbounded_channel();
+        let timing = Timing {
+            retry_interval: Duration::from_secs(60),
+            dial_timeout: Duration::from_secs(1),
+            presence_interval: Duration::from_secs(3600),
+            relay_poll_interval: Duration::from_secs(3600),
+        };
+        let mut node = NodeState::new(Opened { identity, public }, events, net_tx, timing).unwrap();
+        node.my_onion = Some(format!("{name}.onion"));
+        node.refresh_my_card().unwrap();
+        node
+    }
+
+    /// Everything `from` has queued for `to`, removed from its outbox.
+    fn take_frames(from: &mut NodeState, to: &NodeState) -> Vec<WireMessage> {
+        let rows = from.store.outbox_for(to.my_key()).unwrap();
+        for row in &rows {
+            from.store.outbox_delivered(row.id, to.my_key()).unwrap();
+        }
+        rows.into_iter().map(|r| r.frame).collect()
+    }
+
+    fn deliver(from: &NodeState, to: &mut NodeState, frames: Vec<WireMessage>) {
+        let key = from.my_key().to_vec();
+        for frame in frames {
+            to.on_frame(&key, frame).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_channel_welcome_that_overtakes_its_server_welcome_still_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut alice = offline_node(dir.path(), "alice");
+        let mut bob = offline_node(dir.path(), "bob");
+
+        // Become contacts (Bob accepts Alice's invite), shuttling frames.
+        let invite = alice.create_invite().unwrap();
+        bob.add_contact(&invite).unwrap();
+        let frames = take_frames(&mut bob, &alice);
+        deliver(&bob, &mut alice, frames);
+        let frames = take_frames(&mut alice, &bob);
+        deliver(&alice, &mut bob, frames);
+
+        let server = alice.create_server("Club").unwrap();
+        alice.invite_to_server(&server, &to_hex(bob.my_key())).unwrap();
+        let mut frames = take_frames(&mut alice, &bob);
+        let welcomes: Vec<usize> = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| matches!(f, WireMessage::Welcome { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(welcomes.len(), 2, "server + #general");
+        // Deliver them in the wrong order: channel first.
+        frames.swap(welcomes[0], welcomes[1]);
+        deliver(&alice, &mut bob, frames);
+
+        let kinds: Vec<ConversationKind> = bob.conversations().unwrap().iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&ConversationKind::Server));
+        assert!(kinds.contains(&ConversationKind::Channel), "the early channel Welcome was lost: {kinds:?}");
+        assert!(bob.pending_welcomes.is_empty());
+    }
 }

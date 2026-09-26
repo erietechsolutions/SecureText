@@ -218,7 +218,7 @@ impl NodeHandle {
         match config.network {
             NetworkConfig::Memory { network, address } => {
                 let listening = network.listen(&address);
-                state.handle_net(NetEvent::TransportReady { transport: network.transport(), listening });
+                state.handle_net(NetEvent::TransportReady { transport: network.transport(&address), listening });
             }
             NetworkConfig::Tor { bridge } => {
                 let _ = events.send(Event::Network { state: NetworkState::Bootstrapping });

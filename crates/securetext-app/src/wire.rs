@@ -160,6 +160,14 @@ pub enum WireMessage {
     },
     /// Ask the peer for more key packages; their pool with us ran low.
     NeedKeyPackages { count: u32 },
+    /// A queued frame, tagged with the sender's outbox ID. The receiver
+    /// processes `message` and answers with `Ack { id }`; only then does
+    /// the sender drop it from its outbox. A successful socket write
+    /// proves nothing (a peer that vanished without closing the
+    /// connection still "accepts" writes for a while), so delivery is
+    /// confirmed end to end instead.
+    Tracked { id: i64, message: Box<WireMessage> },
+    Ack { id: i64 },
 }
 
 /// The plaintext inside an MLS application message.
