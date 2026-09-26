@@ -32,4 +32,19 @@ written yet — see [docs/roadmap.md](docs/roadmap.md) for the full phase plan.
 
 Ubuntu (22.04+), Fedora (current release), Windows 10 (21H2+), and Windows
 11. See [docs/platform-support.md](docs/platform-support.md) for details.
-macOS is not an official v1 target.
+macOS is not currently an officially supported OS.
+
+Tested and Supported:
+Ubuntu 22.04+
+Fedora 44 or Newer
+
+Untested but Supported:
+
+Windows 10
+Windows 11
+
+Not Officially Supported or Tested:
+
+macOS
+
+
