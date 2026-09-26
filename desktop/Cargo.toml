@@ -1,0 +1,25 @@
+# The desktop shell is its own workspace so the core crates can be built
+# and tested (`cargo test --workspace` at the repo root) on machines
+# without WebKitGTK/Tauri's system dependencies.
+[workspace]
+
+[package]
+name = "securetext-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "securetext-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+securetext-app = { path = "../crates/securetext-app" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }

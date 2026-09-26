@@ -10,14 +10,38 @@ sender and the intended recipient(s) via end-to-end encryption (MLS,
 RFC 9420). Voice/video calls are the one explicit, disclosed exception to
 the anonymity guarantee — see [docs/threat-model.md](docs/threat-model.md).
 
-This repository currently holds **Phase 0** deliverables only: the threat
-model, cryptographic design, network architecture, and technology stack
-decisions that every later phase builds on. No application code has been
-written yet — see [docs/roadmap.md](docs/roadmap.md) for the full phase plan.
-
 ## Status
 
-**Phase 0 — Spec & Threat Model** (in progress)
+Phases 0–3 (design, 1:1 messaging over Tor, invite links, groups and
+channels) are implemented in the Rust crates under `crates/`. Phase 4, the
+desktop client, is in `desktop/` on top of the `securetext-app` core. See
+[docs/roadmap.md](docs/roadmap.md) for exactly what's verified and what's
+still pending for each phase. **This is pre-audit software (Phase 8 hasn't
+happened). Don't rely on it for anything that matters yet.**
+
+## Layout
+
+- `crates/securetext-identity`: encrypted-at-rest identity store
+- `crates/securetext-crypto`: MLS (OpenMLS) groups, capabilities
+- `crates/securetext-net`: Tor onion services (arti), Noise_XX, yamux
+- `crates/securetext-invite`: invite links
+- `crates/securetext-app`: the application core (node, storage, peer protocol)
+- `crates/securetext-cli`: proof-of-integration CLI and live-Tor demos
+- `desktop/`: Tauri desktop client (own Cargo workspace) and its web UI
+
+## Building
+
+```sh
+cargo test --workspace            # core crates; no system GUI deps needed
+
+# Desktop client: needs Tauri's Linux prerequisites
+# (Fedora: sudo dnf install webkit2gtk4.1-devel libsoup3-devel gtk3-devel)
+cd desktop && cargo run
+```
+
+The desktop app keeps its profile under the platform app-data directory.
+Set `SECURETEXT_PROFILE_DIR` to use a different one (e.g. to run two
+profiles side by side).
 
 ## Documents
 

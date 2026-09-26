@@ -28,6 +28,33 @@ pub use capability::{Capability, Permission};
 pub const CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519;
 
+/// How many past epochs' message secrets a group keeps. Zero (OpenMLS's
+/// default) is only safe if every application message is delivered in the
+/// epoch it was sent in. Once a group has more than two members, and
+/// especially once Phase 5's relay adds a second delivery path, a chat
+/// message sent just before a membership change can arrive just after it.
+/// Without this, the message fails to decrypt even for a legitimate
+/// member. Kept deliberately small: every retained epoch is a window where
+/// a compromised device could still read that epoch's messages, a real
+/// (bounded) cost to forward secrecy.
+pub const MAX_PAST_EPOCHS: usize = 3;
+
+/// The result of processing one incoming MLS wire message with
+/// [`Member::process`].
+#[derive(Debug)]
+pub enum Incoming {
+    /// An application message, with the sender's MLS identity public key
+    /// (the same stable handle as `Member::public_key`). MLS itself has
+    /// already authenticated that this key sent it.
+    Application { sender_public_key: Vec<u8>, plaintext: Vec<u8> },
+    /// A commit was applied. `removed_self` is true if it removed this
+    /// member from the group: the group is now inactive and later messages
+    /// in it are unreadable to us.
+    Commit { removed_self: bool },
+    /// A standalone proposal or another non-content message.
+    Other,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum CryptoError {
     #[error("openmls error: {0}")]
@@ -95,6 +122,7 @@ impl<P: OpenMlsProvider> Member<P> {
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
             .use_ratchet_tree_extension(true)
+            .max_past_epochs(MAX_PAST_EPOCHS)
             .build();
         MlsGroup::new(
             &self.provider,
@@ -155,18 +183,32 @@ impl<P: OpenMlsProvider> Member<P> {
         group: &mut MlsGroup,
         their_key_package_bytes: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-        let key_package_in = KeyPackageIn::tls_deserialize_exact(their_key_package_bytes)
-            .map_err(|e| CryptoError::TlsCodec(format!("{e:?}")))?;
-        let key_package = key_package_in
-            .validate(self.provider.crypto(), ProtocolVersion::Mls10)
-            .map_err(|e| CryptoError::Mls(format!("invalid key package: {e:?}")))?;
+        self.add_members(group, &[their_key_package_bytes])
+    }
+
+    /// Add several members in a single commit. Same return value and
+    /// fan-out rules as [`Self::add_member`]; the one Welcome carries the
+    /// secrets for every new member, so each of them gets the same bytes.
+    /// Adding people one commit at a time would instead put each earlier
+    /// joiner behind by one commit per later joiner, and they'd have to
+    /// receive those commits in order before they could read anything.
+    pub fn add_members(
+        &self,
+        group: &mut MlsGroup,
+        key_packages: &[&[u8]],
+    ) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+        let mut validated = Vec::with_capacity(key_packages.len());
+        for bytes in key_packages {
+            let key_package_in = KeyPackageIn::tls_deserialize_exact(*bytes)
+                .map_err(|e| CryptoError::TlsCodec(format!("{e:?}")))?;
+            let key_package = key_package_in
+                .validate(self.provider.crypto(), ProtocolVersion::Mls10)
+                .map_err(|e| CryptoError::Mls(format!("invalid key package: {e:?}")))?;
+            validated.push(key_package);
+        }
 
         let (commit, welcome, _group_info) = group
-            .add_members(
-                &self.provider,
-                &self.signer,
-                core::slice::from_ref(&key_package),
-            )
+            .add_members(&self.provider, &self.signer, &validated)
             .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
 
         group
@@ -223,6 +265,7 @@ impl<P: OpenMlsProvider> Member<P> {
 
         let join_config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
+            .max_past_epochs(MAX_PAST_EPOCHS)
             .build();
         let staged_join = StagedWelcome::new_from_welcome(&self.provider, &join_config, welcome, None)
             .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
@@ -245,12 +288,24 @@ impl<P: OpenMlsProvider> Member<P> {
     /// Process an incoming wire message for `group`. Returns the plaintext
     /// for an application message, or `None` if the message was a commit
     /// (membership change) or proposal that was applied/stored but carries
-    /// no user-visible content.
+    /// no user-visible content. See [`Self::process`] for the variant that
+    /// also reports who sent it.
     pub fn decrypt(
         &self,
         group: &mut MlsGroup,
         bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, CryptoError> {
+        match self.process(group, bytes)? {
+            Incoming::Application { plaintext, .. } => Ok(Some(plaintext)),
+            Incoming::Commit { .. } | Incoming::Other => Ok(None),
+        }
+    }
+
+    /// Like [`Self::decrypt`], but also reports the authenticated sender of
+    /// an application message and whether a commit removed us. A chat
+    /// client needs both: the sender to label the message, and the removal
+    /// flag to stop treating a group we were kicked from as usable.
+    pub fn process(&self, group: &mut MlsGroup, bytes: &[u8]) -> Result<Incoming, CryptoError> {
         let mls_message = MlsMessageIn::tls_deserialize_exact(bytes)
             .map_err(|e| CryptoError::TlsCodec(format!("{e:?}")))?;
         let protocol_message: ProtocolMessage = mls_message
@@ -260,23 +315,38 @@ impl<P: OpenMlsProvider> Member<P> {
             .process_message(&self.provider, protocol_message)
             .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
 
+        // Resolve the sender before a commit is merged: the merge can
+        // change (or remove) the leaf this index points to.
+        let sender_public_key = match processed.sender() {
+            Sender::Member(leaf_index) => group
+                .member_at(*leaf_index)
+                .map(|member| member.signature_key),
+            _ => None,
+        };
+
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                Ok(Some(app_msg.into_bytes()))
+                let sender_public_key = sender_public_key
+                    .ok_or_else(|| CryptoError::Mls("application message from a non-member sender".into()))?;
+                Ok(Incoming::Application {
+                    sender_public_key,
+                    plaintext: app_msg.into_bytes(),
+                })
             }
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                let removed_self = staged_commit.self_removed();
                 group
                     .merge_staged_commit(&self.provider, *staged_commit)
                     .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
-                Ok(None)
+                Ok(Incoming::Commit { removed_self })
             }
             // Standalone proposals, and the "own message echoed back"
             // variants (OwnPendingCommit/OwnPrivateMessage) that OpenMLS
-            // surfaces for out-of-order-delivery edge cases: v1 doesn't yet
-            // build a proposal-review UI or handle non-order-preserving
-            // delivery. Tracked as a gap, not silently dropped — surfacing
-            // proposals properly is a Phase 3 (multi-member groups) task.
-            _ => Ok(None),
+            // surfaces for out-of-order-delivery edge cases. SecureText
+            // never sends standalone proposals (every membership change is
+            // a full commit from the group's admin), so there is nothing
+            // to review here yet.
+            _ => Ok(Incoming::Other),
         }
     }
 }

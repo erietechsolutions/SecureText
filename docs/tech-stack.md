@@ -246,8 +246,16 @@ rather than guessed in advance:
    demo`, which now opens two multiplexed streams (a "control" stream for
    the MLS Welcome, a "chat" stream for application messages) over one
    onion-service connection.
-7. **Frontend framework for Tauri** (React vs. Svelte vs. other) — deferred
-   to Phase 4, not blocking.
+7. **Frontend framework for Tauri** (React vs. Svelte vs. other).
+   **Resolved in Phase 4: neither.** The UI is plain HTML/CSS/JS with no
+   framework, no npm dependencies and no build step (`desktop/ui/`). The
+   screens here (lists, a message view, a few dialogs) don't need a
+   framework, and every npm package in a privacy tool's frontend is
+   third-party code running next to decrypted messages, pulled from a
+   registry with a long supply-chain-incident history. This keeps that
+   surface at zero. Revisit if the UI grows past what hand-written DOM
+   code handles cleanly (Phase 7's threads/reactions are the likely
+   trigger).
 
 ## Phase 2 implementation findings
 
@@ -327,6 +335,44 @@ rather than guessed in advance:
   assumptions don't automatically generalize to a structurally similar but
   not-identical code path in the same function -- each dial-after-launch
   needs its own verified delay, not just the first one.
+
+## Phase 4 implementation findings
+
+- **Tauri builds and runs against real WebKitGTK here without root.** This
+  dev sandbox has no `webkit2gtk4.1-devel`, but the installed
+  `org.gnome.Platform//50` Flatpak runtime ships `libwebkit2gtk-4.1` and
+  `libjavascriptcoregtk-4.1`. The webkit2gtk Rust bindings need only the
+  shared libraries at link time (no C headers), so a two-line pkg-config
+  file pointing at copies of them was enough to link. The binary then
+  runs inside that runtime. On a normal Fedora machine, `sudo dnf install
+  webkit2gtk4.1-devel` replaces all of this.
+- **Test in the real engine, not just a browser.** The first WebKitGTK
+  render collapsed the lock screen to a ~60px sliver: `width: min(420px,
+  100%)` on a child of a `place-items: center` grid resolves against an
+  indefinite size in WebKit. Chrome renders the same CSS correctly. Fixed
+  by using flex plus `max-width`. The general lesson: Tauri on Linux *is*
+  WebKitGTK, so UI checks have to run there.
+- **Headless GUI runs:** GTK's Broadway backend (`GDK_BACKEND=broadway`)
+  renders a real window into a web page, so the actual desktop binary can
+  be launched and screenshotted with no display. `TAURI_WEBVIEW_AUTOMATION=true`
+  plus `WebKitWebDriver` (both shipped in the GNOME runtime) allows full
+  WebDriver control of the real app (`desktop/e2e/gui_e2e.py`). One
+  sandbox-specific trap: GTK 4.x-era image loading goes through glycin,
+  which spawns loaders through the Flatpak portal, and that portal rejects
+  a bare runtime launched with `flatpak run <runtime>` ("Key file does not
+  have group Application"). It works only inside an app context.
+- **Single-owner state.** The node is one task owning the identity store,
+  every `MlsGroup`, and the app database. UI calls are closures sent to
+  that task. This rules out the worst MLS failure mode (two concurrent
+  commits forking a group) by construction rather than by locking
+  discipline, and the SQLite connections never cross threads.
+- **Key packages are single-use (RFC 9420 §10), and the app has to plan
+  for it.** An invite's key package is consumed by the DM it creates, so
+  adding the same contact to a server and its channels later needs more.
+  Peers now hand each other a small pool when a relationship starts and
+  top it up whenever a Welcome consumes one. If the pool runs dry, the
+  admin's client asks for more and tells the user to retry once the
+  contact has been online. This isn't a hard failure.
 
 ## Standing rule: crypto/network-adjacent dependency vetting
 

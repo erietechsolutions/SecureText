@@ -5,6 +5,7 @@ members = [
     "crates/securetext-crypto",
     "crates/securetext-net",
     "crates/securetext-invite",
+    "crates/securetext-app",
     "crates/securetext-cli",
 ]
 

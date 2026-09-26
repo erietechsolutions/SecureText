@@ -220,15 +220,80 @@ this is a security-sensitive project where shortcuts compound.
   extensively live-verified in Phases 1-2, so this is about confirming the
   3-member case specifically, not a new transport risk.
 
-## Phase 4 — Discord-like Client UI
-- Server list, channel list, DM list, message view, member/role list
-- Built on top of the Phase 1–3 backend via Tauri
-- Onion-connection status and Tor circuit health surfaced in the UI (so
-  users understand why a first message to a new contact takes longer —
-  architecture.md §6)
+## Phase 4 — Discord-like Client UI *(feature-complete; app logic verified deterministically, real desktop binary verified launching in WebKitGTK; full GUI-driven run over live Tor pending, see exit criteria)*
+- [x] Application core, UI-agnostic (`crates/securetext-app`): a long-running
+      node per profile that owns the encrypted identity store, every MLS
+      group, and an app database (peers, conversations, message history,
+      other peers' key packages, outgoing queue) in the same
+      envelope-encrypted SQLite file. One task owns all of it, so MLS group
+      state is never mutated concurrently. Network I/O runs in
+      per-connection tasks: onion service, then Noise_XX with key pinning,
+      then yamux, then a small framed peer protocol (`wire.rs`).
+- [x] Contacts and DMs from invite links. A DM is a 2-member MLS group, as
+      before. Accepting an invite now also exchanges **signed contact
+      cards** (label + onion address + Noise key, signed by the MLS
+      identity key) and a pool of single-use key packages, which is what
+      lets either side later add the other to a server without both being
+      online at once.
+- [x] Servers and channels on the Phase 3 primitives. Server = MLS group;
+      each channel = its own MLS group; private channels include only the
+      members picked. Joining a server delivers everyone's signed cards,
+      and existing members get the newcomer's card inside the server
+      group, so **members who never exchanged invites can still reach each
+      other directly** (there's no server to relay through). The admin
+      (the creator, architecture.md §7) invites, creates channels and
+      removes members; removal re-keys the server and every channel the
+      member was in. Whole-roster adds use a single commit
+      (`Member::add_members`).
+- [x] Offline behaviour for Phases 1–4 (architecture.md §4): every
+      outgoing frame is persisted in the encrypted outbox before sending,
+      retried with backoff, and flushed in order when the peer is next
+      reachable. It survives restarts of either side. Messages that arrive
+      ahead of the commit they depend on are held and retried, and groups
+      keep `MAX_PAST_EPOCHS = 3` epochs of secrets so a message sent just
+      before a membership change still decrypts (a small, deliberate
+      forward-secrecy cost, documented at the constant).
+- [x] Tauri desktop shell (`desktop/`, its own Cargo workspace so the core
+      still builds and tests on machines without WebKitGTK) plus a
+      framework-free HTML/CSS/JS frontend (`desktop/ui/`). It has a server
+      rail, channel/DM sidebar, message view, member list with
+      online/admin/remove, and dialogs for invites, contacts, servers,
+      private channels and removal. The frontend loads nothing remote
+      (strict CSP), because any request outside Tor would leak the user's
+      IP.
+- [x] Tor status in the UI: a persistent "Tor · onion-routed" indicator
+      with a plain-language explainer (E2EE, Tor-only routing with no
+      direct fallback, why the first message to someone can take up to a
+      minute), a banner while Tor is bootstrapping or unavailable, and
+      "Queued — sends automatically when … is reachable over Tor" on
+      undelivered messages.
+- **Verification:**
+  - ✅ `crates/securetext-app/tests/app_flows.rs`: three real nodes (real
+    encrypted profiles, MLS, Noise with key pinning, yamux, outbox) on an
+    in-memory network standing in for Tor. Covers invite-to-DM both ways;
+    a server where two members who never exchanged invites chat through
+    the roster; a private channel the third member provably doesn't get;
+    admin-only enforcement; removal (the removed member is told and stops
+    receiving); offline queueing that survives restarts of both sides; a
+    wrong passphrase; and an impostor holding a contact's onion address
+    being refused by the Noise key check. Passed 5/5 repeated runs.
+  - ✅ The real `securetext-desktop` binary built against WebKitGTK 4.1
+    and launched headlessly (GTK Broadway backend, screenshot taken). The
+    frontend loaded and its first call into Rust (`profile_info`)
+    succeeded. That run also caught a WebKit-only layout bug, now fixed.
+  - 🔲 **A full GUI-driven run of the exit criterion over live Tor.**
+    `desktop/e2e/gui_e2e.py` drives two real app windows through WebDriver
+    (WebKitWebDriver, what `tauri-driver` uses on Linux): create profiles,
+    share and accept an invite, DM, create a server, invite, chat in
+    #general, create a private channel, remove a member. Its first run was
+    blocked by the dev machine's loopback interface going down (a network
+    toggle outside this project), not by the app.
 - **Exit criteria:** a non-technical tester can create a server, invite a
   friend, and chat, without touching a CLI, and understands from the UI
-  alone that their connection is Tor-routed.
+  alone that their connection is Tor-routed. Every step of that is
+  implemented in the GUI. It's verified at the app-logic level; the
+  GUI-driven live-Tor run above and a session with an actual
+  non-technical tester are still to do.
 
 ## Phase 5 — Offline Delivery
 - Store-and-forward relay service (self-hosted and/or volunteer-run),

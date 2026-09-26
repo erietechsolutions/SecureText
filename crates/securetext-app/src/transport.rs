@@ -1,0 +1,158 @@
+//! Where raw byte streams come from. The node only needs two things from a
+//! network: "dial this onion address" and "here are incoming connections".
+//! Hiding them behind [`Transport`] lets the whole application (MLS,
+//! Noise, yamux, the peer protocol, the offline queue) run over an
+//! in-memory network in tests, with Tor swapped in for real use. The
+//! Noise handshake and everything above it runs identically either way;
+//! only the bottom layer changes.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+use futures::future::BoxFuture;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
+
+/// The single logical port SecureText's peer protocol listens on.
+pub const PEER_PORT: u16 = 1;
+
+pub trait RawStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> RawStream for T {}
+
+pub type BoxedStream = Box<dyn RawStream>;
+
+pub trait Transport: Send + Sync + 'static {
+    fn dial<'a>(&'a self, onion_address: &'a str) -> BoxFuture<'a, anyhow::Result<BoxedStream>>;
+}
+
+/// A bound listener: our own address plus the stream of incoming
+/// connections to it. `_guard` keeps whatever resources back the listener
+/// (the running onion service, or an in-memory registration) alive for as
+/// long as the node holds this.
+pub struct Listening {
+    pub onion_address: String,
+    pub incoming: mpsc::UnboundedReceiver<BoxedStream>,
+    pub _guard: Box<dyn Send + Sync>,
+}
+
+/// Real transport: arti. Every connection is to or from a v3 onion
+/// service; there is no code path here that can open a clearnet socket
+/// (threat-model.md's mandatory-anonymity requirement).
+pub struct TorTransport {
+    client: securetext_net::Client,
+}
+
+impl TorTransport {
+    pub fn new(client: securetext_net::Client) -> Self {
+        Self { client }
+    }
+
+    /// Launch this identity's onion service and forward accepted streams.
+    /// The service key lives in arti's keystore under the client's state
+    /// directory, so with a persistent state directory the address stays
+    /// the same across restarts (what keeps old invite links working).
+    pub fn listen(&self, nickname: &str) -> anyhow::Result<Listening> {
+        let mut listener = securetext_net::Listener::launch(&self.client, nickname)?;
+        let onion_address = listener.onion_address()?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let accept_task = tokio::spawn(async move {
+            loop {
+                match listener.accept_next().await {
+                    Ok(Some(stream)) => {
+                        if tx.send(Box::new(stream) as BoxedStream).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    // One failed rendezvous shouldn't take the service down.
+                    Err(e) => eprintln!("[securetext] incoming connection failed: {e}"),
+                }
+            }
+        });
+        Ok(Listening {
+            onion_address,
+            incoming: rx,
+            _guard: Box::new(AbortOnDrop(accept_task)),
+        })
+    }
+}
+
+impl Transport for TorTransport {
+    fn dial<'a>(&'a self, onion_address: &'a str) -> BoxFuture<'a, anyhow::Result<BoxedStream>> {
+        Box::pin(async move {
+            let stream = securetext_net::dial(&self.client, onion_address, PEER_PORT).await?;
+            Ok(Box::new(stream) as BoxedStream)
+        })
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// An in-process stand-in for the Tor network, for tests: named
+/// "addresses" backed by in-memory pipes. Nodes can be taken offline to
+/// exercise the offline-delivery paths.
+#[derive(Clone, Default)]
+pub struct MemoryNetwork {
+    inner: Arc<Mutex<MemoryInner>>,
+}
+
+#[derive(Default)]
+struct MemoryInner {
+    listeners: HashMap<String, mpsc::UnboundedSender<BoxedStream>>,
+    unreachable: HashSet<String>,
+}
+
+impl MemoryNetwork {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn listen(&self, address: &str) -> Listening {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.lock().unwrap().listeners.insert(address.to_string(), tx);
+        Listening {
+            onion_address: address.to_string(),
+            incoming: rx,
+            _guard: Box::new(()),
+        }
+    }
+
+    /// Make `address` refuse new connections (existing ones are
+    /// unaffected; shut the node down to drop those).
+    pub fn set_reachable(&self, address: &str, reachable: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        if reachable {
+            inner.unreachable.remove(address);
+        } else {
+            inner.unreachable.insert(address.to_string());
+        }
+    }
+
+    pub fn transport(&self) -> Arc<dyn Transport> {
+        Arc::new(self.clone())
+    }
+}
+
+impl Transport for MemoryNetwork {
+    fn dial<'a>(&'a self, onion_address: &'a str) -> BoxFuture<'a, anyhow::Result<BoxedStream>> {
+        Box::pin(async move {
+            let inner = self.inner.lock().unwrap();
+            anyhow::ensure!(!inner.unreachable.contains(onion_address), "{onion_address} is unreachable");
+            let listener = inner
+                .listeners
+                .get(onion_address)
+                .ok_or_else(|| anyhow::anyhow!("no such address: {onion_address}"))?;
+            let (ours, theirs) = tokio::io::duplex(256 * 1024);
+            listener
+                .send(Box::new(theirs))
+                .map_err(|_| anyhow::anyhow!("{onion_address} is not accepting connections"))?;
+            Ok(Box::new(ours) as BoxedStream)
+        })
+    }
+}

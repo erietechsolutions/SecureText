@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Nothing remote, ever: any request leaving this page outside Tor
+       would expose the user's IP, which the whole design exists to hide. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>SecureText</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Unlock / create-profile screen -->
+  <section id="lock" class="lock" hidden>
+    <div class="lock-card">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <h1>SecureText</h1>
+      </div>
+      <p class="lock-sub" id="lock-sub">Private, end-to-end encrypted chat that only ever travels over Tor.</p>
+
+      <form id="unlock-form" class="stack" hidden>
+        <label>Passphrase
+          <input id="unlock-pass" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="btn primary" type="submit">Unlock</button>
+      </form>
+
+      <form id="create-form" class="stack" hidden>
+        <label>Display name
+          <input id="create-name" maxlength="64" autocomplete="off" required placeholder="What should people see?">
+        </label>
+        <label>Passphrase
+          <input id="create-pass" type="password" autocomplete="new-password" minlength="8" required>
+        </label>
+        <label>Confirm passphrase
+          <input id="create-pass2" type="password" autocomplete="new-password" minlength="8" required>
+        </label>
+        <p class="fineprint">Your profile lives only on this device, encrypted with this passphrase.
+          There's no account and no recovery: if you forget it, nobody can open the profile, including us.</p>
+        <button class="btn primary" type="submit">Create profile</button>
+      </form>
+
+      <p id="lock-error" class="form-error" role="alert"></p>
+      <p id="lock-busy" class="lock-busy" hidden>Opening your encrypted profile…</p>
+    </div>
+  </section>
+
+  <!-- Main app -->
+  <div id="app" class="app" hidden>
+    <nav class="rail" aria-label="Servers">
+      <button class="rail-btn home" id="rail-home" title="Direct messages" aria-label="Direct messages">
+        <span class="rail-glyph" aria-hidden="true">✉</span>
+      </button>
+      <div class="rail-sep"></div>
+      <div id="rail-servers" class="rail-servers"></div>
+      <button class="rail-btn add" id="rail-add" title="Create a server" aria-label="Create a server">+</button>
+    </nav>
+
+    <aside class="sidebar">
+      <header class="sidebar-head" id="sidebar-head"></header>
+      <div class="sidebar-body" id="sidebar-body"></div>
+      <footer class="me">
+        <div class="avatar" id="me-avatar"></div>
+        <div class="me-text">
+          <div class="me-name" id="me-name"></div>
+          <div class="me-fp" id="me-fp" title="Your identity key fingerprint"></div>
+        </div>
+      </footer>
+    </aside>
+
+    <main class="main">
+      <header class="main-head">
+        <div class="main-title" id="main-title"></div>
+        <button class="net-pill" id="net-pill" type="button" aria-haspopup="dialog"></button>
+      </header>
+      <div id="net-banner" class="net-banner" hidden></div>
+      <div class="messages" id="messages" aria-live="polite"></div>
+      <form class="composer" id="composer" hidden>
+        <textarea id="composer-input" rows="1" maxlength="4000" placeholder="Message" aria-label="Message"></textarea>
+        <button class="btn primary" type="submit">Send</button>
+      </form>
+      <div class="composer-note" id="composer-note" hidden></div>
+    </main>
+
+    <aside class="members" id="members-panel" aria-label="Members">
+      <h2 class="panel-title" id="members-title">Members</h2>
+      <div id="members"></div>
+    </aside>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toasts" class="toasts" aria-live="assertive"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

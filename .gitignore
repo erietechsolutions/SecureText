@@ -9,6 +9,7 @@ build/
 
 # Tauri
 src-tauri/target/
+desktop/gen/
 
 # Local secrets / keys — never commit identity material
 *.pem
