@@ -10,6 +10,13 @@
 | Android | *Planned* (roadmap Phases 10–11); Planned to be backwards compatible with version 12 or newer |
 
 ## Officially supported relay platforms (v1 target)
+| OS | Versions |
+|---|---|
+| Ubuntu | 22.04 LTS and newer |
+| Ubuntu Server | 20.04 and newer |
+| Debian Server | 13 or newer |
+| Fedora | 44 or newer |
+
 |---|---|
 | OS | Versions |
 | Ubuntu | 22.04 LTS and newer |
