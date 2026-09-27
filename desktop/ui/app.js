@@ -102,12 +102,33 @@
     presence: {},        // key -> { status, text }
     myPresence: { status: 'online', text: '' },
     images: {},          // file id -> data: URL (downloaded images)
+    settings: {},        // server id -> its roles/categories/layout
+    collapsed: {},       // category id -> collapsed in the sidebar
   };
+
+  // Server permissions (securetext-app's `perms`).
+  const P = { ADMIN: 1, SERVER: 2, ROLES: 4, CHANNELS: 8, KICK: 16, INVITE: 32 };
+  const PERM_INFO = [
+    [P.ADMIN, 'Administrator', 'Every permission'],
+    [P.SERVER, 'Manage server', 'Rename the server and change its icon'],
+    [P.ROLES, 'Manage roles', 'Create, edit and assign roles below their own'],
+    [P.CHANNELS, 'Manage channels', 'Create, rename, move and organise channels, set channel timers'],
+    [P.KICK, 'Kick members', 'Remove members ranked below them'],
+    [P.INVITE, 'Invite members', 'Invite their contacts into the server'],
+  ];
+  const can = (c, bit) => !!c && !c.removed && (c.permissions & bit) !== 0;
+  const SWATCHES = ['#7c6cf2', '#e91e63', '#e67e22', '#f1c40f', '#2ecc71', '#1abc9c', '#3498db', '#99aab5'];
 
   const conv = (id) => state.convs.find((c) => c.id === id);
   const servers = () => state.convs.filter((c) => c.kind === 'server');
   const dms = () => state.convs.filter((c) => c.kind === 'dm');
   const channelsOf = (sid) => state.convs.filter((c) => c.kind === 'channel' && c.server_id === sid);
+  // A server's channels in one category (null: none), in layout order.
+  function orderedChannels(sid, categoryId, knownCategories) {
+    return channelsOf(sid)
+      .filter((c) => (c.category && knownCategories.has(c.category) ? c.category : null) === categoryId)
+      .sort((a, b) => a.position - b.position || a.name.localeCompare(b.name));
+  }
   const peerLabel = (key) => (state.contacts.find((c) => c.key === key) || {}).label;
 
   // ------------------------------------------------------------------
@@ -204,6 +225,8 @@
 
   async function refreshConvs() {
     state.convs = await call('conversations');
+    await Promise.all(servers().map((sv) => call('server_settings', { serverId: sv.id })
+      .then((st) => { state.settings[sv.id] = st; }).catch(() => {})));
   }
 
   async function refreshContacts() {
@@ -304,6 +327,14 @@
         }
         break;
       }
+      case 'server_changed':
+        await refreshConvs();
+        render();
+        refreshMembers();
+        break;
+      case 'warning':
+        toast(ev.message, 'error');
+        break;
       case 'presence':
         state.presence[ev.key] = { status: ev.status, text: ev.text };
         renderSidebar();
@@ -363,9 +394,19 @@
     $('#rail-servers').innerHTML = servers().map((s) => {
       const unread = channelsOf(s.id).reduce((n, c) => n + (state.unread[c.id] || 0), 0);
       const active = state.view.serverId === s.id;
-      return `<button class="rail-btn ${active ? 'active' : ''}" data-server="${esc(s.id)}" title="${esc(s.name)}" aria-label="${esc(s.name)}">
+      return `<button class="rail-btn ${active ? 'active' : ''}" data-server="${esc(s.id)}" title="${esc(s.name)}" aria-label="${esc(s.name)}" ${s.icon_color ? `data-bg="${esc(s.icon_color)}"` : ''}>
         ${esc(initials(s.name))}${unread ? `<span class="badge">${unread}</span>` : ''}</button>`;
     }).join('');
+    applyColors($('#rail-servers'));
+  }
+
+  // The content-security policy forbids inline style attributes, so
+  // colors chosen by people (server icons, roles) are applied here, after
+  // being checked to be plain #rrggbb values.
+  const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+  function applyColors(root) {
+    root.querySelectorAll('[data-bg]').forEach((el) => { if (COLOR_RE.test(el.dataset.bg)) el.style.background = el.dataset.bg; });
+    root.querySelectorAll('[data-fg]').forEach((el) => { if (COLOR_RE.test(el.dataset.fg)) el.style.color = el.dataset.fg; });
   }
 
   function renderSidebar() {
@@ -394,22 +435,36 @@
     }
     const server = conv(state.view.serverId);
     if (!server) return goHome();
-    const admin = server.is_admin && !server.removed;
+    const manage = can(server, P.SERVER) || can(server, P.ROLES) || can(server, P.CHANNELS);
     head.innerHTML = `<span class="title">${esc(server.name)}</span>
-      ${admin ? '<button class="btn small primary" data-action="invite-server">Invite</button>' : ''}`;
-    const chans = channelsOf(server.id).map((c) => {
+      ${can(server, P.INVITE) ? '<button class="btn small primary" data-action="invite-server">Invite</button>' : ''}
+      ${manage ? '<button class="icon-btn" data-action="server-settings" title="Server settings" aria-label="Server settings">⚙</button>' : ''}`;
+    const movable = can(server, P.CHANNELS);
+    const item = (c) => {
       const unread = state.unread[c.id] || 0;
       const active = state.view.convId === c.id;
-      return `<button class="item ${active ? 'active' : ''} ${unread ? 'unread' : ''} ${c.removed ? 'removed' : ''}" data-conv="${esc(c.id)}">
-        <span class="hash" aria-hidden="true">${c.private ? '🔒︎' : '#'}</span>
-        <span class="grow">${esc(c.name)}</span>
-        ${unread ? `<span class="count">${unread}</span>` : ''}</button>`;
-    }).join('');
-    body.innerHTML = `
-      <div class="section-label">Text channels
-        ${admin ? '<button class="icon-btn" data-action="new-channel" title="Create channel" aria-label="Create channel">+</button>' : ''}</div>
-      ${chans || '<div class="empty-note">No channels.</div>'}
-      ${server.removed ? '<div class="empty-note">You were removed from this server. History stays readable on this device.</div>' : ''}`;
+      return `<div class="item-row" data-drop-channel="${esc(c.id)}">
+        <button class="item ${active ? 'active' : ''} ${unread ? 'unread' : ''} ${c.removed ? 'removed' : ''}" data-conv="${esc(c.id)}" ${movable ? 'draggable="true"' : ''} data-drag-channel="${esc(c.id)}">
+          <span class="hash" aria-hidden="true">${c.private ? '🔒︎' : '#'}</span>
+          <span class="grow">${esc(c.name)}</span>
+          ${unread ? `<span class="count">${unread}</span>` : ''}</button>
+        ${movable ? `<button class="icon-btn item-gear" data-channel-settings="${esc(c.id)}" title="Edit channel" aria-label="Edit channel">⚙</button>` : ''}
+      </div>`;
+    };
+    const cats = (state.settings[server.id] || {}).categories || [];
+    const known = new Set(cats.map((c) => c.id));
+    const loose = orderedChannels(server.id, null, known);
+    let html = `<div class="section-label drop-zone" data-drop-category="">Channels
+        ${movable ? '<button class="icon-btn" data-action="new-channel" title="Create channel" aria-label="Create channel">+</button>' : ''}</div>
+      ${loose.map(item).join('')}`;
+    for (const cat of cats) {
+      const collapsed = state.collapsed[cat.id];
+      html += `<div class="section-label drop-zone category" data-drop-category="${esc(cat.id)}">
+          <button class="cat-toggle" data-toggle-category="${esc(cat.id)}" aria-expanded="${collapsed ? 'false' : 'true'}">${collapsed ? '▸' : '▾'} ${esc(cat.name)}</button>
+          ${movable ? `<button class="icon-btn" data-new-channel-in="${esc(cat.id)}" title="Create channel in ${esc(cat.name)}" aria-label="Create channel">+</button>` : ''}</div>
+        ${collapsed ? '' : orderedChannels(server.id, cat.id, known).map(item).join('')}`;
+    }
+    body.innerHTML = html + (server.removed ? '<div class="empty-note">You were removed from this server. History stays readable on this device.</div>' : '');
   }
 
   function renderMain() {
@@ -432,6 +487,7 @@
     } else {
       const server = conv(c.server_id);
       title.innerHTML = `<span class="hash">${c.private ? '🔒︎' : '#'}</span><span>${esc(c.name)}</span>
+        ${c.topic ? `<span class="topic" title="${esc(c.topic)}">${esc(c.topic)}</span>` : ''}
         ${c.private ? '<span class="tag">Private</span>' : ''}
         ${server ? `<span class="sub">· ${esc(server.name)}</span>` : ''}`;
     }
@@ -700,7 +756,7 @@
       return;
     }
     const server = c.server_id ? conv(c.server_id) : null;
-    const canKick = server && server.is_admin && !server.removed;
+    const canKick = can(server, P.KICK);
     const showAdmin = c.kind !== 'dm'; // a DM's "admin" is just whoever started it
     const scopeRemoved = c.removed || (server && server.removed);
     if (scopeRemoved) {
@@ -710,16 +766,24 @@
     }
     const online = state.members.filter((m) => m.online).length;
     $('#members-title').textContent = `Members — ${online}/${state.members.length} connected`;
-    panel.innerHTML = state.members.map((m) => `
+    let lastGroup;
+    panel.innerHTML = state.members.map((m) => {
+      const groupName = c.kind === 'dm' ? null : (m.group || 'Members');
+      const header = groupName !== lastGroup && c.kind !== 'dm'
+        ? `<div class="panel-title group-title">${esc(groupName)} — ${state.members.filter((x) => (x.group || 'Members') === groupName).length}</div>` : '';
+      lastGroup = groupName;
+      return header + `
       <div class="member ${m.online ? '' : 'offline'}">
         ${avatar(m.label, m.key, m.status || (m.online ? 'online' : 'offline'), true)}
         <div class="grow">
-          <div class="name">${esc(m.label)}${m.is_me ? ' <span class="sub">(you)</span>' : ''} ${showAdmin && m.is_admin ? '<span class="crown" title="Server admin">♛</span>' : ''}</div>
+          <div class="name"><span ${m.color ? `data-fg="${esc(m.color)}"` : ''}>${esc(m.label)}</span>${m.is_me ? ' <span class="sub">(you)</span>' : ''} ${showAdmin && m.is_admin ? '<span class="crown" title="Server owner">♛</span>' : ''}</div>
           ${m.status_text ? `<div class="sub status-text">${esc(m.status_text)}</div>` : ''}
           <div class="sub" title="Identity key fingerprint">${esc(m.fingerprint)}</div>
         </div>
-        ${canKick && !m.is_me ? `<button class="btn small ghost kick" data-kick="${esc(m.key)}" data-name="${esc(m.label)}" title="Remove from server">Remove</button>` : ''}
-      </div>`).join('');
+        ${canKick && !m.is_me && !m.is_admin ? `<button class="btn small ghost kick" data-kick="${esc(m.key)}" data-name="${esc(m.label)}" title="Remove from server">Remove</button>` : ''}
+      </div>`;
+    }).join('');
+    applyColors(panel);
   }
 
   function renderMe() {
@@ -776,14 +840,14 @@
 
   function renderHeadActions(c) {
     const box = $('#head-actions');
-    const can = c && c.kind !== 'server' && !c.removed && !state.call;
-    const timerAllowed = c && !c.removed && (c.kind === 'dm' || (c.kind === 'channel' && c.is_admin));
+    const callable = c && c.kind !== 'server' && !c.removed && !state.call;
+    const timerAllowed = c && !c.removed && (c.kind === 'dm' || can(c, P.CHANNELS));
     const timer = c && c.kind !== 'server' && !c.removed
       ? `<button class="icon-btn ${c.disappear_secs ? 'on' : ''}" data-action="timer" ${timerAllowed ? '' : 'disabled'}
-          title="${c.disappear_secs ? 'Messages disappear after ' + esc(TIMER_CHOICES.find(([s]) => s === c.disappear_secs)?.[1] || c.disappear_secs + ' s') : 'Disappearing messages: off'}${timerAllowed ? '' : ' (only the admin can change this)'}"
+          title="${c.disappear_secs ? 'Messages disappear after ' + esc(TIMER_CHOICES.find(([s]) => s === c.disappear_secs)?.[1] || c.disappear_secs + ' s') : 'Disappearing messages: off'}${timerAllowed ? '' : ' (needs the Manage channels permission)'}"
           aria-label="Disappearing messages">⏱︎</button>`
       : '';
-    box.innerHTML = timer + (can
+    box.innerHTML = timer + (callable
       ? `<button class="icon-btn" data-action="call-voice" title="Start a voice call" aria-label="Start a voice call">📞︎</button>
          <button class="icon-btn" data-action="call-video" title="Start a video call" aria-label="Start a video call">🎥︎</button>`
       : '');
@@ -965,6 +1029,278 @@
     } catch (e) {
       toast(errText(e), 'error');
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Servers: roles, categories, channel layout (Discord-style)
+  // ------------------------------------------------------------------
+  const setEdit = (key, value) => ({ key, value });
+
+  async function editServer(serverId, edits) {
+    state.settings[serverId] = await call('edit_server', { serverId, edits });
+    await refreshConvs();
+    render();
+    refreshMembers();
+  }
+
+  async function moveChannel(serverId, channelId, category, index) {
+    try {
+      state.settings[serverId] = await call('move_channel', { serverId, channelId, category, index });
+      await refreshConvs();
+      renderSidebar();
+    } catch (e) {
+      toast(errText(e), 'error');
+    }
+  }
+
+  // Drag a channel onto another channel (goes before it) or onto a
+  // category header (goes to the top of that category).
+  let dragging = null;
+  document.addEventListener('dragstart', (e) => {
+    const t = e.target.closest && e.target.closest('[data-drag-channel]');
+    if (!t) return;
+    dragging = t.dataset.dragChannel;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', dragging);
+  });
+  document.addEventListener('dragover', (e) => {
+    if (dragging && e.target.closest && e.target.closest('[data-drop-channel], [data-drop-category]')) e.preventDefault();
+  });
+  document.addEventListener('drop', (e) => {
+    const target = e.target.closest && e.target.closest('[data-drop-channel], [data-drop-category]');
+    const moving = dragging;
+    dragging = null;
+    if (!target || !moving) return;
+    e.preventDefault();
+    const sid = state.view.serverId;
+    const known = new Set(((state.settings[sid] || {}).categories || []).map((c) => c.id));
+    if (target.dataset.dropCategory !== undefined) {
+      return moveChannel(sid, moving, target.dataset.dropCategory || null, 0);
+    }
+    const before = conv(target.dataset.dropChannel);
+    if (!before || before.id === moving) return;
+    const category = before.category && known.has(before.category) ? before.category : null;
+    const list = orderedChannels(sid, category, known).filter((c) => c.id !== moving);
+    moveChannel(sid, moving, category, list.findIndex((c) => c.id === before.id));
+  });
+
+  function showChannelSettings(channelId) {
+    const c = conv(channelId);
+    const sid = c && c.server_id;
+    if (!c || !sid) return;
+    const st = state.settings[sid] || { categories: [] };
+    const known = new Set(st.categories.map((x) => x.id));
+    const category = c.category && known.has(c.category) ? c.category : '';
+    modal(`<h3>Edit #${esc(c.name)}</h3>
+      <label>Name<input id="m-name" maxlength="64" value="${esc(c.name)}"></label>
+      <label>Topic<input id="m-topic" maxlength="256" placeholder="What's this channel about?" value="${esc(c.topic)}"></label>
+      <label>Category<select id="m-cat"><option value="">No category</option>
+        ${st.categories.map((x) => `<option value="${esc(x.id)}" ${x.id === category ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
+      <div class="row"><button class="btn small" id="m-up">Move up</button><button class="btn small" id="m-down">Move down</button></div>
+      <p class="form-error" id="m-err"></p>
+      <div class="actions"><button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="m-go">Save</button></div>`,
+    (root, close) => {
+      const shift = async (delta) => {
+        const list = orderedChannels(sid, category || null, known);
+        const i = list.findIndex((x) => x.id === c.id);
+        await moveChannel(sid, c.id, category || null, Math.max(0, i + delta));
+      };
+      $('#m-up', root).addEventListener('click', () => shift(-1));
+      $('#m-down', root).addEventListener('click', () => shift(1));
+      $('#m-go', root).addEventListener('click', async (e) => {
+        busy(e.target, true);
+        try {
+          const cat = $('#m-cat', root).value || null;
+          const meta = { name: $('#m-name', root).value.trim(), topic: $('#m-topic', root).value.trim(), category: c.category, position: c.position };
+          await editServer(sid, [setEdit('channel/' + c.id, meta)]);
+          if (cat !== (category || null)) {
+            await moveChannel(sid, c.id, cat, orderedChannels(sid, cat, known).length);
+          }
+          close();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+          busy(e.target, false);
+        }
+      });
+    });
+  }
+
+  function swatchesHtml(current, name) {
+    return `<div class="swatches">${SWATCHES.map((c) => `<label class="swatch"><input type="radio" name="${name}" value="${c}" ${c === current ? 'checked' : ''}><span data-bg="${c}"></span></label>`).join('')}</div>`;
+  }
+
+  async function showServerSettings(tab) {
+    const server = conv(state.view.serverId);
+    if (!server) return;
+    let st;
+    try {
+      st = state.settings[server.id] = await call('server_settings', { serverId: server.id });
+    } catch (e) {
+      return toast(errText(e), 'error');
+    }
+    const members = await call('members', { conversationId: server.id }).catch(() => []);
+    const mine = st.my_permissions;
+    const tabs = [['overview', 'Overview', P.SERVER], ['roles', 'Roles', P.ROLES], ['members', 'Members', P.ROLES], ['categories', 'Categories', P.CHANNELS]]
+      .filter(([, , bit]) => mine & bit);
+    tab = tab && tabs.some(([id]) => id === tab) ? tab : (tabs[0] || [])[0];
+    const below = (r) => r.id === 'everyone' || r.position < st.my_rank;
+    let body = '';
+    if (tab === 'overview') {
+      body = `<label>Server name<input id="s-name" maxlength="64" value="${esc(st.name)}"></label>
+        <p class="sub">Icon color</p>${swatchesHtml(st.icon_color || '', 'icon')}
+        <div class="actions"><button class="btn primary" id="s-save">Save</button></div>`;
+    } else if (tab === 'roles') {
+      body = `<p class="lead">Members get the permissions of every role they have, plus @everyone's. Roles higher in the list outrank lower ones; you can only manage roles below your own.</p>
+        <div class="role-list">${st.roles.map((r, i) => `<div class="role-row">
+          <span class="role-dot" data-bg="${esc(r.color)}"></span><span class="grow" data-fg="${esc(r.color)}">${esc(r.name)}</span>
+          <span class="sub">${Object.values(st.member_roles).filter((ids) => ids.includes(r.id)).length || ''}</span>
+          ${below(r) && r.id !== 'everyone' && i > 0 && below(st.roles[i - 1]) ? `<button class="btn small ghost" data-role-up="${esc(r.id)}" aria-label="Move ${esc(r.name)} up">↑</button>` : ''}
+          ${below(r) && r.id !== 'everyone' && st.roles[i + 1] && st.roles[i + 1].id !== 'everyone' ? `<button class="btn small ghost" data-role-down="${esc(r.id)}" aria-label="Move ${esc(r.name)} down">↓</button>` : ''}
+          ${below(r) ? `<button class="btn small" data-role-edit="${esc(r.id)}">Edit</button>` : '<span class="sub">above you</span>'}
+        </div>`).join('')}</div>
+        <div class="actions"><button class="btn primary" id="s-new-role">Create role</button></div>`;
+    } else if (tab === 'members') {
+      const assignable = st.roles.filter((r) => r.id !== 'everyone' && below(r));
+      body = `<p class="lead">Give members roles below your own.</p>
+        <div class="pick-list">${members.map((m) => `<div class="member-roles">
+          <div class="name">${esc(m.label)}${m.is_admin ? ' <span class="crown" title="Owner">♛</span>' : ''}</div>
+          <div class="row">${assignable.map((r) => `<label class="check chip"><input type="checkbox" data-member="${esc(m.key)}" value="${esc(r.id)}" ${(st.member_roles[m.key] || []).includes(r.id) ? 'checked' : ''}> <span data-fg="${esc(r.color)}">${esc(r.name)}</span></label>`).join('') || '<span class="sub">No roles you can assign yet.</span>'}</div>
+        </div>`).join('')}</div>`;
+    } else if (tab === 'categories') {
+      body = `<div class="role-list">${st.categories.map((c, i) => `<div class="role-row">
+          <input class="grow" data-cat-name="${esc(c.id)}" maxlength="64" value="${esc(c.name)}">
+          ${i > 0 ? `<button class="btn small ghost" data-cat-up="${esc(c.id)}" aria-label="Move up">↑</button>` : ''}
+          ${i < st.categories.length - 1 ? `<button class="btn small ghost" data-cat-down="${esc(c.id)}" aria-label="Move down">↓</button>` : ''}
+          <button class="btn small ghost" data-cat-save="${esc(c.id)}">Rename</button>
+          <button class="btn small danger" data-cat-delete="${esc(c.id)}">Delete</button></div>`).join('') || '<div class="empty-note">No categories yet.</div>'}</div>
+        <div class="row"><input id="s-cat-new" maxlength="64" placeholder="New category name"><button class="btn primary" id="s-cat-add">Add category</button></div>`;
+    }
+    modal(`<h3>${esc(st.name)} settings</h3>
+      <div class="tabs">${tabs.map(([id, label]) => `<button class="tab ${id === tab ? 'active' : ''}" data-tab="${id}">${label}</button>`).join('')}</div>
+      <div class="tab-body">${body}</div>
+      <p class="form-error" id="m-err"></p>
+      <div class="actions"><button class="btn ghost" data-close>Done</button></div>`,
+    (root, close) => {
+      applyColors(root);
+      const fail = (err) => { $('#m-err', root).textContent = errText(err); };
+      const again = (t) => { close(); showServerSettings(t); };
+      const run = async (edits, t) => { try { await editServer(server.id, edits); again(t); } catch (err) { fail(err); } };
+      root.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => again(b.dataset.tab)));
+      if (tab === 'overview') {
+        $('#s-save', root).addEventListener('click', () => {
+          const edits = [setEdit('server/name', $('#s-name', root).value.trim())];
+          const icon = root.querySelector('input[name=icon]:checked');
+          if (icon) edits.push(setEdit('server/icon', icon.value));
+          run(edits, 'overview');
+        });
+      }
+      if (tab === 'roles') {
+        $('#s-new-role', root).addEventListener('click', () => {
+          const top = Math.max(0, ...st.roles.filter(below).map((r) => r.position));
+          const id = 'r' + Math.random().toString(36).slice(2, 10);
+          // A new role goes just above the most senior one we can manage,
+          // but below our own rank.
+          const position = Math.min(top + 1, st.my_rank - 1);
+          if (position < 1) return fail('You need a role above the new one to create it.');
+          editRole(server.id, st, { id, name: 'new role', color: '#99aab5', permissions: 0, position, hoist: false }, true);
+        });
+        root.querySelectorAll('[data-role-edit]').forEach((b) => b.addEventListener('click', () => {
+          editRole(server.id, st, st.roles.find((r) => r.id === b.dataset.roleEdit), false);
+        }));
+        const swap = (id, dir) => {
+          const i = st.roles.findIndex((r) => r.id === id);
+          const other = st.roles[i + dir];
+          const r = st.roles[i];
+          if (!other || other.id === 'everyone') return;
+          run([setEdit('role/' + r.id, { ...r, position: other.position }), setEdit('role/' + other.id, { ...other, position: r.position })], 'roles');
+        };
+        root.querySelectorAll('[data-role-up]').forEach((b) => b.addEventListener('click', () => swap(b.dataset.roleUp, -1)));
+        root.querySelectorAll('[data-role-down]').forEach((b) => b.addEventListener('click', () => swap(b.dataset.roleDown, 1)));
+      }
+      if (tab === 'members') {
+        root.querySelectorAll('[data-member]').forEach((box) => box.addEventListener('change', () => {
+          const key = box.dataset.member;
+          const ids = new Set(st.member_roles[key] || []);
+          if (box.checked) ids.add(box.value); else ids.delete(box.value);
+          run([setEdit('member/' + key, [...ids])], 'members');
+        }));
+      }
+      if (tab === 'categories') {
+        $('#s-cat-add', root).addEventListener('click', () => {
+          const name = $('#s-cat-new', root).value.trim();
+          if (!name) return;
+          const id = 'c' + Math.random().toString(36).slice(2, 10);
+          run([setEdit('category/' + id, { id, name, position: st.categories.length })], 'categories');
+        });
+        const cat = (id) => st.categories.find((c) => c.id === id);
+        root.querySelectorAll('[data-cat-save]').forEach((b) => b.addEventListener('click', () => {
+          const c = cat(b.dataset.catSave);
+          run([setEdit('category/' + c.id, { ...c, name: root.querySelector(`[data-cat-name="${CSS.escape(c.id)}"]`).value.trim() })], 'categories');
+        }));
+        root.querySelectorAll('[data-cat-delete]').forEach((b) => b.addEventListener('click', () => {
+          // Its channels fall back to "no category".
+          run([setEdit('category/' + b.dataset.catDelete, null)], 'categories');
+        }));
+        const move = (id, dir) => {
+          const i = st.categories.findIndex((c) => c.id === id);
+          const a = st.categories[i];
+          const b = st.categories[i + dir];
+          if (!b) return;
+          run([setEdit('category/' + a.id, { ...a, position: i + dir }), setEdit('category/' + b.id, { ...b, position: i })], 'categories');
+        };
+        root.querySelectorAll('[data-cat-up]').forEach((b) => b.addEventListener('click', () => move(b.dataset.catUp, -1)));
+        root.querySelectorAll('[data-cat-down]').forEach((b) => b.addEventListener('click', () => move(b.dataset.catDown, 1)));
+      }
+    });
+  }
+
+  function editRole(serverId, st, role, isNew) {
+    const everyone = role.id === 'everyone';
+    const mine = st.my_permissions;
+    modal(`<h3>${isNew ? 'New role' : 'Edit ' + esc(role.name)}</h3>
+      ${everyone ? '<p class="lead">@everyone applies to every member of the server.</p>' : `
+      <label>Role name<input id="r-name" maxlength="64" value="${esc(role.name)}"></label>
+      <p class="sub">Color</p>${swatchesHtml(role.color, 'rcolor')}
+      <label class="check"><input type="checkbox" id="r-hoist" ${role.hoist ? 'checked' : ''}> Show members with this role separately in the member list</label>`}
+      <p class="sub">Permissions</p>
+      <div class="pick-list">${PERM_INFO.map(([bit, label, help]) => `<label class="check pick perm">
+        <input type="checkbox" value="${bit}" ${role.permissions & bit ? 'checked' : ''} ${mine & bit ? '' : 'disabled'}>
+        <span><strong>${label}</strong><br><span class="sub">${help}</span></span></label>`).join('')}</div>
+      <p class="form-error" id="m-err"></p>
+      <div class="actions">
+        ${!isNew && !everyone ? '<button class="btn danger" id="r-delete">Delete role</button>' : ''}
+        <button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="r-save">Save</button></div>`,
+    (root, close) => {
+      applyColors(root);
+      const back = () => { close(); showServerSettings('roles'); };
+      $('#r-save', root).addEventListener('click', async (e) => {
+        let permissions = 0;
+        root.querySelectorAll('.perm input:checked').forEach((b) => { permissions |= Number(b.value); });
+        const updated = everyone ? { ...role, permissions } : {
+          ...role,
+          name: $('#r-name', root).value.trim(),
+          color: (root.querySelector('input[name=rcolor]:checked') || {}).value || role.color,
+          hoist: $('#r-hoist', root).checked,
+          permissions,
+        };
+        busy(e.target, true);
+        try {
+          await editServer(serverId, [setEdit('role/' + role.id, updated)]);
+          back();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+          busy(e.target, false);
+        }
+      });
+      const del = $('#r-delete', root);
+      if (del) del.addEventListener('click', async () => {
+        // Take the role off everyone who has it, then delete it.
+        const edits = Object.entries(st.member_roles).filter(([, ids]) => ids.includes(role.id))
+          .map(([k, ids]) => setEdit('member/' + k, ids.filter((x) => x !== role.id)));
+        edits.push(setEdit('role/' + role.id, null));
+        try { await editServer(serverId, edits); back(); } catch (err) { $('#m-err', root).textContent = errText(err); }
+      });
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1270,7 +1606,7 @@
     });
   }
 
-  async function showNewChannel() {
+  async function showNewChannel(categoryId) {
     const server = conv(state.view.serverId);
     if (!server) return;
     const members = (await call('members', { conversationId: server.id })).filter((m) => !m.is_me);
@@ -1300,6 +1636,11 @@
         try {
           const id = await call('create_channel', { serverId: server.id, name, private: priv.checked, memberKeys });
           close();
+          if (typeof categoryId === 'string') {
+            const known = new Set(((state.settings[server.id] || {}).categories || []).map((c) => c.id));
+            await refreshConvs();
+            await moveChannel(server.id, id, categoryId, orderedChannels(server.id, categoryId, known).length);
+          }
           await refreshConvs();
           await select(conv(id));
         } catch (err) {
@@ -1370,8 +1711,14 @@
   // Interaction
   // ------------------------------------------------------------------
   document.addEventListener('click', (e) => {
-    const t = e.target.closest('[data-action], [data-conv], [data-server], [data-kick], [data-react], [data-react-menu], [data-thread], [data-download], [data-save]');
+    const t = e.target.closest('[data-action], [data-conv], [data-server], [data-kick], [data-react], [data-react-menu], [data-thread], [data-download], [data-save], [data-channel-settings], [data-toggle-category], [data-new-channel-in]');
     if (!t) return;
+    if (t.dataset.channelSettings) return showChannelSettings(t.dataset.channelSettings);
+    if (t.dataset.toggleCategory) {
+      state.collapsed[t.dataset.toggleCategory] = !state.collapsed[t.dataset.toggleCategory];
+      return renderSidebar();
+    }
+    if (t.dataset.newChannelIn) return showNewChannel(t.dataset.newChannelIn);
     if (t.dataset.react) return react(t.dataset.msg, t.dataset.react, t.dataset.on === '1');
     if (t.dataset.reactMenu) { e.stopPropagation(); return showReactionMenu(t, t.dataset.reactMenu); }
     if (t.dataset.thread) return openThread(t.dataset.thread);
@@ -1390,9 +1737,10 @@
       case 'add-contact': return showAddContact();
       case 'my-invite': return showMyInvite();
       case 'new-server': return showNewServer();
-      case 'new-channel': return showNewChannel();
+      case 'new-channel': return showNewChannel(null);
       case 'invite-server': return showInviteToServer();
       case 'settings': return showSettings();
+      case 'server-settings': return showServerSettings();
       case 'attach': return $('#file-input').click();
       case 'timer': return showTimerSettings();
       case 'close-thread': state.thread = null; return renderThread();

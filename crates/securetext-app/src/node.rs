@@ -9,6 +9,7 @@
 
 mod calls;
 mod rich;
+mod server;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use crate::transport::{BoxedStream, Listening, Transport};
 pub use calls::{stats as call_stats, CallParticipantView, CallView};
 pub(crate) use calls::CallSetup;
 pub use rich::{AttachmentData, AttachmentView, ReactionView};
+pub use server::{perms, Category, ChannelMeta, Role, ServerSettings};
 use crate::updates::{ExitFactory, UpdateConfig, UpdateEvent, UpdateStatus, Updater};
 use crate::wire::{
     self, to_hex, ContactCard, ConversationInfo, ConversationKind, Payload, SignedCard, WireMessage,
@@ -126,7 +128,13 @@ pub(crate) struct Outgoing {
 struct Conn {
     id: u64,
     tx: mpsc::UnboundedSender<Outgoing>,
+    /// We dialed it (rather than accepted it).
+    outgoing: bool,
 }
+
+/// A connection that's been superseded keeps reading this long before it
+/// closes, so frames already in flight on it still arrive.
+const SUPERSEDED_GRACE: Duration = Duration::from_secs(30);
 
 struct PendingWelcome {
     from: Vec<u8>,
@@ -935,6 +943,21 @@ impl NodeState {
         }
         self.dialing.remove(&peer_key);
         self.backoff.remove(&peer_key);
+        let outgoing = card.is_none();
+        // Two connections at once (we dialed each other at the same
+        // moment): both sides must use the same one, or each sends on a
+        // connection the other has stopped using. Both keep the one dialed
+        // by the lower identity key. The other isn't used for sending
+        // (dropping `tx`), but it keeps reading for a while.
+        if let Some(existing) = self.connections.get(&peer_key) {
+            let keep_outgoing = self.public.public_key.as_slice() < peer_key.as_slice();
+            if existing.outgoing != outgoing && outgoing != keep_outgoing {
+                if let Some(card) = card {
+                    self.accept_card(&peer_key, &card);
+                }
+                return;
+            }
+        }
         if let Some(card) = card {
             // A verified card from a known peer is authoritative for how
             // to reach them. Unknown peers are only remembered once they
@@ -957,7 +980,7 @@ impl NodeState {
             }
         }
         let _ = tx.send(Outgoing { outbox_id: None, message: self.my_presence_frame() });
-        self.connections.insert(peer_key.clone(), Conn { id: conn_id, tx });
+        self.connections.insert(peer_key.clone(), Conn { id: conn_id, tx, outgoing });
         self.emit(Event::Peer { key: to_hex(&peer_key), online: true });
         self.downloads_on_connect();
     }
@@ -1066,23 +1089,39 @@ impl NodeState {
         }
 
         // The Welcome itself is MLS-verified; the metadata riding along
-        // with it is only as good as its sender. Check it's consistent:
-        // the sender must be in the group, and must be its admin.
+        // with it is only as good as its sender. Check it's consistent.
         anyhow::ensure!(
             group.members().any(|m| m.signature_key == from),
             "Welcome sender is not a member of the group"
         );
-        anyhow::ensure!(info.admin_public_key == from, "Welcome sender is not the group's admin");
-        if info.kind == ConversationKind::Channel {
-            let server_id = info
-                .server_group_id
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("channel without a server"))?;
-            let server = self
-                .store
-                .conversation(server_id)?
-                .ok_or_else(|| anyhow::anyhow!("channel for a server we're not in"))?;
-            anyhow::ensure!(server.admin_key == from, "channel admin differs from server admin");
+        match info.kind {
+            // A DM is started by the person who sent it.
+            ConversationKind::Dm => {
+                anyhow::ensure!(info.admin_public_key == from, "Welcome sender didn't start this conversation")
+            }
+            // Anyone allowed to can invite, but the claimed owner must be
+            // the member in the group's first slot (its creator), which
+            // the inviter can't fake.
+            ConversationKind::Server => {
+                let owner = group.member_at(openmls::prelude::LeafNodeIndex::new(0)).map(|m| m.signature_key);
+                anyhow::ensure!(owner.as_deref() == Some(info.admin_public_key.as_slice()), "Welcome names the wrong owner");
+            }
+            ConversationKind::Channel => {
+                let server_id = info
+                    .server_group_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("channel without a server"))?;
+                let server = self
+                    .store
+                    .conversation(server_id)?
+                    .ok_or_else(|| anyhow::anyhow!("channel for a server we're not in"))?;
+                anyhow::ensure!(server.admin_key == info.admin_public_key, "channel names a different owner than its server");
+                let p = self.permissions_in(server_id, from);
+                anyhow::ensure!(
+                    from == server.admin_key || p & (perms::MANAGE_CHANNELS | perms::INVITE_MEMBERS) != 0,
+                    "Welcome sender isn't allowed to add people to channels"
+                );
+            }
         }
 
         // Remember the sender first (from the card they presented on this
@@ -1113,6 +1152,9 @@ impl NodeState {
         let mut row = ConversationRow::from_info(gid.clone(), &info, now_ms());
         row.name = clamp_chars(&name, MAX_NAME_CHARS);
         self.store.insert_conversation(&row)?;
+        if let (ConversationKind::Server, Some(snapshot)) = (info.kind, info.server_state.clone()) {
+            self.adopt_server_snapshot(&gid, snapshot);
+        }
         self.groups.insert(gid.clone(), group);
         self.dirty = true;
 
@@ -1170,7 +1212,8 @@ impl NodeState {
                     eprintln!("[securetext] ignored a message payload: {e:#}");
                 }
             }
-            Ok(Incoming::Commit { removed_self }) => {
+            Ok(Incoming::Commit { removed_self, committer, added, removed }) => {
+                self.check_membership_change(&gid, committer.as_deref(), &added, &removed);
                 self.dirty = true;
                 if removed_self {
                     let _ = self.store.mark_removed(&gid);
@@ -1221,13 +1264,17 @@ impl NodeState {
             }
             Payload::Reaction { target, emoji, on } => self.on_reaction(gid, sender, target, emoji, on)?,
             Payload::Disappear { secs } => self.on_disappear(gid, sender, secs)?,
+            Payload::ServerEdit { lamport, edits } => self.on_server_edit(gid, sender, lamport, edits)?,
             Payload::Call { call_id, signal } => {
                 if !conversation.removed {
                     self.on_call_signal(gid, sender, call_id, signal);
                 }
             }
             Payload::Roster { cards } => {
-                anyhow::ensure!(sender == conversation.admin_key, "roster update from a non-admin");
+                anyhow::ensure!(
+                    sender == conversation.admin_key || self.permissions_in(gid, sender) & perms::INVITE_MEMBERS != 0,
+                    "roster update from someone who can't invite"
+                );
                 for card in &cards {
                     if card.card.mls_public_key != self.public.public_key {
                         self.remember_card(card, false)?;
@@ -1381,6 +1428,7 @@ impl NodeState {
             server_group_id: None,
             admin_public_key: self.public.public_key.clone(),
             private: true,
+            server_state: None,
         };
         self.store.insert_conversation(&ConversationRow::from_info(gid.clone(), &info, now_ms()))?;
         self.groups.insert(gid.clone(), group);
@@ -1394,29 +1442,53 @@ impl NodeState {
     }
 
     pub(crate) fn conversations(&self) -> anyhow::Result<Vec<ConversationView>> {
-        Ok(self
-            .store
-            .conversations()?
+        let rows = self.store.conversations()?;
+        // Settings per server, computed once.
+        let mut settings: HashMap<Vec<u8>, ServerSettings> = HashMap::new();
+        for c in rows.iter().filter(|c| c.kind == ConversationKind::Server) {
+            if let Ok(s) = self.server_settings(&to_hex(&c.group_id)) {
+                settings.insert(c.group_id.clone(), s);
+            }
+        }
+        Ok(rows
             .into_iter()
-            .map(|c| ConversationView {
-                id: to_hex(&c.group_id),
-                kind: c.kind,
-                name: c.name.clone(),
-                server_id: c.server_id.as_deref().map(to_hex),
-                is_admin: c.admin_key == self.public.public_key,
-                private: c.private,
-                removed: c.removed,
-                disappear_secs: self.store.disappear_secs(&c.group_id).ok().flatten(),
-                peer_key: if c.kind == ConversationKind::Dm {
-                    self.groups.get(&c.group_id).and_then(|g| {
-                        g.members()
-                            .map(|m| m.signature_key)
-                            .find(|k| k.as_slice() != self.my_key())
-                            .map(|k| to_hex(&k))
-                    })
-                } else {
-                    None
-                },
+            .map(|c| {
+                let server = match c.kind {
+                    ConversationKind::Server => settings.get(&c.group_id),
+                    ConversationKind::Channel => c.server_id.as_ref().and_then(|s| settings.get(s)),
+                    ConversationKind::Dm => None,
+                };
+                let meta = server.and_then(|s| s.channels.get(&to_hex(&c.group_id))).cloned().unwrap_or_default();
+                let name = match c.kind {
+                    ConversationKind::Server => server.map(|s| s.name.clone()).unwrap_or(c.name.clone()),
+                    ConversationKind::Channel => meta.name.clone().unwrap_or(c.name.clone()),
+                    ConversationKind::Dm => c.name.clone(),
+                };
+                ConversationView {
+                    id: to_hex(&c.group_id),
+                    kind: c.kind,
+                    name,
+                    server_id: c.server_id.as_deref().map(to_hex),
+                    is_admin: c.admin_key == self.public.public_key,
+                    private: c.private,
+                    removed: c.removed,
+                    disappear_secs: self.store.disappear_secs(&c.group_id).ok().flatten(),
+                    permissions: server.map(|s| s.my_permissions).unwrap_or(0),
+                    topic: meta.topic,
+                    category: meta.category,
+                    position: meta.position,
+                    icon_color: if c.kind == ConversationKind::Server { server.and_then(|s| s.icon_color.clone()) } else { None },
+                    peer_key: if c.kind == ConversationKind::Dm {
+                        self.groups.get(&c.group_id).and_then(|g| {
+                            g.members()
+                                .map(|m| m.signature_key)
+                                .find(|k| k.as_slice() != self.my_key())
+                                .map(|k| to_hex(&k))
+                        })
+                    } else {
+                        None
+                    },
+                }
             })
             .collect())
     }
@@ -1444,11 +1516,12 @@ impl NodeState {
         Ok(conversation)
     }
 
-    fn admin_server(&self, server_id: &str) -> anyhow::Result<ConversationRow> {
+    /// A server we're in and hold `bit` in.
+    fn server_with(&self, server_id: &str, bit: u32, what: &str) -> anyhow::Result<ConversationRow> {
         let gid = wire::from_hex(server_id)?;
         let server = self.active_conversation(&gid)?;
         anyhow::ensure!(server.kind == ConversationKind::Server, "not a server");
-        anyhow::ensure!(server.admin_key == self.public.public_key, "only the server's admin can do that");
+        self.require(&gid, bit, what)?;
         Ok(server)
     }
 
@@ -1462,6 +1535,7 @@ impl NodeState {
             server_group_id: None,
             admin_public_key: self.public.public_key.clone(),
             private: false,
+            server_state: None,
         };
         self.store.insert_conversation(&ConversationRow::from_info(gid.clone(), &info, now_ms()))?;
         self.groups.insert(gid.clone(), group);
@@ -1482,7 +1556,7 @@ impl NodeState {
         private: bool,
         member_keys: &[String],
     ) -> anyhow::Result<String> {
-        let server = self.admin_server(server_id)?;
+        let server = self.server_with(server_id, perms::MANAGE_CHANNELS, "create channels")?;
         let name = validate_name(name)?;
         let server_members: Vec<Vec<u8>> = self.group_members(&server.group_id)?;
         let wanted: Vec<Vec<u8>> = if private {
@@ -1506,8 +1580,10 @@ impl NodeState {
             kind: ConversationKind::Channel,
             name,
             server_group_id: Some(server.group_id.clone()),
-            admin_public_key: self.public.public_key.clone(),
+            // Channels belong to the server's owner, whoever created them.
+            admin_public_key: server.admin_key.clone(),
             private,
+            server_state: None,
         };
         let welcome = if wanted.is_empty() {
             None
@@ -1533,7 +1609,7 @@ impl NodeState {
 
     /// Add a contact to a server and to each of its public channels.
     pub(crate) fn invite_to_server(&mut self, server_id: &str, peer_key_hex: &str) -> anyhow::Result<()> {
-        let server = self.admin_server(server_id)?;
+        let server = self.server_with(server_id, perms::INVITE_MEMBERS, "invite people")?;
         let peer_key = wire::from_hex(peer_key_hex)?;
         let peer = self
             .store
@@ -1600,6 +1676,7 @@ impl NodeState {
             server_group_id: conversation.server_id.clone(),
             admin_public_key: conversation.admin_key.clone(),
             private: conversation.private,
+            server_state: if conversation.kind == ConversationKind::Server { self.server_snapshot(gid) } else { None },
         };
         let roster = self.roster_cards(gid)?;
         self.send_frame(peer_key, WireMessage::Welcome { welcome, info, roster }, None)?;
@@ -1609,9 +1686,15 @@ impl NodeState {
 
     /// Remove a member from a server and every channel of it they're in.
     pub(crate) fn kick(&mut self, server_id: &str, peer_key_hex: &str) -> anyhow::Result<()> {
-        let server = self.admin_server(server_id)?;
+        let server = self.server_with(server_id, perms::KICK_MEMBERS, "remove members")?;
         let peer_key = wire::from_hex(peer_key_hex)?;
-        anyhow::ensure!(peer_key != self.public.public_key, "you can't remove yourself from your own server");
+        anyhow::ensure!(peer_key != self.public.public_key, "you can't remove yourself this way");
+        anyhow::ensure!(peer_key != server.admin_key, "the server's owner can't be removed");
+        anyhow::ensure!(
+            self.public.public_key == server.admin_key
+                || self.rank_in(&server.group_id, &peer_key) < self.rank_in(&server.group_id, self.my_key()),
+            "you can only remove members whose highest role is below yours"
+        );
         anyhow::ensure!(
             self.group_members(&server.group_id)?.contains(&peer_key),
             "they're not in this server"
@@ -1643,22 +1726,43 @@ impl NodeState {
             .store
             .conversation(&gid)?
             .ok_or_else(|| anyhow::anyhow!("no such conversation"))?;
-        let mut members: Vec<MemberView> = self
+        let settings = self.server_of(&gid).and_then(|(sid, _)| self.server_settings(&to_hex(&sid)).ok());
+        let mut members: Vec<(i64, MemberView)> = self
             .group_members(&gid)?
             .into_iter()
-            .map(|key| MemberView {
-                key: to_hex(&key),
-                label: self.label_for(&key),
-                fingerprint: fingerprint(&key),
-                is_admin: key == conversation.admin_key,
-                is_me: key == self.public.public_key,
-                online: key == self.public.public_key || self.connections.contains_key(&key),
-                status: self.presence_of(&key).0,
-                status_text: self.presence_of(&key).1,
+            .map(|key| {
+                let hex = to_hex(&key);
+                // Their roles, most senior first.
+                let mut roles: Vec<&Role> = settings
+                    .as_ref()
+                    .map(|s| {
+                        let ids = s.member_roles.get(&hex).cloned().unwrap_or_default();
+                        s.roles.iter().filter(|r| ids.contains(&r.id)).collect()
+                    })
+                    .unwrap_or_default();
+                roles.sort_by_key(|r| std::cmp::Reverse(r.position));
+                let hoisted = roles.iter().find(|r| r.hoist);
+                let view = MemberView {
+                    key: hex,
+                    label: self.label_for(&key),
+                    fingerprint: fingerprint(&key),
+                    is_admin: key == conversation.admin_key,
+                    is_me: key == self.public.public_key,
+                    online: key == self.public.public_key || self.connections.contains_key(&key),
+                    status: self.presence_of(&key).0,
+                    status_text: self.presence_of(&key).1,
+                    roles: roles.iter().map(|r| r.id.clone()).collect(),
+                    color: roles.first().map(|r| r.color.clone()),
+                    group: hoisted.map(|r| r.name.clone()),
+                };
+                (hoisted.map(|r| r.position).unwrap_or(-1), view)
             })
             .collect();
-        members.sort_by(|a, b| b.is_admin.cmp(&a.is_admin).then(a.label.to_lowercase().cmp(&b.label.to_lowercase())));
-        Ok(members)
+        // Hoisted groups by seniority, then the owner first, then by name.
+        members.sort_by(|(ra, a), (rb, b)| {
+            rb.cmp(ra).then(b.is_admin.cmp(&a.is_admin)).then(a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+        });
+        Ok(members.into_iter().map(|(_, m)| m).collect())
     }
 
     pub(crate) fn contacts(&self) -> anyhow::Result<Vec<ContactView>> {
@@ -1762,11 +1866,19 @@ async fn run_connection(
         }
     });
 
+    // Once the node stops using this connection (it's been superseded or
+    // dropped), keep reading for `SUPERSEDED_GRACE` so nothing already
+    // sent to us on it is lost, then close.
+    let mut grace_ends: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             _ = &mut read_task => break,
-            outgoing = rx.recv() => {
-                let Some(outgoing) = outgoing else { break };
+            _ = tokio::time::sleep_until(grace_ends.unwrap_or_else(tokio::time::Instant::now)), if grace_ends.is_some() => break,
+            outgoing = rx.recv(), if grace_ends.is_none() => {
+                let Some(outgoing) = outgoing else {
+                    grace_ends = Some(tokio::time::Instant::now() + SUPERSEDED_GRACE);
+                    continue;
+                };
                 let frame = match outgoing.outbox_id {
                     Some(id) => WireMessage::Tracked { id, message: Box::new(outgoing.message) },
                     None => outgoing.message,
@@ -1913,7 +2025,7 @@ mod tests {
     /// sends down it.
     fn fake_connection(node: &mut NodeState, peer: &[u8]) -> mpsc::UnboundedReceiver<Outgoing> {
         let (tx, rx) = mpsc::unbounded_channel();
-        node.connections.insert(peer.to_vec(), Conn { id: 999, tx });
+        node.connections.insert(peer.to_vec(), Conn { id: 999, tx, outgoing: true });
         rx
     }
 
@@ -2041,5 +2153,75 @@ mod tests {
         // A new call still rings.
         bob.on_call_signal(&gid, alice.my_key(), "call-2".into(), ring());
         assert_eq!(bob.call_view().unwrap().state, "incoming");
+    }
+
+    #[tokio::test]
+    async fn receivers_ignore_server_edits_the_author_was_not_allowed_to_make() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut alice, bob, _dm) = befriended(dir.path());
+        let server = alice.create_server("Club").unwrap();
+        let gid = wire::from_hex(&server).unwrap();
+        let set = |key: &str, v: serde_json::Value| wire::Edit { key: key.into(), value: Some(v) };
+        // Bob (no roles) sends a rename and grants himself a role, as a
+        // modified client could.
+        let forged = vec![
+            set("server/name", serde_json::json!("Bob's now")),
+            set("role/boss", serde_json::json!({"id":"boss","name":"Boss","color":"#000000","permissions":63,"position":50})),
+            set(&format!("member/{}", to_hex(bob.my_key())), serde_json::json!(["boss"])),
+        ];
+        alice.on_server_edit(&gid, bob.my_key(), 99, forged).unwrap();
+        let s = alice.server_settings(&server).unwrap();
+        assert_eq!(s.name, "Club");
+        assert!(s.roles.iter().all(|r| r.id != "boss"));
+        assert_eq!(alice.permissions_in(&gid, bob.my_key()), 0);
+    }
+
+    #[tokio::test]
+    async fn a_download_keeps_asking_the_only_holder_after_a_hiccup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut alice, mut bob, dm) = befriended(dir.path());
+        let sent = alice.send_file(&dm, "data.bin", "", &[7u8; 3000], "", None).unwrap();
+        let file_id = sent.attachment.unwrap().file_id;
+        let frames = take_frames(&mut alice, &bob);
+        deliver(&alice, &mut bob, frames);
+        let alice_key = alice.my_key().to_vec();
+        let mut rx = fake_connection(&mut bob, &alice_key);
+        bob.start_download(&file_id).unwrap();
+        assert!(matches!(rx.try_recv().unwrap().message, WireMessage::FileRequest { .. }));
+        // Her connection blips (seen as silent/dropped): she's now "tried".
+        bob.downloads_on_disconnect(&alice_key);
+        // She's the only one who has it, and she's still reachable: ask again.
+        assert!(
+            matches!(rx.try_recv().map(|o| o.message), Ok(WireMessage::FileRequest { .. })),
+            "the sole holder must be asked again"
+        );
+        // A reply to the earlier request is accepted and completes the file.
+        let a = bob.store.attachment(&file_id).unwrap().unwrap();
+        let ciphertext = std::fs::read(alice.attachment_path(&file_id, false)).unwrap();
+        assert_eq!(ciphertext.len() as u64, a.cipher_size);
+        bob.on_file_chunk(&alice_key, file_id.clone(), 0, ciphertext).unwrap();
+        assert_eq!(bob.store.attachment(&file_id).unwrap().unwrap().state, "complete");
+    }
+
+    #[tokio::test]
+    async fn two_simultaneous_connections_resolve_to_the_same_one_on_both_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut alice, mut bob, _dm) = befriended(dir.path());
+        let (a_key, b_key) = (alice.my_key().to_vec(), bob.my_key().to_vec());
+        let a_card = alice.my_card.clone().unwrap();
+        let b_card = bob.my_card.clone().unwrap();
+        // Connection 1 was dialed by Alice, connection 2 by Bob. Each side
+        // learns about them in a different order.
+        let (t1, _r1) = mpsc::unbounded_channel();
+        let (t2, _r2) = mpsc::unbounded_channel();
+        alice.on_connected(b_key.clone(), None, 1, t1); // she dialed it
+        alice.on_connected(b_key.clone(), Some(b_card), 2, t2); // he dialed it
+        let (t3, _r3) = mpsc::unbounded_channel();
+        let (t4, _r4) = mpsc::unbounded_channel();
+        bob.on_connected(a_key.clone(), None, 2, t4); // he dialed it
+        bob.on_connected(a_key.clone(), Some(a_card), 1, t3); // she dialed it
+        let expected = if a_key < b_key { 1 } else { 2 };
+        assert_eq!(alice.connections[&b_key].id, expected, "Alice keeps the lower key's connection");
+        assert_eq!(bob.connections[&a_key].id, expected, "and so does Bob");
     }
 }

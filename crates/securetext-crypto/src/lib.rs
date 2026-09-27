@@ -51,8 +51,10 @@ pub enum Incoming {
     Application { sender_public_key: Vec<u8>, plaintext: Vec<u8> },
     /// A commit was applied. `removed_self` is true if it removed this
     /// member from the group: the group is now inactive and later messages
-    /// in it are unreadable to us.
-    Commit { removed_self: bool },
+    /// in it are unreadable to us. `committer` made it (MLS-authenticated);
+    /// `added` / `removed` are the identity keys whose membership changed,
+    /// so the application can check the committer was allowed to.
+    Commit { removed_self: bool, committer: Option<Vec<u8>>, added: Vec<Vec<u8>>, removed: Vec<Vec<u8>> },
     /// A standalone proposal or another non-content message.
     Other,
 }
@@ -337,10 +339,19 @@ impl<P: OpenMlsProvider> Member<P> {
             }
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                 let removed_self = staged_commit.self_removed();
+                let added: Vec<Vec<u8>> = staged_commit
+                    .add_proposals()
+                    .map(|p| p.add_proposal().key_package().leaf_node().signature_key().as_slice().to_vec())
+                    .collect();
+                // Removed leaves must be resolved before the merge empties them.
+                let removed: Vec<Vec<u8>> = staged_commit
+                    .remove_proposals()
+                    .filter_map(|p| group.member_at(p.remove_proposal().removed()).map(|m| m.signature_key))
+                    .collect();
                 group
                     .merge_staged_commit(&self.provider, *staged_commit)
                     .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
-                Ok(Incoming::Commit { removed_self })
+                Ok(Incoming::Commit { removed_self, committer: sender_public_key, added, removed })
             }
             // Standalone proposals, and the "own message echoed back"
             // variants (OwnPendingCommit/OwnPrivateMessage) that OpenMLS

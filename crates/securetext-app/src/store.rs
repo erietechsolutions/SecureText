@@ -200,6 +200,14 @@ impl Store {
                 state TEXT NOT NULL,
                 received INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS app_server_state (
+                server_id BLOB NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT,
+                lamport INTEGER NOT NULL,
+                author BLOB NOT NULL,
+                PRIMARY KEY (server_id, key)
+            );
             CREATE INDEX IF NOT EXISTS app_messages_expiry ON app_messages (expires_at)
                 WHERE expires_at IS NOT NULL;
             -- Deleted rows (expired messages above all) are overwritten,
@@ -427,6 +435,48 @@ impl Store {
     pub fn force_expired(&self, id: &str) -> anyhow::Result<()> {
         self.conn.execute("UPDATE app_messages SET expires_at = 1 WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // ---- server settings (roles, layout) ----
+
+    /// Store `edit` if it's newer than what's there (higher Lamport clock,
+    /// then higher author key). Returns whether it was applied.
+    pub fn put_server_edit(&self, server_id: &[u8], e: &crate::wire::StampedEdit) -> anyhow::Result<bool> {
+        let existing: Option<(i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT lamport, author FROM app_server_state WHERE server_id = ?1 AND key = ?2",
+                params![server_id, e.key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((lamport, author)) = existing {
+            if (lamport as u64, author.as_slice()) >= (e.lamport, e.author.as_slice()) {
+                return Ok(false);
+            }
+        }
+        let value = e.value.as_ref().map(|v| v.to_string());
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_server_state (server_id, key, value, lamport, author) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![server_id, e.key, value, e.lamport as i64, e.author],
+        )?;
+        Ok(true)
+    }
+
+    pub fn server_edits(&self, server_id: &[u8]) -> anyhow::Result<Vec<crate::wire::StampedEdit>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value, lamport, author FROM app_server_state WHERE server_id = ?1 ORDER BY key")?;
+        let rows = stmt.query_map(params![server_id], |r| {
+            let value: Option<String> = r.get(1)?;
+            Ok(crate::wire::StampedEdit {
+                key: r.get(0)?,
+                value: value.and_then(|v| serde_json::from_str(&v).ok()),
+                lamport: r.get::<_, i64>(2)? as u64,
+                author: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     // ---- conversation settings ----

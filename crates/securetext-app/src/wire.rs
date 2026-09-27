@@ -116,7 +116,7 @@ impl ConversationKind {
 /// What a Welcome is *for*. MLS itself only knows about groups; the app
 /// needs to know whether a new group is a DM, a server, or one of a
 /// server's channels.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ConversationInfo {
     pub kind: ConversationKind,
     pub name: String,
@@ -129,6 +129,32 @@ pub struct ConversationInfo {
     pub admin_public_key: Vec<u8>,
     #[serde(default)]
     pub private: bool,
+    /// Server Welcomes carry the server's current settings (roles,
+    /// categories, channel layout), so the newcomer sees the same server as
+    /// everyone else from the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_state: Option<Vec<StampedEdit>>,
+}
+
+/// One field of a server's settings (see `node/server.rs`): `key` names
+/// the field, `value` is its JSON value (`None` = deleted).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Edit {
+    pub key: String,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+}
+
+/// An edit with the stamp that decides which of two concurrent edits
+/// wins: the higher Lamport clock, then the higher author key.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StampedEdit {
+    pub key: String,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+    pub lamport: u64,
+    #[serde(with = "b64")]
+    pub author: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,8 +248,12 @@ pub enum Payload {
     /// Add or remove an emoji reaction to a message.
     Reaction { target: String, emoji: String, on: bool },
     /// Set (or, with `None`, clear) the conversation's disappearing-message
-    /// timer. DMs: either person; channels: the admin.
+    /// timer. DMs: either person; channels: members with Manage Channels.
     Disappear { secs: Option<i64> },
+    /// Changes to a server's settings (roles, layout, names), sent in the
+    /// server's group. Each edit is checked against its author's
+    /// permissions by every receiver.
+    ServerEdit { lamport: u64, edits: Vec<Edit> },
     /// Sent by a server's admin to announce members' contact cards, so
     /// every member can reach every other member directly. MLS
     /// authenticates the admin as the sender; each card's own signature

@@ -405,9 +405,7 @@ impl NodeState {
         let conversation = self.active_conversation(&gid)?;
         match conversation.kind {
             ConversationKind::Server => anyhow::bail!("set it on a channel"),
-            ConversationKind::Channel => {
-                anyhow::ensure!(conversation.admin_key == self.public.public_key, "only the server's admin can change this")
-            }
+            ConversationKind::Channel => self.require(&gid, super::perms::MANAGE_CHANNELS, "change channel timers")?,
             ConversationKind::Dm => {}
         }
         let payload = Payload::Disappear { secs };
@@ -526,7 +524,10 @@ impl NodeState {
         let conversation = self.store.conversation(gid)?.ok_or_else(|| anyhow::anyhow!("unknown conversation"))?;
         match conversation.kind {
             ConversationKind::Dm => {}
-            ConversationKind::Channel => anyhow::ensure!(sender == conversation.admin_key, "timer change from a non-admin"),
+            ConversationKind::Channel => anyhow::ensure!(
+                sender == conversation.admin_key || self.permissions_in(gid, sender) & super::perms::MANAGE_CHANNELS != 0,
+                "timer change from someone without Manage Channels"
+            ),
             ConversationKind::Server => anyhow::bail!("no timer on a server group"),
         }
         let secs = secs.map(|s| s.clamp(MIN_DISAPPEAR, MAX_DISAPPEAR));
@@ -637,8 +638,17 @@ impl NodeState {
         let mut candidates: Vec<Vec<u8>> = vec![a.sender_key.clone()];
         candidates.extend(members.into_iter().filter(|k| *k != a.sender_key));
         let me = self.public.public_key.clone();
-        let untried: Vec<Vec<u8>> = candidates.into_iter().filter(|k| *k != me && !dl.tried.contains(k)).collect();
-        let source = untried.iter().find(|k| self.connections.contains_key(*k)).cloned();
+        candidates.retain(|k| *k != me);
+        let untried: Vec<Vec<u8>> = candidates.iter().filter(|k| !dl.tried.contains(k)).cloned().collect();
+        // Prefer someone we haven't tried yet. "Tried" is only a
+        // preference: if the only people connected are ones we tried
+        // before (say, the sole holder whose connection blipped), ask them
+        // again rather than never.
+        let source = untried
+            .iter()
+            .find(|k| self.connections.contains_key(*k))
+            .or_else(|| candidates.iter().find(|k| self.connections.contains_key(*k)))
+            .cloned();
         let Some(source) = source else {
             // Nobody who might have it is connected: dial them (the sender
             // first), and ask as soon as one of them answers.
@@ -686,9 +696,15 @@ impl NodeState {
     }
 
     pub(crate) fn on_file_chunk(&mut self, from: &[u8], file_id: String, offset: u64, data: Vec<u8>) -> anyhow::Result<()> {
-        let Some(dl) = self.rich.downloads.get(&file_id) else { return Ok(()) };
-        anyhow::ensure!(dl.source.as_deref() == Some(from), "chunk from a peer we didn't ask");
+        if !self.rich.downloads.contains_key(&file_id) {
+            return Ok(());
+        }
         let a = self.store.attachment(&file_id)?.ok_or_else(|| anyhow::anyhow!("unknown file"))?;
+        // Usually from the peer we asked last, but an earlier source's
+        // reply can arrive after we switched. Any member's chunk at the
+        // right offset is fine: the whole file is checked against its
+        // MLS-carried hash at the end.
+        anyhow::ensure!(self.group_members(&a.group_id)?.iter().any(|k| k == from), "file chunk from a non-member");
         anyhow::ensure!(offset == a.received, "out-of-order chunk");
         anyhow::ensure!(!data.is_empty() && a.received + data.len() as u64 <= a.cipher_size, "chunk overruns the file");
         let mut f = std::fs::OpenOptions::new().append(true).open(self.attachment_path(&file_id, true))?;

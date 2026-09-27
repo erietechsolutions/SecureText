@@ -499,3 +499,34 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
 .dot.st-dnd { background: var(--bad) !important; }
 .status-text { font-style: italic; }
 .icon-btn.on { color: var(--accent-2); }
+
+/* ---- server customization ---- */
+.item-row { display: flex; align-items: center; position: relative; }
+.item-row .item { flex: 1; min-width: 0; }
+.item-row .item-gear { position: absolute; right: 6px; visibility: hidden; }
+.item-row:hover .item-gear, .item-row .item-gear:focus { visibility: visible; }
+/* The gear takes the unread count's place while hovered. */
+.item-row:hover .count, .item-row:focus-within .count { visibility: hidden; }
+.item[draggable="true"] { cursor: grab; }
+.drop-zone { cursor: default; }
+.section-label.category { margin-top: 10px; }
+.cat-toggle { border: 0; background: none; color: inherit; font: inherit; text-transform: inherit; letter-spacing: inherit; padding: 0; cursor: pointer; flex: 1; text-align: left; }
+.main-title .topic { color: var(--text-3); font-size: 13px; margin-left: 10px; padding-left: 10px; border-left: 1px solid var(--line); max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-title { margin-top: 12px; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 6px 0 12px; }
+.tab { border: 0; background: none; color: var(--text-2); padding: 8px 12px; cursor: pointer; border-bottom: 2px solid transparent; font: inherit; }
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab-body { max-height: 55vh; overflow-y: auto; display: grid; gap: 10px; }
+.role-list { display: grid; gap: 4px; }
+.role-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 8px; background: var(--bg-raised); }
+.role-row .grow { flex: 1; min-width: 0; }
+.role-dot { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+.swatches { display: flex; gap: 8px; flex-wrap: wrap; }
+.swatch { position: relative; }
+.swatch input { position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none; }
+.swatch span { display: block; width: 26px; height: 26px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; }
+.swatch input:checked + span { border-color: var(--text); }
+.swatch input:focus-visible + span { outline: 2px solid var(--accent); }
+.member-roles { padding: 6px 0; border-bottom: 1px solid var(--line); display: grid; gap: 4px; }
+.chip { font-size: 13px; }
+.perm .sub { font-weight: 400; }

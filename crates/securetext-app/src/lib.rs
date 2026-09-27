@@ -39,7 +39,7 @@ use securetext_identity::IdentityStore;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-pub use node::{fingerprint, AttachmentData, AttachmentView, CallParticipantView, CallView, ReactionView, MAX_MESSAGE_CHARS};
+pub use node::{fingerprint, perms, AttachmentData, Category, ChannelMeta, Role, ServerSettings, AttachmentView, CallParticipantView, CallView, ReactionView, MAX_MESSAGE_CHARS};
 use node::{CallSetup, Job, NetEvent, NodeState, Opened, Timing};
 pub use securetext_call as call;
 pub use transport::{MemoryNetwork, TorTransport, Transport};
@@ -158,6 +158,15 @@ pub struct ConversationView {
     pub removed: bool,
     /// Disappearing-message timer, in seconds, if on.
     pub disappear_secs: Option<i64>,
+    /// Our permissions in the server this belongs to (0 for DMs; see
+    /// [`perms`]).
+    pub permissions: u32,
+    /// Channels: topic, category and position in the server's layout.
+    pub topic: String,
+    pub category: Option<String>,
+    pub position: i64,
+    /// Servers: the icon color, if one was set.
+    pub icon_color: Option<String>,
     /// For DMs: the other person's key.
     pub peer_key: Option<String>,
 }
@@ -196,6 +205,12 @@ pub struct MemberView {
     /// "online", "away", "dnd", or "offline".
     pub status: String,
     pub status_text: String,
+    /// Servers and channels: the member's role ids, most senior first.
+    pub roles: Vec<String>,
+    /// The color of their most senior colored role, if any.
+    pub color: Option<String>,
+    /// The name of the hoisted role they're listed under, if any.
+    pub group: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -225,6 +240,11 @@ pub enum Event {
     /// Disappearing messages whose time ran out.
     MessagesDeleted { conversation_id: String, ids: Vec<String> },
     Presence { key: String, status: String, text: String },
+    /// A server's settings (roles, layout, names) changed.
+    ServerChanged { server_id: String },
+    /// Something the user should know about, e.g. a membership change made
+    /// without permission.
+    Warning { conversation_id: String, message: String },
     Update { status: UpdateStatus },
     /// The call changed (or ended: `call` is `None` and `ended` says why).
     Call { call: Option<CallView>, ended: Option<String> },
@@ -409,6 +429,30 @@ impl NodeHandle {
     /// Set our status ("online", "away", "dnd") and an optional short text.
     pub async fn set_presence(&self, status: String, text: String) -> anyhow::Result<(String, String)> {
         self.call(move |s| s.set_presence(&status, &text)).await
+    }
+
+    // ---- server settings: roles, layout (Discord-style) ----
+
+    pub async fn server_settings(&self, server_id: String) -> anyhow::Result<ServerSettings> {
+        self.call(move |s| s.server_settings(&server_id)).await
+    }
+
+    /// Change server settings. Each edit names a field (`server/name`,
+    /// `server/icon`, `role/<id>`, `member/<key>`, `category/<id>`,
+    /// `channel/<id>`) and its new value (`None` deletes it).
+    pub async fn edit_server(&self, server_id: String, edits: Vec<wire::Edit>) -> anyhow::Result<ServerSettings> {
+        self.call(move |s| s.edit_server(&server_id, edits)).await
+    }
+
+    /// Move a channel to position `index` within `category` (or no category).
+    pub async fn move_channel(
+        &self,
+        server_id: String,
+        channel_id: String,
+        category: Option<String>,
+        index: usize,
+    ) -> anyhow::Result<ServerSettings> {
+        self.call(move |s| s.move_channel(&server_id, &channel_id, category, index)).await
     }
 
     pub async fn download_attachment(&self, file_id: String) -> anyhow::Result<()> {

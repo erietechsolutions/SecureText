@@ -99,9 +99,12 @@ class Window:
         try:
             self.cmd("POST", f"/element/{self.find(css)}/click", {})
         except RuntimeError as e:
-            if "unsupported operation" not in str(e) and "not interactable" not in str(e):
+            if "unsupported operation" not in str(e) and "not interactable" not in str(e) and "intercepted" not in str(e):
                 raise
-            self.js("document.querySelector(arguments[0]).click();", css)
+            # The element can be replaced while re-rendering; report that
+            # the same way the driver does, so `_with_retry` tries again.
+            if not self.js("const e = document.querySelector(arguments[0]); if (e) e.click(); return !!e;", css):
+                raise RuntimeError(f"[{self.name}] no such element: {css}")
 
     def _type(self, css, text):
         try:
@@ -334,6 +337,74 @@ def rich_stage(alice, bob):
     bob.shot("23-rich")
 
 
+def select_channel(w, name):
+    """Open a channel in the current server by its name."""
+    find = f"[...document.querySelectorAll('#sidebar-body [data-conv]')].find(b => b.querySelector('.grow').textContent.trim() === {json.dumps(name)})"
+    w.wait(f"#{name} listed", f"return !!{find};")
+    w.js(f"{find}.click();")
+    w.wait(f"#{name} open", has_text("#main-title", name))
+
+
+def roles_stage(alice, bob):
+    """Discord-style server customization through the UI: Alice renames the
+    server, colors its icon, creates a hoisted Mod role with Manage
+    Channels, gives it to Bob, makes a category, files #general under it
+    and sets a topic. Bob sees all of it and can now create channels."""
+    alice.click("[data-action=server-settings]")
+    alice.wait("server settings", "return !!document.querySelector('#s-name');")
+    alice.js("document.querySelector('#s-name').value = '';")
+    alice.type("#s-name", "Book Club HQ")
+    alice.click("input[name=icon][value='#e91e63'] + span")
+    alice.click("#s-save")
+    alice.wait("renamed", has_text("#sidebar-head", "Book Club HQ"))
+
+    alice.click("[data-tab=roles]")
+    alice.wait("roles tab", "return !!document.querySelector('#s-new-role');")
+    alice.click("#s-new-role")
+    alice.js("document.querySelector('#r-name').value = '';")
+    alice.type("#r-name", "Mod")
+    alice.click("input[name=rcolor][value='#2ecc71'] + span")
+    alice.click("#r-hoist")
+    alice.click(".perm input[value='8']")  # Manage channels
+    alice.shot("24-role-editor")
+    alice.click("#r-save")
+    alice.wait("role listed", has_text(".role-list", "Mod"))
+    alice.click("[data-tab=members]")
+    alice.wait("members tab", "return [...document.querySelectorAll('.member-roles')].some(r => r.textContent.includes('Bob'));")
+    alice.js("[...document.querySelectorAll('.member-roles')].find(r => r.textContent.includes('Bob')).querySelector('input[type=checkbox]').click();")
+    alice.wait("role assigned", "return [...document.querySelectorAll('.member-roles')].find(r => r.textContent.includes('Bob')).querySelector('input:checked') !== null;")
+    alice.click("[data-tab=categories]")
+    alice.type("#s-cat-new", "Reading")
+    alice.click("#s-cat-add")
+    alice.wait("category listed", "return !!document.querySelector('[data-cat-name]');")
+    alice.shot("25-server-settings")
+    alice.click(".modal [data-close]")
+
+    alice.js("document.querySelector('[data-channel-settings]').style.visibility = 'visible';")
+    select_channel(alice, "general")
+    alice.js("document.querySelector('.item.active').parentElement.querySelector('[data-channel-settings]').click();")
+    alice.wait("channel settings", "return !!document.querySelector('#m-topic');")
+    alice.type("#m-topic", "Talk about this month's book")
+    alice.js("const s = document.querySelector('#m-cat'); s.value = s.options[1].value;")
+    alice.click("#m-go")
+    alice.wait("topic shown", has_text("#main-title", "this month"))
+
+    bob.wait("server renamed for Bob", has_text("#sidebar-head", "Book Club HQ"), timeout=180)
+    bob.wait("category for Bob", has_text("#sidebar-body", "Reading"), timeout=180)
+    select_channel(bob, "general")
+    bob.wait("topic for Bob", has_text("#main-title", "this month"), timeout=180)
+    bob.wait("Bob listed under Mod", "const g = [...document.querySelectorAll('#members .group-title')].map(e => e.textContent);"
+             " return g.some(t => t.startsWith('Mod'));", timeout=180)
+    bob.wait("Bob can create channels", "return !!document.querySelector('[data-action=new-channel]');", timeout=60)
+    color = bob.js("return [...document.querySelectorAll('#members .name span[data-fg]')].map(e => getComputedStyle(e).color);")
+    icon = bob.js("return getComputedStyle(document.querySelector('#rail-servers .rail-btn')).backgroundColor;")
+    log(f"bob sees the rename, category, topic and his Mod role (name color {color}, icon {icon})")
+    assert "rgb(46, 204, 113)" in color, color
+    assert icon == "rgb(233, 30, 99)", icon
+    bob.shot("26-customized-server")
+    alice.shot("26-customized-server")
+
+
 def screen_share_check(alice, bob):
     alice.click("[data-action=call-screen]")
     alice.wait("sharing screen", has_text("#call-panel", "Stop sharing"), timeout=30)
@@ -460,6 +531,7 @@ def main():
         alice.wait("both members listed", "return document.querySelectorAll('#members .member').length === 2;")
         alice.shot("09-server-general")
         bob.shot("09-server-general")
+        roles_stage(alice, bob)
 
         # A private channel, then removing Bob.
         alice.click("[data-action=new-channel]")
@@ -472,8 +544,7 @@ def main():
         time.sleep(3)
         assert "admins" not in bob.js(text_of("#sidebar-body")), "bob must not see the private channel"
 
-        alice.click("#sidebar-body [data-conv]")  # back to #general
-        alice.wait("#general open again", has_text("#main-title", "general"))
+        select_channel(alice, "general")
         alice.wait("remove button", "return !!document.querySelector('.member .kick');")
         alice.js("document.querySelector('.member .kick').style.visibility = 'visible';")
         alice.click(".member .kick")

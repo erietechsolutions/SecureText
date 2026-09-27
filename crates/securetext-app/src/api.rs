@@ -115,6 +115,38 @@ pub async fn dispatch(node: &NodeHandle, cmd: &str, args: Value) -> Result<Value
             let a: Relay = parse(args)?;
             to_value(node.set_relay(a.address).await.map_err(err)?)
         }
+        "server_settings" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct S {
+                server_id: String,
+            }
+            let a: S = parse(args)?;
+            to_value(node.server_settings(a.server_id).await.map_err(err)?)
+        }
+        "edit_server" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct S {
+                server_id: String,
+                edits: Vec<crate::wire::Edit>,
+            }
+            let a: S = parse(args)?;
+            to_value(node.edit_server(a.server_id, a.edits).await.map_err(err)?)
+        }
+        "move_channel" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct S {
+                server_id: String,
+                channel_id: String,
+                #[serde(default)]
+                category: Option<String>,
+                index: usize,
+            }
+            let a: S = parse(args)?;
+            to_value(node.move_channel(a.server_id, a.channel_id, a.category, a.index).await.map_err(err)?)
+        }
         "send_file" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
