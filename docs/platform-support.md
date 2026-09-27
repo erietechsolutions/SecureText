@@ -11,6 +11,7 @@
 
 ## Officially supported relay platforms (v1 target)
 |---|---|
+| OS | Versions |
 | Ubuntu | 22.04 LTS and newer |
 | Ubuntu Server | 20.04 LTS and newer |
 | Debian Server | 13 or newer |
