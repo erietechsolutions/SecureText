@@ -205,6 +205,9 @@ pub(crate) struct NodeState {
     updater: Option<Updater>,
     call: Option<calls::CallState>,
     call_setup: Option<CallSetup>,
+    /// Calls that ended here recently, so a late or repeated ring for one
+    /// doesn't ring again.
+    ended_calls: std::collections::VecDeque<String>,
     /// Live-only frames (call signals) for peers we're still dialing: sent
     /// if the connection comes up within `LIVE_HOLD`, otherwise dropped.
     /// Never persisted and never left at a relay.
@@ -284,6 +287,7 @@ impl NodeState {
             updater: None,
             call: None,
             call_setup: None,
+            ended_calls: std::collections::VecDeque::new(),
             live_pending: HashMap::new(),
             rich: rich::RichState::new(attachments_dir),
             dirty: false,
@@ -2020,5 +2024,22 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         alice.on_connected(bob.my_key().to_vec(), None, 5000, tx);
         assert!(alice.connections.contains_key(bob.my_key()), "contacts aren't subject to the stranger cap");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_ring_for_a_declined_call_does_not_ring_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (alice, mut bob, dm) = befriended(dir.path());
+        let gid = wire::from_hex(&dm).unwrap();
+        let ring = || wire::CallSignal::Ring { video: false, key: vec![1; 32], turn: vec![], started_at: now_ms() };
+        bob.on_call_signal(&gid, alice.my_key(), "call-1".into(), ring());
+        assert_eq!(bob.call_view().unwrap().state, "incoming");
+        bob.decline_call().unwrap();
+        // Alice re-sends her ring before she's heard about the decline.
+        bob.on_call_signal(&gid, alice.my_key(), "call-1".into(), ring());
+        assert!(bob.call_view().is_none(), "a declined call must not ring again");
+        // A new call still rings.
+        bob.on_call_signal(&gid, alice.my_key(), "call-2".into(), ring());
+        assert_eq!(bob.call_view().unwrap().state, "incoming");
     }
 }

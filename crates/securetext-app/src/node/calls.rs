@@ -27,6 +27,9 @@ const RING_TIMEOUT: Duration = Duration::from_secs(60);
 /// A pair in the call that still isn't connected after this long gets
 /// another try (signals are live-only, so one can be lost).
 const STUCK: Duration = Duration::from_secs(10);
+/// An unanswered ring is sent again this often (signals are live-only, so
+/// one can be lost on a flaky link; receivers ignore repeats).
+const RING_RESEND: Duration = Duration::from_secs(5);
 /// A ring older than this when it arrives is ignored.
 const STALE_RING_MS: i64 = 90_000;
 const TURN_SETTING: &str = "turn_servers";
@@ -71,6 +74,9 @@ pub(crate) struct CallState {
     since: HashMap<Vec<u8>, Instant>,
     /// When we last re-announced ourselves to people who owe us an offer.
     last_nudge: Option<Instant>,
+    /// Our own ring, for re-sending while nobody has answered: when it was
+    /// last sent, and the original start time it carries.
+    last_ring: Option<(Instant, i64)>,
 }
 
 pub(crate) enum CallNet {
@@ -163,6 +169,15 @@ impl NodeState {
         self.emit(Event::Call { call: self.call_view(), ended: ended.map(str::to_string) });
     }
 
+    /// Remember that a call is over here (bounded), so rings for it are
+    /// ignored from now on.
+    fn remember_ended(&mut self, call_id: &str) {
+        if self.ended_calls.len() >= 32 {
+            self.ended_calls.pop_front();
+        }
+        self.ended_calls.push_back(call_id.to_string());
+    }
+
     /// Send a call signal to every member of the conversation: straight
     /// away to those connected, and to the rest if a connection comes up
     /// within a few seconds (they're dialed now). Never queued durably.
@@ -210,10 +225,11 @@ impl NodeState {
 
         let call_id = random_id();
         let key = securetext_call::crypto::CallKey::generate().to_vec();
+        let started_at = now_ms();
         self.send_call_signal(
             &gid,
             &call_id,
-            CallSignal::Ring { video, key: key.clone(), turn: turn.clone(), started_at: now_ms() },
+            CallSignal::Ring { video, key: key.clone(), turn: turn.clone(), started_at },
         )?;
         self.call = Some(CallState {
             call_id,
@@ -233,6 +249,7 @@ impl NodeState {
             muted: false,
             since: HashMap::new(),
             last_nudge: None,
+            last_ring: Some((Instant::now(), started_at)),
         });
         self.start_engine();
         self.emit_call(None);
@@ -264,6 +281,7 @@ impl NodeState {
             anyhow::bail!("nobody is calling");
         };
         let _ = self.send_call_signal(&c.gid, &c.call_id, CallSignal::Decline);
+        self.remember_ended(&c.call_id);
         self.emit_call(Some("declined"));
         Ok(())
     }
@@ -273,6 +291,7 @@ impl NodeState {
         if c.phase != Phase::Incoming {
             let _ = self.send_call_signal(&c.gid, &c.call_id, CallSignal::Leave);
         }
+        self.remember_ended(&c.call_id);
         close_engine(c.engine);
         self.emit_call(Some("you hung up"));
         Ok(())
@@ -283,6 +302,7 @@ impl NodeState {
             if c.phase != Phase::Incoming {
                 let _ = self.send_call_signal(&c.gid, &c.call_id, CallSignal::Leave);
             }
+            self.remember_ended(&c.call_id);
             close_engine(c.engine);
             self.emit_call(Some(reason));
         }
@@ -483,8 +503,12 @@ impl NodeState {
         let ours = self.call.as_ref().is_some_and(|c| c.call_id == call_id && c.gid == gid);
         match signal {
             CallSignal::Ring { video, key, turn, started_at } => {
-                if self.call.is_some() || now_ms() - started_at > STALE_RING_MS || key.len() != 32 {
-                    return; // busy, stale, or malformed
+                if self.call.is_some()
+                    || self.ended_calls.contains(&call_id)
+                    || now_ms() - started_at > STALE_RING_MS
+                    || key.len() != 32
+                {
+                    return; // busy, already over here, stale, or malformed
                 }
                 let removed = self.store.conversation(gid).ok().flatten().is_none_or(|c| c.removed);
                 if removed {
@@ -508,6 +532,7 @@ impl NodeState {
                     muted: false,
                     since: HashMap::new(),
                     last_nudge: None,
+                    last_ring: None,
                 });
                 self.emit_call(None);
             }
@@ -570,7 +595,9 @@ impl NodeState {
                 let c = self.call.as_mut().expect("ours");
                 if c.phase == Phase::Incoming {
                     if sender == c.caller {
+                        let id = c.call_id.clone();
                         self.call = None;
+                        self.remember_ended(&id);
                         self.emit_call(Some("missed call"));
                     }
                     return;
@@ -602,6 +629,7 @@ impl NodeState {
     /// haven't connected get another try.
     pub(crate) fn call_tick(&mut self) {
         self.retry_stuck_pairs();
+        self.resend_ring();
         let Some(c) = &self.call else { return };
         if c.started.elapsed() < RING_TIMEOUT {
             return;
@@ -609,7 +637,9 @@ impl NodeState {
         match c.phase {
             Phase::Outgoing => self.end_call("no answer"),
             Phase::Incoming => {
+                let id = c.call_id.clone();
                 self.call = None;
+                self.remember_ended(&id);
                 self.emit_call(Some("missed call"));
             }
             Phase::Active => {}
@@ -628,6 +658,23 @@ fn we_offer(me: &[u8], caller: &[u8], peer: &[u8]) -> bool {
 }
 
 impl NodeState {
+    /// While a call we started is still ringing, ring again every
+    /// `RING_RESEND`, in case the first one was lost.
+    fn resend_ring(&mut self) {
+        let Some(c) = self.call.as_mut() else { return };
+        if c.phase != Phase::Outgoing {
+            return;
+        }
+        let Some((sent, started_at)) = c.last_ring else { return };
+        if sent.elapsed() < RING_RESEND {
+            return;
+        }
+        c.last_ring = Some((Instant::now(), started_at));
+        let signal = CallSignal::Ring { video: c.video, key: c.key.clone(), turn: c.ring_turn.clone(), started_at };
+        let (gid, id) = (c.gid.clone(), c.call_id.clone());
+        let _ = self.send_call_signal(&gid, &id, signal);
+    }
+
     /// Call signals are live-only, so on a flaky link one can be lost and
     /// leave a pair of participants unconnected. After `STUCK`, whoever
     /// offers for that pair offers again (replacing any half-built

@@ -221,17 +221,33 @@ async fn a_channel_call_meshes_three_people_and_everyone_hears_everyone() {
             panic!("media never connected for everyone");
         }
     }
-    tokio::time::sleep(Duration::from_secs(3)).await;
     // Each person hears both others' tones in the mix, and not their own.
-    for (who, p, own, others) in [
+    // Measured over the last second, polled: on a starved CI machine a
+    // given second can have dropouts, so wait for a clean one.
+    let people = [
         ("alice", &alice, 440.0, [660.0, 880.0]),
         ("bob", &bob, 660.0, [440.0, 880.0]),
         ("carol", &carol, 880.0, [440.0, 660.0]),
-    ] {
-        for f in others {
-            assert!(share_at(&p.audio, f) > 0.15, "{who} hears {f} Hz: {}", share_at(&p.audio, f));
+    ];
+    let hears_right = |p: &Caller, own: f32, others: [f32; 2]| {
+        others.iter().all(|f| share_at(&p.audio, *f) > 0.15) && share_at(&p.audio, own) < 0.05
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    while !people.iter().all(|(_, p, own, others)| hears_right(p, *own, *others)) {
+        if tokio::time::Instant::now() > deadline {
+            for (who, p, own, others) in &people {
+                eprintln!(
+                    "{who}: own {own} Hz {:.2}, others {:?}",
+                    share_at(&p.audio, *own),
+                    others.iter().map(|f| (f, share_at(&p.audio, *f))).collect::<Vec<_>>()
+                );
+            }
+            panic!("not everyone heard both others (and only them)");
         }
-        assert!(share_at(&p.audio, own) < 0.05, "{who} doesn't hear herself");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    for (who, p, _, _) in &people {
         for s in p.node.call_stats().await.unwrap() {
             assert_eq!(s.local_candidate, "relay", "{who}: {s:?}");
             assert_eq!(s.remote_candidate, "relay", "{who}: {s:?}");
