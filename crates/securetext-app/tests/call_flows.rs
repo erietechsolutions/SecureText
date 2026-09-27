@@ -200,8 +200,8 @@ async fn a_channel_call_meshes_three_people_and_everyone_hears_everyone() {
     befriend(&alice.node, &bob.node).await;
     befriend(&alice.node, &carol.node).await;
     let server_id = alice.node.create_server("Club".into()).await.unwrap();
-    alice.node.invite_to_server(server_id.clone(), my_key(&bob.node).await).await.unwrap();
-    alice.node.invite_to_server(server_id.clone(), my_key(&carol.node).await).await.unwrap();
+    invite(&alice.node, &server_id, &my_key(&bob.node).await).await;
+    invite(&alice.node, &server_id, &my_key(&carol.node).await).await;
     let general_b = channel_named(&bob.node, &server_id, "general").await;
     let general_c = channel_named(&carol.node, &server_id, "general").await;
     let general = channel_named(&alice.node, &server_id, "general").await;

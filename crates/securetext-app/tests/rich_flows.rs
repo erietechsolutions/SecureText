@@ -161,8 +161,8 @@ async fn files_are_fetched_from_whoever_has_them_and_arrive_intact() {
     befriend(&alice, &bob).await;
     befriend(&alice, &carol).await;
     let server = alice.create_server("Club".into()).await.unwrap();
-    alice.invite_to_server(server.clone(), my_key(&bob).await).await.unwrap();
-    alice.invite_to_server(server.clone(), my_key(&carol).await).await.unwrap();
+    invite(&alice, &server, &my_key(&bob).await).await;
+    invite(&alice, &server, &my_key(&carol).await).await;
     let general = channel_named(&alice, &server, "general").await;
     channel_named(&bob, &server, "general").await;
     channel_named(&carol, &server, "general").await;

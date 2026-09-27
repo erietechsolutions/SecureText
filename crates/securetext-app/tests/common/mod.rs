@@ -116,3 +116,22 @@ pub async fn channel_named(node: &NodeHandle, server: &str, name: &str) -> Strin
     .await
 }
 
+
+/// Invite `key` into `server`, retrying while their fresh key packages are
+/// still on the way (they're sent just after the DM is set up, so a test
+/// that invites straight after `befriend` can get there first).
+pub async fn invite(node: &NodeHandle, server: &str, key: &str) {
+    let what = format!("invite {} into the server", &key[..8.min(key.len())]);
+    eventually(&what, || {
+        let node = node.clone();
+        let (server, key) = (server.to_string(), key.to_string());
+        async move {
+            match node.invite_to_server(server, key).await {
+                Ok(()) => Some(()),
+                Err(e) if e.to_string().contains("waiting on fresh keys") => None,
+                Err(e) => panic!("invite failed: {e:#}"),
+            }
+        }
+    })
+    .await
+}

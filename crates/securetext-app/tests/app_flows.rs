@@ -64,8 +64,8 @@ async fn server_channels_membership_and_kick() {
 
     let server = alice.create_server("Book Club".into()).await.unwrap();
     let general = channel_named(&alice, &server, "general").await;
-    alice.invite_to_server(server.clone(), bob_key.clone()).await.unwrap();
-    alice.invite_to_server(server.clone(), carol_key.clone()).await.unwrap();
+    invite(&alice, &server, &bob_key).await;
+    invite(&alice, &server, &carol_key).await;
 
     assert_eq!(channel_named(&bob, &server, "general").await, general);
     assert_eq!(channel_named(&carol, &server, "general").await, general);

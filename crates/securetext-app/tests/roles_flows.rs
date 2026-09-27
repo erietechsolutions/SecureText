@@ -39,7 +39,7 @@ async fn roles_delegate_server_management_and_everyone_agrees() {
     let (bob_key, carol_key, alice_key) = (my_key(&bob).await, my_key(&carol).await, my_key(&alice).await);
 
     let server = alice.create_server("Club".into()).await.unwrap();
-    alice.invite_to_server(server.clone(), bob_key.clone()).await.unwrap();
+    invite(&alice, &server, &bob_key).await;
     channel_named(&bob, &server, "general").await;
 
     // Bob, a plain member, can't invite yet.
@@ -70,7 +70,7 @@ async fn roles_delegate_server_management_and_everyone_agrees() {
 
     // Now Bob can invite Carol. She arrives already seeing the settings
     // made before she joined (they ride in the Welcome).
-    bob.invite_to_server(server.clone(), carol_key.clone()).await.unwrap();
+    invite(&bob, &server, &carol_key).await;
     let general_c = channel_named(&carol, &server, "general").await;
     let carols_view = settings_where(&carol, &server, "carol to see the settings", |s| s.name == "The Club").await;
     assert!(carols_view.roles.iter().any(|r| r.name == "Mod"));
@@ -179,8 +179,8 @@ async fn channel_rules_control_who_sees_and_does_what() {
     befriend(&alice, &carol).await;
     let (bob_key, carol_key) = (my_key(&bob).await, my_key(&carol).await);
     let server = alice.create_server("Club".into()).await.unwrap();
-    alice.invite_to_server(server.clone(), bob_key.clone()).await.unwrap();
-    alice.invite_to_server(server.clone(), carol_key.clone()).await.unwrap();
+    invite(&alice, &server, &bob_key).await;
+    invite(&alice, &server, &carol_key).await;
     let staff = alice.create_channel(server.clone(), "staff".into(), false, vec![]).await.unwrap();
     channel_named(&carol, &server, "staff").await;
     let general = channel_named(&alice, &server, "general").await;
@@ -238,6 +238,13 @@ async fn channel_rules_control_who_sees_and_does_what() {
     // Access back: Carol rejoins #staff and gets new messages there.
     alice.edit_server(server.clone(), vec![set(&format!("rules/channel/{staff}"), Vec::<Overwrite>::new())]).await.unwrap();
     removed_is(&carol, &staff, false).await;
+    // Bob posts once he's seen her added (a message sent before that is
+    // encrypted for the group as it was, without her).
+    eventually("bob to see carol back in #staff", || {
+        let (bob, staff, carol_key) = (bob.clone(), staff.clone(), carol_key.clone());
+        async move { bob.members(staff).await.ok()?.into_iter().any(|m| m.key == carol_key).then_some(()) }
+    })
+    .await;
     bob.post(staff.clone(), "welcome back".into(), None).await.unwrap();
     wait_for_message(&carol, &staff, "welcome back").await;
 }
