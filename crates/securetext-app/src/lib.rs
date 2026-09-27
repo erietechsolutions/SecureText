@@ -19,7 +19,11 @@
 //! The UI talks to it only through `NodeHandle`'s async methods, which
 //! return plain serializable view structs.
 
+#![forbid(unsafe_code)]
+
 pub mod api;
+#[cfg(fuzzing)]
+pub mod fuzzing;
 mod node;
 mod relay;
 mod store;
@@ -100,6 +104,19 @@ impl NodeConfig {
             call_allow_loopback: false,
         }
     }
+}
+
+/// Make a directory readable by its owner only (Unix). The profile's
+/// contents are encrypted, but their names, sizes and timestamps
+/// (attachments, Tor state) are nobody else's business.
+pub(crate) fn private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let _ = dir;
+    Ok(())
 }
 
 /// Whether a profile already exists in `profile_dir` (decides between the
@@ -228,6 +245,7 @@ impl NodeHandle {
     /// reported through [`Event::Network`] / [`StatusView::network`].
     pub async fn start(config: NodeConfig) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&config.profile_dir)?;
+        private_dir(&config.profile_dir)?;
         let identity_path = config.profile_dir.join(IDENTITY_FILE);
         let label = config.label.trim().to_string();
         let passphrase = config.passphrase.clone();

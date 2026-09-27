@@ -24,6 +24,8 @@
 //! `SHA-256(context || secret)`, so people who can deposit (anyone given
 //! the mailbox ID) can't read or delete what's there.
 
+#![forbid(unsafe_code)]
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

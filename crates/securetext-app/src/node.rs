@@ -48,6 +48,18 @@ const MAX_PEER_KEY_PACKAGES: u32 = 16;
 /// Messages for a group we can't process yet (typically: they belong to
 /// an epoch whose commit hasn't arrived yet), per group.
 const MAX_PENDING_PER_GROUP: usize = 256;
+/// Held-back MLS messages across all groups, by size and by number of
+/// distinct groups: a stranger can send frames for made-up groups.
+const MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PENDING_GROUPS: usize = 64;
+/// Contact cards presented by peers we don't know yet.
+const MAX_PRESENTED_CARDS: usize = 256;
+const PRESENTED_CARD_TTL: Duration = Duration::from_secs(3600);
+/// Inbound handshakes in progress at once, and live connections from
+/// peers who aren't contacts or co-members (someone mid-way through
+/// accepting our invite, or a stranger).
+const MAX_ACCEPTING: usize = 32;
+const MAX_UNKNOWN_CONNECTIONS: usize = 16;
 /// How many times a pending message is retried before it's dropped
 /// (a duplicate delivery will never succeed and shouldn't linger).
 const MAX_PENDING_TRIES: u8 = 8;
@@ -150,7 +162,7 @@ pub(crate) struct NodeState {
     public: PublicIdentity,
     member: Member<PersistentProvider<Connection>>,
     signer: SignatureKeyPair,
-    noise_private: Vec<u8>,
+    noise_private: zeroize::Zeroizing<Vec<u8>>,
     crypto: RustCrypto,
     store: Store,
     groups: HashMap<Vec<u8>, MlsGroup>,
@@ -166,7 +178,8 @@ pub(crate) struct NodeState {
     /// Cards presented by peers on connections they opened to us, for
     /// peers we don't know yet (they become known once they send a valid
     /// Welcome).
-    presented_cards: HashMap<Vec<u8>, SignedCard>,
+    presented_cards: HashMap<Vec<u8>, (SignedCard, Instant)>,
+    accepting: Arc<tokio::sync::Semaphore>,
     dialing: HashSet<Vec<u8>>,
     backoff: HashMap<Vec<u8>, (Instant, u32)>,
     pending: HashMap<Vec<u8>, Vec<Pending>>,
@@ -220,7 +233,7 @@ impl NodeState {
         let member_signer = identity
             .signing_key_pair(&public)?
             .ok_or_else(|| anyhow::anyhow!("identity store has no signing key"))?;
-        let noise_private = identity.noise_static_private_key()?;
+        let noise_private = zeroize::Zeroizing::new(identity.noise_static_private_key()?);
 
         let mut provider = PersistentProvider::new(Connection::open(identity.db_path())?);
         provider.run_migrations()?;
@@ -253,6 +266,7 @@ impl NodeState {
             my_relay,
             connections: HashMap::new(),
             presented_cards: HashMap::new(),
+            accepting: Arc::new(tokio::sync::Semaphore::new(MAX_ACCEPTING)),
             dialing: HashSet::new(),
             backoff: HashMap::new(),
             pending: HashMap::new(),
@@ -428,6 +442,40 @@ impl NodeState {
             }
         }
         self.seal_if_dirty();
+    }
+
+    // =====================================================================
+    // Fuzzing hooks (`--cfg fuzzing` only; see fuzzing.rs)
+    // =====================================================================
+
+    #[cfg(fuzzing)]
+    pub(crate) fn fuzz_set_onion(&mut self, onion: &str) {
+        self.my_onion = Some(onion.to_string());
+        let _ = self.refresh_my_card();
+    }
+
+    #[cfg(fuzzing)]
+    pub(crate) fn fuzz_key(&self) -> &[u8] {
+        self.my_key()
+    }
+
+    #[cfg(fuzzing)]
+    pub(crate) fn fuzz_take_outbox(&mut self, to: &[u8]) -> Vec<WireMessage> {
+        let rows = self.store.outbox_for(to).unwrap_or_default();
+        for row in &rows {
+            let _ = self.store.outbox_delivered(row.id, to);
+        }
+        rows.into_iter().map(|r| r.frame).collect()
+    }
+
+    #[cfg(fuzzing)]
+    pub(crate) fn fuzz_on_frame(&mut self, from: &[u8], message: WireMessage) -> anyhow::Result<()> {
+        self.on_frame(from, message)
+    }
+
+    #[cfg(fuzzing)]
+    pub(crate) fn fuzz_on_payload(&mut self, gid: &[u8], sender: &[u8], plaintext: &[u8]) -> anyhow::Result<()> {
+        self.on_payload(gid, sender, plaintext)
     }
 
     // =====================================================================
@@ -701,7 +749,15 @@ impl NodeState {
             let _ = self.store.upsert_peer(&row, Some(card));
             self.dirty = true;
         }
-        self.presented_cards.insert(from.to_vec(), card.clone());
+        // Anyone who can reach our onion address can present a card, so
+        // what's kept for strangers is bounded in time and number.
+        self.presented_cards.retain(|_, (_, at)| at.elapsed() < PRESENTED_CARD_TTL);
+        if self.presented_cards.len() >= MAX_PRESENTED_CARDS && !self.presented_cards.contains_key(from) {
+            if let Some(oldest) = self.presented_cards.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k.clone()) {
+                self.presented_cards.remove(&oldest);
+            }
+        }
+        self.presented_cards.insert(from.to_vec(), (card.clone(), Instant::now()));
     }
 
     pub(crate) fn set_relay(&mut self, link: Option<&str>) -> anyhow::Result<Option<String>> {
@@ -807,6 +863,9 @@ impl NodeState {
     }
 
     fn spawn_accept(&mut self, mut stream: BoxedStream) {
+        // A flood of connection attempts can't make us run unbounded
+        // handshakes: past the limit, new streams are dropped unanswered.
+        let Ok(permit) = self.accepting.clone().try_acquire_owned() else { return };
         let conn_id = self.next_id();
         let net_tx = self.net_tx.clone();
         let noise_private = self.noise_private.clone();
@@ -835,6 +894,7 @@ impl NodeState {
                 Ok::<_, anyhow::Error>((mux, mux_stream, card))
             })
             .await;
+            drop(permit);
             if let Ok(Ok((mux, stream, card))) = accepted {
                 let peer_key = card.card.mls_public_key.clone();
                 run_connection(mux, stream, peer_key, Some(card), conn_id, net_tx).await;
@@ -856,6 +916,15 @@ impl NodeState {
     ) {
         if peer_key == self.public.public_key {
             return; // someone replaying our own card; the Noise check makes this us, pointless
+        }
+        // Strangers get a handful of connections between them (enough for
+        // people accepting our invites); dropping `tx` closes the rest.
+        let known = |s: &Self, k: &[u8]| s.store.peer(k).ok().flatten().is_some();
+        if !known(self, &peer_key) && !self.connections.contains_key(&peer_key) {
+            let strangers = self.connections.keys().filter(|k| !known(self, k)).count();
+            if strangers >= MAX_UNKNOWN_CONNECTIONS {
+                return;
+            }
         }
         self.dialing.remove(&peer_key);
         self.backoff.remove(&peer_key);
@@ -1014,7 +1083,7 @@ impl NodeState {
         let sender_card = self
             .presented_cards
             .get(from)
-            .cloned()
+            .map(|(card, _)| card.clone())
             .or_else(|| roster.iter().find(|c| c.card.mls_public_key == from).cloned());
         if let Some(card) = sender_card {
             self.remember_card(&card, info.kind == ConversationKind::Dm)?;
@@ -1113,6 +1182,12 @@ impl NodeState {
 
     fn hold_pending(&mut self, gid: Vec<u8>, from: &[u8], message: Vec<u8>, tries: u8) {
         if tries >= MAX_PENDING_TRIES {
+            return;
+        }
+        let held: usize = self.pending.values().flatten().map(|p| p.message.len()).sum();
+        if held + message.len() > MAX_PENDING_BYTES
+            || (!self.pending.contains_key(&gid) && self.pending.len() >= MAX_PENDING_GROUPS)
+        {
             return;
         }
         let queue = self.pending.entry(gid).or_default();
@@ -1894,5 +1969,53 @@ mod tests {
         assert_eq!(bob.store.attachment(&file_id).unwrap().unwrap().state, "failed");
         assert!(!bob.attachment_path(&file_id, false).exists());
         assert!(!bob.attachment_path(&file_id, true).exists());
+    }
+
+    #[tokio::test]
+    async fn a_stranger_cannot_make_us_hold_unbounded_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut alice = offline_node(dir.path(), "alice");
+        let stranger = vec![7u8; 32];
+
+        // MLS frames for made-up groups: bounded in groups and bytes.
+        for i in 0..200u32 {
+            let gid = i.to_be_bytes().to_vec();
+            alice.on_frame(&stranger, WireMessage::Mls { group_id: gid, message: vec![0u8; 1024 * 1024] }).unwrap();
+        }
+        assert!(alice.pending.len() <= MAX_PENDING_GROUPS, "{} groups held", alice.pending.len());
+        let bytes: usize = alice.pending.values().flatten().map(|p| p.message.len()).sum();
+        assert!(bytes <= MAX_PENDING_BYTES, "{bytes} bytes held");
+
+        // Self-signed cards from ever-new identities: bounded.
+        for _ in 0..(MAX_PRESENTED_CARDS + 50) {
+            let signer = SignatureKeyPair::new(openmls_traits::types::SignatureScheme::ED25519).unwrap();
+            let card = ContactCard {
+                label: "x".into(),
+                mls_public_key: signer.to_public_vec(),
+                onion_address: "x.onion".into(),
+                noise_public_key: vec![1; 32],
+                relay: None,
+            };
+            let signed = SignedCard::sign(card, &signer).unwrap();
+            alice.accept_card(&signed.card.mls_public_key.clone(), &signed);
+        }
+        assert!(alice.presented_cards.len() <= MAX_PRESENTED_CARDS);
+
+        // Connections from strangers: capped. A known contact still gets in.
+        let mut keep = Vec::new();
+        for i in 0..(MAX_UNKNOWN_CONNECTIONS + 10) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            keep.push(rx);
+            alice.on_connected(vec![100 + i as u8; 32], None, 1000 + i as u64, tx);
+        }
+        assert_eq!(alice.connections.len(), MAX_UNKNOWN_CONNECTIONS);
+        let mut bob = offline_node(dir.path(), "bob");
+        let invite = alice.create_invite().unwrap();
+        bob.add_contact(&invite).unwrap();
+        let frames = take_frames(&mut bob, &alice);
+        deliver(&bob, &mut alice, frames);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        alice.on_connected(bob.my_key().to_vec(), None, 5000, tx);
+        assert!(alice.connections.contains_key(bob.my_key()), "contacts aren't subject to the stranger cap");
     }
 }

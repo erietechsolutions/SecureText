@@ -173,7 +173,7 @@ pub struct Heard {
 /// decode from anything else.
 pub fn analyse(samples: &[i16]) -> Option<Heard> {
     const BLOCK: usize = SAMPLE_RATE as usize / 100;
-    let blocks: Vec<&[i16]> = samples.chunks_exact(BLOCK).collect();
+    let blocks: Vec<&[i16]> = samples.as_chunks::<BLOCK>().0.iter().map(|b| b.as_slice()).collect();
     if blocks.is_empty() {
         return None;
     }

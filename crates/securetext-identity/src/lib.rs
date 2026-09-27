@@ -31,6 +31,8 @@
 //! `seal()` call loses that write (the on-disk copy is only ever as fresh as
 //! the last seal).
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 use argon2::Argon2;
@@ -45,6 +47,52 @@ use rand::RngCore;
 use rusqlite::Connection;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Where the decrypted working copy of the database lives while the
+/// profile is open.
+///
+/// - **Private.** The directory is created mode 0700 and the file 0600.
+///   `tempfile`'s default follows the umask (usually 0755), which made
+///   the working copy readable by other local users before Phase 9.
+/// - **Off disk where possible.** It's deleted on close, but a crash or
+///   power cut leaves it behind. So on Linux it goes under
+///   `$XDG_RUNTIME_DIR`, which is per-user, in memory (tmpfs) and wiped at
+///   logout. Elsewhere it falls back to the system temp directory; Windows'
+///   %TEMP% is on disk (docs/audit/README.md).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
+fn working_dir() -> std::io::Result<tempfile::TempDir> {
+    let builder = {
+        let mut b = tempfile::Builder::new();
+        b.prefix("securetext-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            b.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        b
+    };
+    if cfg!(target_os = "linux") {
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            if runtime.is_absolute() && runtime.is_dir() {
+                if let Ok(dir) = builder.tempdir_in(&runtime) {
+                    return Ok(dir);
+                }
+            }
+        }
+    }
+    builder.tempdir()
+}
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -154,8 +202,11 @@ impl IdentityStore {
         rand::thread_rng().fill_bytes(&mut salt);
         let session_key = derive_key(passphrase, &salt)?;
 
-        let tmp_dir = tempfile::tempdir()?;
+        let tmp_dir = working_dir()?;
         let tmp_db_path = tmp_dir.path().join("identity.db");
+        // Created empty and private first, so SQLite (and the journal
+        // files it derives from it) never have a wider mode.
+        write_private(&tmp_db_path, &[])?;
         let mut connection = Connection::open(&tmp_db_path)?;
         run_migrations(&mut connection)?;
         create_meta_table(&connection)?;
@@ -205,9 +256,9 @@ impl IdentityStore {
             .decrypt(Nonce::from_slice(&on_disk.nonce), on_disk.ciphertext.as_ref())
             .map_err(|_| IdentityError::Crypto)?;
 
-        let tmp_dir = tempfile::tempdir()?;
+        let tmp_dir = working_dir()?;
         let tmp_db_path = tmp_dir.path().join("identity.db");
-        std::fs::write(&tmp_db_path, &plaintext_db_bytes)?;
+        write_private(&tmp_db_path, &plaintext_db_bytes)?;
 
         let connection = Connection::open(&tmp_db_path)?;
         let public = read_meta(&connection)?.ok_or(IdentityError::NoIdentity)?;
@@ -490,6 +541,47 @@ struct OnDiskFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for a Phase 9 finding: the decrypted working copy
+    /// used to sit in a 0755 directory, readable by every local user.
+    #[cfg(unix)]
+    #[test]
+    fn the_decrypted_working_copy_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("id.enc");
+        let (mut store, _) = IdentityStore::create(&path, "alice", "correct horse").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(store.db_path().parent().unwrap()), 0o700, "working directory (new profile)");
+        assert_eq!(mode(store.db_path()) & 0o077, 0, "working copy (new profile)");
+        store.seal().unwrap();
+        drop(store);
+        let (store, _) = IdentityStore::open(&path, "correct horse").unwrap();
+        assert_eq!(mode(store.db_path().parent().unwrap()), 0o700, "working directory");
+        assert_eq!(mode(store.db_path()) & 0o077, 0, "working copy must not be group/world readable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_plaintext_working_copy_lives_in_the_runtime_dir_when_there_is_one() {
+        // XDG_RUNTIME_DIR is process-wide; this test sets it only for
+        // the duration of one call, so it doesn't race other tests.
+        let runtime = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY-free: `set_var` is only unsafe in edition 2024.
+        std::env::set_var("XDG_RUNTIME_DIR", runtime.path());
+        let dir = working_dir().unwrap();
+        match previous {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        assert!(dir.path().starts_with(runtime.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+    }
 
     #[test]
     fn create_seal_reopen_round_trip() {

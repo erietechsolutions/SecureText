@@ -16,7 +16,7 @@ this is a security-sensitive project where shortcuts compound.
 | 6 | Desktop installers & auto-updates | ✅ Built and verified locally · CI install runs and first signed release pending |
 | 7 | Voice & video (the disclosed exception) | ✅ Built · verified via GUI with live-Tor signaling · real devices/networks pending |
 | 8 | Rich features | ✅ Built · verified via the GUI over live Tor |
-| 9 | Hardening & third-party audit | Not started · required before any production claim |
+| 9 | Hardening & third-party audit | 🟡 Internal hardening + audit prep done · **independent audit not done** · required before any production claim |
 | 10 | Mobile core compatibility | Not started |
 | 11 | Android app, export & updates | Not started |
 
@@ -697,19 +697,75 @@ Feature checklist and per-feature metadata review: feature-parity.md.
   Not built yet: editing/deleting, mentions, notifications, search, pins,
   custom roles and multi-device.
 
-## Phase 9 — Hardening & Third-Party Audit
-- Independent security audit covering: the crypto implementation and
-  protocol composition (MLS-for-1:1 included, since it's a less-common
-  usage pattern than MLS-for-groups-only), and the Tor integration
-  specifically (onion-service key handling, bridge configuration, the
-  Phase 7 calls exception's actual exposure). The **update and release
-  chain from Phase 6** is in scope too: signing-key handling, update
-  verification, and Tor-only update fetching. A compromised updater
-  bypasses every other protection.
-- Address findings before any "production-ready" claim is made.
+## Phase 9 — Hardening & Third-Party Audit *(hardening and audit preparation done; the independent audit has not happened)*
+The audit package: audit/README.md (scope in priority order, a map from
+each threat to the code that defends it, our own findings, and open
+questions).
+- [ ] **Independent security audit** of:
+  - the crypto implementation and protocol composition (MLS for 1:1
+    included, since it's a less common use of MLS than groups only);
+  - the Tor integration (onion-service key handling, bridge
+    configuration);
+  - the Phase 7 calls exception's actual exposure;
+  - **the update and release chain from Phase 6**: signing-key handling,
+    update verification, and Tor-only update fetching. A compromised
+    updater bypasses every other protection.
+  
+  **Not done. Only an outside party can do it.** Everything below
+  prepares for it.
+- [ ] Address the audit's findings before any "production-ready" claim is
+      made.
+- [x] **Internal hardening pass** (audit/README.md §4). **Ten findings,
+      nine fixed, one mitigated.** Each fix has a regression test, and the
+      key ones were mutation-checked.
+  - **P9-01 (High), fixed.** The decrypted working copy of the profile
+    database sat in a **0755** directory. `tempfile` follows the umask, so
+    any other local user could read the keys and history while the app was
+    unlocked. It's now 0700/0600.
+  - **P9-02, mitigated.** That working copy now lives in
+    `$XDG_RUNTIME_DIR` (tmpfs) on Linux, so a crash doesn't leave
+    plaintext on disk. Still open on Windows.
+  - **Denial of service by anyone who can reach an onion address, fixed:**
+    - yamux defaults allowed about 1 GiB of buffering per connection
+      (now 4 streams / 16 MiB);
+    - messages held for unknown groups were unbounded (now 64 groups /
+      32 MiB);
+    - inbound handshakes and stranger connections were unlimited (now
+      32 / 16);
+    - presented cards from strangers were kept forever;
+    - the relay had no connection cap (now 256).
+  - **Onion-only dialing:** `securetext_net::dial` now refuses anything
+    but a well-formed v3 onion address, so a contact can't point us at a
+    clearnet host.
+  - **Smaller items:** an invite-link length cap, and owner-only profile
+    and attachment directories.
+- [x] **Coverage-guided fuzzing** (`fuzz/`, libFuzzer + AddressSanitizer)
+      with six targets:
+  - frames and payloads;
+  - a live node taking any input from a stranger or a contact, including
+    every MLS payload handler;
+  - decrypted relay envelopes;
+  - invites and the relay protocol;
+  - the update manifest;
+  - call media.
+  
+  Ten minutes each, **tens of millions of executions, no crashes or
+  panics**. Runs weekly in CI (`fuzz.yml`).
+- [x] **Code and supply chain:**
+  - `#![forbid(unsafe_code)]` in every crate (there was no `unsafe` to
+    remove);
+  - clippy clean in both workspaces;
+  - `cargo-deny` clean in both, in CI, with every remaining notice
+    justified in `deny.toml`;
+  - HTML escaping reviewed across the UI.
+  
+  Earlier phases' dependency fixes: rustls RUSTSEC-2026-0285 and
+  `audiopus_sys`.
 - **Exit criteria:** audit complete, critical/high findings remediated.
-  **This phase is not optional and should not be skipped or compressed
-  under schedule pressure** — see crypto-spec.md §8.
+  **Not met: no independent audit has been done.** The one High finding
+  from the internal review is fixed. **This phase is not optional and
+  should not be skipped or compressed under schedule pressure** (see
+  crypto-spec.md §8).
 
 ## Phase 10 — Mobile Core Compatibility
 Goal: make the Rust core run correctly on mobile before building a mobile

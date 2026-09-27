@@ -150,6 +150,17 @@ pub(crate) fn seal(
     Ok(blob)
 }
 
+/// Fuzzing only: seal arbitrary bytes as if they were an envelope, so the
+/// fuzzer controls what `open` sees after decryption.
+#[cfg(fuzzing)]
+pub(crate) fn seal_raw_for_fuzzing(mine: &MyRelay, plaintext: &[u8]) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&mine.key));
+    let nonce = [0u8; 12];
+    let mut blob = nonce.to_vec();
+    blob.extend(cipher.encrypt(Nonce::from_slice(&nonce), AeadPayload { msg: plaintext, aad: &mine.mailbox }).unwrap());
+    blob
+}
+
 /// Open a blob from our own mailbox. Returns the verified sender card and
 /// the frames they sent us.
 pub(crate) fn open(

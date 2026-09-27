@@ -11,9 +11,10 @@ RFC 9420). Voice/video calls (planned) are the one explicit, disclosed
 exception to the anonymity guarantee — see
 [docs/threat-model.md](docs/threat-model.md).
 
-> **Pre-audit software.** The independent security audit (roadmap Phase 9)
-> hasn't happened yet. Don't rely on SecureText for anything that matters
-> until it has.
+> **Pre-audit software.** The project has done its own hardening pass
+> (docs/audit/README.md), but the independent security audit (roadmap
+> Phase 9) hasn't happened yet. Don't rely on SecureText for anything
+> that matters until it has.
 
 ## Status
 
@@ -28,7 +29,7 @@ exception to the anonymity guarantee — see
 | 6 | Desktop installers & auto-updates | ✅ Built and verified locally · first signed release pending |
 | 7 | Voice & video | ✅ Built · verified via the GUI · real devices/networks pending |
 | 8 | Rich features (files, reactions, threads…) | ✅ Verified through the GUI over live Tor |
-| 9 | Hardening & third-party audit | Not started |
+| 9 | Hardening & third-party audit | 🟡 Internal hardening done · **independent audit not done** |
 | 10 | Mobile core compatibility | Not started |
 | 11 | Android app, export & updates | Not started |
 
@@ -121,7 +122,8 @@ delivery pastes a relay address into the app (⚙ next to their name).
 ```sh
 cargo test --workspace                           # unit + integration tests (in-memory network)
 cargo test -p securetext-net -- --ignored        # live Tor tests (needs network access)
-python3 desktop/e2e/gui_e2e.py --binary desktop/target/debug/securetext-desktop [--relay securetext-relay1:…]
+python3 desktop/e2e/gui_e2e.py --binary desktop/target/debug/securetext-desktop [--turn …] [--relay securetext-relay1:…]
+cargo +nightly fuzz run node_input -- -max_total_time=600   # coverage-guided fuzzing (six targets in fuzz/)
 ```
 
 The last one drives two real app windows through WebDriver over live Tor.
@@ -140,7 +142,8 @@ running it headlessly.
 - `crates/securetext-call`: call engine (relay-only WebRTC, Opus, per-call media key) and `securetext-turn`
 - `crates/securetext-cli`: proof-of-integration CLI and live-Tor demos
 - `desktop/`: Tauri desktop client (own Cargo workspace), its web UI, and the GUI end-to-end test
-- `packaging/`, `scripts/`, `.github/workflows/`: installers, relay packaging, release pipeline
+- `packaging/`, `scripts/`, `.github/workflows/`: installers, relay packaging, release pipeline, CI and fuzzing
+- `fuzz/`: coverage-guided fuzz targets (nightly, cargo-fuzz)
 
 ## Supported platforms
 
@@ -163,6 +166,7 @@ See [docs/platform-support.md](docs/platform-support.md) for details.
 - [docs/platform-support.md](docs/platform-support.md) — supported platforms, packaging and CI notes
 - [docs/releasing.md](docs/releasing.md) — installers, the release pipeline, and signing updates
 - [docs/feature-parity.md](docs/feature-parity.md) — the Discord-like feature checklist and what each feature reveals
+- [docs/audit/README.md](docs/audit/README.md) — audit preparation: scope, threat-to-code map, internal findings, open questions
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and verification status
 
 ## License

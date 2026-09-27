@@ -1,0 +1,58 @@
+# Coverage-guided fuzzing (roadmap Phase 9). Needs nightly and cargo-fuzz:
+#   cargo +nightly fuzz run node_input -- -max_total_time=600
+# Kept out of the main workspace so normal builds don't need nightly.
+[package]
+name = "securetext-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+securetext-app = { path = "../crates/securetext-app" }
+securetext-invite = { path = "../crates/securetext-invite" }
+securetext-relay = { path = "../crates/securetext-relay" }
+securetext-update = { path = "../crates/securetext-update" }
+securetext-call = { path = "../crates/securetext-call" }
+serde_json = "1"
+
+[workspace]
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "relay_envelope"
+path = "fuzz_targets/relay_envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "node_input"
+path = "fuzz_targets/node_input.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "invite_and_relay"
+path = "fuzz_targets/invite_and_relay.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "update_manifest"
+path = "fuzz_targets/update_manifest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "call_media"
+path = "fuzz_targets/call_media.rs"
+test = false
+doc = false

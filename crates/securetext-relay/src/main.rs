@@ -9,12 +9,16 @@
 //! `/var/lib/securetext-relay/address`). The relay never opens a clearnet
 //! listener.
 
+#![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use securetext_relay::{server, Limits, RelayAddress, RelayStore};
 
 const NICKNAME: &str = "securetext-relay";
+/// Connections served at once. Past this, new ones are dropped straight
+/// away, so a flood of connections can't exhaust the relay's memory.
+const MAX_CONNECTIONS: usize = 256;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -56,12 +60,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         match listener.accept_next().await {
             Ok(Some(stream)) => {
+                let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
                 let store = store.clone();
                 let key = noise_private.clone();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     // Errors here are per-connection (a client going away
                     // mid-request); they don't affect the relay.
                     let _ = server::serve_connection(stream, &key, store).await;

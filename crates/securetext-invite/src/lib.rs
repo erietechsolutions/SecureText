@@ -19,6 +19,8 @@
 //! matches how Signal/Session/Cwtch-style invite mechanisms work; it is
 //! not a new trust model invented here.
 
+#![forbid(unsafe_code)]
+
 use serde::{Deserialize, Serialize};
 
 const SCHEME_PREFIX: &str = "securetext1:";
@@ -104,6 +106,8 @@ mod as_base64 {
     }
 }
 
+const MAX_LINK_LEN: usize = 16 * 1024;
+
 impl Invite {
     /// Encode as a single shareable string.
     pub fn to_link(&self) -> String {
@@ -116,6 +120,10 @@ impl Invite {
     /// Parse a string previously produced by [`Invite::to_link`].
     pub fn from_link(link: &str) -> Result<Self, InviteError> {
         use base64::Engine;
+        // Real links are well under 2 KiB; don't decode megabytes of paste.
+        if link.len() > MAX_LINK_LEN {
+            return Err(InviteError::Malformed("too long to be an invite link".into()));
+        }
         let encoded = link.strip_prefix(SCHEME_PREFIX).ok_or(InviteError::WrongScheme)?;
         let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(encoded.trim())

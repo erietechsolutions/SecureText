@@ -1,8 +1,7 @@
 //! The one entry point a UI shell uses to call into a node: a command name
 //! plus JSON arguments in, JSON out. The Tauri shell exposes exactly this
-//! as a single command, so whatever frontend code runs against it runs
-//! against the same dispatch table everywhere, including the
-//! browser-based dev harness (`examples/web_harness.rs`).
+//! as a single command, so any frontend runs against the same dispatch
+//! table.
 //!
 //! Argument names are camelCase, matching what Tauri's JS `invoke`
 //! convention produces.

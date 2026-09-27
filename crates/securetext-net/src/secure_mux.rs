@@ -57,12 +57,16 @@ impl SecureMux {
     /// (Noise initiator) and [`yamux::Mode::Server`] on the side that
     /// accepted the connection (Noise responder) -- yamux's stream-ID
     /// allocation scheme depends on the two ends agreeing on this.
+    /// Maximum logical streams per connection. SecureText's protocols use
+    /// one; the rest is headroom, not an invitation.
+    pub const MAX_STREAMS: usize = 4;
+
     pub fn new<S>(raw_stream: S, noise: NoiseTransport, mode: yamux::Mode) -> Self
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let pipe_end = spawn_noise_pump(raw_stream, noise);
-        let mut connection = yamux::Connection::new(pipe_end.compat(), yamux::Config::default(), mode);
+        let mut connection = yamux::Connection::new(pipe_end.compat(), mux_config(), mode);
 
         let (open_tx, mut open_rx) =
             mpsc::unbounded_channel::<oneshot::Sender<Result<yamux::Stream, NetError>>>();
@@ -239,9 +243,40 @@ async fn read_length_prefixed<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::
     Ok(buf)
 }
 
+/// yamux's defaults (512 streams, a 1 GiB receive window per connection)
+/// suit a general-purpose multiplexer, not one facing anonymous peers:
+/// anyone who can reach an onion address could make us buffer up to a
+/// gigabyte per connection in streams nobody reads. Four streams and
+/// 16 MiB is ample for one peer-protocol or relay stream carrying frames
+/// of at most 4 MiB.
+fn mux_config() -> yamux::Config {
+    let mut config = yamux::Config::default();
+    config.set_max_num_streams(SecureMux::MAX_STREAMS);
+    config.set_max_connection_receive_window(Some(16 * 1024 * 1024));
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_connection_carries_at_most_max_streams() {
+        let (mut client_raw, mut server_raw) = tokio::io::duplex(1 << 20);
+        let keys = || snow::Builder::new(crate::noise::NOISE_PATTERN.parse().unwrap()).generate_keypair().unwrap();
+        let (ck, sk) = (keys(), keys());
+        let (c, s) = tokio::join!(
+            crate::noise::handshake_initiator(&mut client_raw, &ck.private),
+            crate::noise::handshake_responder(&mut server_raw, &sk.private)
+        );
+        let client = SecureMux::new(client_raw, c.unwrap().0, yamux::Mode::Client);
+        let _server = SecureMux::new(server_raw, s.unwrap().0, yamux::Mode::Server);
+        let mut open = Vec::new();
+        for _ in 0..SecureMux::MAX_STREAMS {
+            open.push(client.open().await.expect("within the limit"));
+        }
+        assert!(client.open().await.is_err(), "one stream past the limit is refused");
+    }
 
     /// Local-only correctness proof: two `SecureMux`es over an in-memory
     /// duplex pipe (standing in for the Noise-encrypted onion-service

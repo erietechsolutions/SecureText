@@ -26,9 +26,14 @@ base64.workspace = true
 rand.workspace = true
 chacha20poly1305.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
 directories = "6"
 anyhow.workspace = true
 thiserror.workspace = true
+
+# Only for the fuzzing entry points (`--cfg fuzzing`, see fuzz/).
+[target.'cfg(fuzzing)'.dependencies]
+tempfile.workspace = true
 
 [dev-dependencies]
 securetext-update = { path = "../securetext-update", features = ["test-support"] }
@@ -37,3 +42,6 @@ tempfile.workspace = true
 snow.workspace = true
 base64.workspace = true
 rusqlite.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

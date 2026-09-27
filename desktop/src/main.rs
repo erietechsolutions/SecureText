@@ -4,6 +4,7 @@
 //! across. All application logic lives in `securetext-app`, and all
 //! commands the UI can run go through `securetext_app::api::dispatch`.
 
+#![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;

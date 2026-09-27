@@ -30,6 +30,7 @@
 //! identity and Tor state directory (`--dir`), so the onion address stays
 //! stable across runs and an invite printed once remains valid later.
 
+#![forbid(unsafe_code)]
 use rusqlite::Connection;
 use securetext_crypto::{Member, PersistentProvider};
 use securetext_identity::IdentityStore;
@@ -988,7 +989,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn from_hex(s: &str) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(s.len() % 2 == 0, "hex string must have an even length");
+    anyhow::ensure!(s.len().is_multiple_of(2), "hex string must have an even length");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(anyhow::Error::from))

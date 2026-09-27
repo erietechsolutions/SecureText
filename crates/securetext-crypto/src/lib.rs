@@ -9,6 +9,8 @@
 //! created, joined via Welcome, and used to exchange authenticated,
 //! forward-secret application messages.
 
+#![forbid(unsafe_code)]
+
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;

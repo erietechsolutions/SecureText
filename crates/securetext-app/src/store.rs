@@ -98,6 +98,9 @@ pub struct AttachmentRow {
     pub received: u64,
 }
 
+/// An expired message: (conversation, message id, attachment id).
+pub type Expired = (Vec<u8>, String, Option<String>);
+
 pub struct OutboxRow {
     pub id: i64,
     pub frame: WireMessage,
@@ -402,11 +405,11 @@ impl Store {
     /// Delete every message whose time is up, with its reactions and
     /// attachment records. Returns (conversation, message id, attachment)
     /// for each, so the caller can remove attachment files and tell the UI.
-    pub fn delete_expired(&self, now: i64) -> anyhow::Result<Vec<(Vec<u8>, String, Option<String>)>> {
+    pub fn delete_expired(&self, now: i64) -> anyhow::Result<Vec<Expired>> {
         let mut stmt = self.conn.prepare(
             "SELECT group_id, id, attachment FROM app_messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
         )?;
-        let gone: Vec<(Vec<u8>, String, Option<String>)> = stmt
+        let gone: Vec<Expired> = stmt
             .query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<Result<_, _>>()?;
         for (gid, id, attachment) in &gone {

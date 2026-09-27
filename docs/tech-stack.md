@@ -505,6 +505,23 @@ state through the app's own API when a step fails.
   --no-documents-portal`). Clean up by exact process name. `pkill -f` on a
   pattern also matches the shell running it.
 
+## Phase 9 implementation findings
+
+- **`tempfile::tempdir()` doesn't make private directories.** It follows
+  the umask (usually giving 0755). The profile's decrypted working copy
+  lived in one from Phase 1 on, readable by other local users (finding
+  P9-01, audit/README.md). Use `tempfile::Builder::permissions(0o700)`,
+  and create sensitive files 0600 before anything else opens them.
+- **yamux's defaults are for trusted peers:** 512 streams and a 1 GiB
+  receive window per connection. Anything facing anonymous peers should
+  set `max_num_streams` and `max_connection_receive_window` (P9-03).
+- **Fuzzing through the AEAD and MLS layers** needs entry points that skip
+  them. They're compiled only under `--cfg fuzzing`
+  (`securetext-app/src/fuzzing.rs`) and declared in `[lints.rust]
+  unexpected_cfgs`, so normal builds don't warn. Target-specific
+  dependencies (`[target.'cfg(fuzzing)'.dependencies]`) keep fuzz-only
+  crates out of normal builds.
+
 ## Standing rule: crypto/network-adjacent dependency vetting
 
 Prompted by how noisy a crates.io search for Signal-protocol-adjacent

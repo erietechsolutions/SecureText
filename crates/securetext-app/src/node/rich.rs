@@ -343,6 +343,7 @@ impl NodeState {
         rand::rngs::OsRng.fill_bytes(&mut key);
         let ciphertext = encrypt_file(&key, &file_id, data)?;
         std::fs::create_dir_all(&self.rich.attachments_dir)?;
+        crate::private_dir(&self.rich.attachments_dir)?;
         std::fs::write(self.attachment_path(&file_id, false), &ciphertext)?;
         // Only trust a MIME type we can confirm; anything else is opaque.
         let mime = match sniff_image(data) {
@@ -617,6 +618,7 @@ impl NodeState {
             return Ok(());
         }
         std::fs::create_dir_all(&self.rich.attachments_dir)?;
+        crate::private_dir(&self.rich.attachments_dir)?;
         std::fs::File::create(self.attachment_path(file_id, true))?;
         self.store.set_attachment_progress(file_id, "downloading", 0)?;
         self.rich.downloads.insert(file_id.to_string(), Download { source: None, asked: None, tried: Vec::new() });

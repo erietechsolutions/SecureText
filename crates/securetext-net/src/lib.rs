@@ -10,6 +10,8 @@
 //! network should be done on an unrestricted machine as part of Phase 1's
 //! exit criteria, not assumed from a passing compile.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use arti_client::{config::onion_service::OnionServiceConfigBuilder, TorClient, TorClientConfig};
@@ -234,8 +236,25 @@ impl Listener {
 /// address if ever needed; SecureText uses a single fixed port for its
 /// protocol.
 pub async fn dial(client: &Client, onion_address: &str, port: u16) -> Result<DataStream, NetError> {
+    // Addresses come from other people (invite links, contact cards, relay
+    // addresses). Without this check, a contact could name a clearnet host
+    // and have us reach it through a Tor exit. Messaging is onion-only by
+    // design, so anything else is refused here, the one place every
+    // messaging connection passes through.
+    if !is_v3_onion(onion_address) {
+        return Err(NetError::Config(format!("not a v3 onion address: {onion_address:.80}")));
+    }
     let stream = client.connect((onion_address, port)).await?;
     Ok(stream)
+}
+
+/// A syntactically valid Tor v3 onion address: 56 base32 characters (the
+/// last one encoding version 3), then `.onion`.
+pub fn is_v3_onion(address: &str) -> bool {
+    let Some(label) = address.strip_suffix(".onion") else { return false };
+    label.len() == 56
+        && label.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
+        && label.ends_with('d')
 }
 
 pub use arti_client::IsolationToken;
@@ -262,6 +281,17 @@ pub async fn connect_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_v3_onion_addresses_are_dialable() {
+        assert!(is_v3_onion("e4tlats24pehr4x62iivdluvdnj5i2ux7zesxpk4mvcovcrg2yzg5oad.onion"));
+        assert!(!is_v3_onion("example.com"), "clearnet host");
+        assert!(!is_v3_onion("github.com.onion"), "wrong length");
+        assert!(!is_v3_onion("E4TLATS24PEHR4X62IIVDLUVDNJ5I2UX7ZESXPK4MVCOVCRG2YZG5OAD.onion"), "uppercase");
+        assert!(!is_v3_onion("e4tlats24pehr4x62iivdluvdnj5i2ux7zesxpk4mvcovcrg2yzg5oa1.onion"), "not base32");
+        assert!(!is_v3_onion("e4tlats24pehr4x62iivdluvdnj5i2ux7zesxpk4mvcovcrg2yzg5oad.onion.evil.com"));
+        assert!(!is_v3_onion("expyuzz4wqqyqhjn.onion"), "v2");
+    }
 
     /// This test requires real, unrestricted internet access to the Tor
     /// network and is skipped by default in sandboxed/CI environments where

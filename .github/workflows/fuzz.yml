@@ -1,0 +1,37 @@
+# Coverage-guided fuzzing (roadmap Phase 9): every fuzz target for a few
+# minutes, weekly and on demand. Crashes fail the run and the reproducing
+# inputs are kept as artifacts.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target"
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wire, node_input, relay_envelope, invite_and_relay, update_manifest, call_media]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev cmake
+      - run: cargo install --locked cargo-fuzz
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ inputs.seconds || 300 }} -rss_limit_mb=4096 -max_len=65536
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: fuzz/artifacts/

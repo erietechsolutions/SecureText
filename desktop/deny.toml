@@ -1,0 +1,43 @@
+# cargo-deny policy for the desktop shell's workspace (CI: .github/workflows/ci.yml).
+# Same rules as the root deny.toml, plus the Tauri/GTK stack's notices.
+# Checked: known vulnerabilities (RustSec), yanked crates, and that every
+# dependency comes from crates.io.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+# Each ignore says why it doesn't apply. Revisit on every dependency bump.
+ignore = [
+    # rsa: Marvin timing attack on RSA *private-key* operations. arti only
+    # uses RSA to verify Tor relays' legacy identity signatures (public-key
+    # operations); SecureText holds no RSA private keys. No fixed version.
+    { id = "RUSTSEC-2023-0071", reason = "only RSA public-key verification inside arti; no private-key operations" },
+    # paste / proc-macro-error2: unmaintained compile-time macro helpers
+    # pulled in transitively (arti, openmls). No runtime code, no fix.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro crate, transitive, no runtime exposure" },
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time macro crate, transitive, no runtime exposure" },
+    # Tauri's GTK 3 stack: glib-macros (proc-macro-error, build time only).
+    { id = "RUSTSEC-2024-0370", reason = "build-time proc macro helper of glib-macros (gtk-rs 0.18, via Tauri); no runtime code" },
+    # unic-*: Unicode tables used by urlpattern inside tauri-utils, for
+    # matching the app's own capability URLs. No untrusted input reaches
+    # them; revisit when Tauri moves off urlpattern 0.3.
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range via tauri-utils/urlpattern; unmaintained, no known vulnerability" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common via tauri-utils/urlpattern; unmaintained, no known vulnerability" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property via tauri-utils/urlpattern; unmaintained, no known vulnerability" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version via tauri-utils/urlpattern; unmaintained, no known vulnerability" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident via tauri-utils/urlpattern; unmaintained, no known vulnerability" },
+]
+
+[bans]
+# Duplicate versions are common in a tree this size (arti, openmls);
+# report them without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
