@@ -33,7 +33,7 @@ on:
         type: boolean
         default: false
       dev_tag:
-        description: "Publish a dev build as a GitHub pre-release under this tag (e.g. dev-1.0). No update manifest: installed copies are never offered it"
+        description: "Publish a dev build as a GitHub pre-release under this tag (\"auto\" = dev-<run number>). Dev builds update only from later dev builds, via the dev-channel feed"
         type: string
         default: ""
 
@@ -42,6 +42,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Dev builds: channel and version baked into the app (desktop/src/main.rs).
+  # Each dev build's version is higher than the last (the run number), so
+  # dev installs update from one to the next.
+  SECURETEXT_CHANNEL: ${{ inputs.dev_tag != '' && 'dev' || 'stable' }}
+  DEV_N: ${{ inputs.dev_tag != '' && github.run_number || '' }}
+  DEV_TAG: ${{ inputs.dev_tag == 'auto' && format('dev-{0}', github.run_number) || inputs.dev_tag }}
 
 jobs:
   version:
@@ -81,7 +87,7 @@ jobs:
   build-linux:
     name: build .deb / .AppImage / relay .deb
     if: ${{ !inputs.fedora_only }}
-    needs: test
+    needs: [version, test]
     # The oldest supported Ubuntu, so the packages' glibc and library
     # dependencies are satisfiable on every supported Ubuntu.
     runs-on: ubuntu-22.04
@@ -103,7 +109,15 @@ jobs:
         run: cargo install --locked tauri-cli --version "^2" && cargo install --locked cargo-deb
       - name: Desktop installers
         working-directory: desktop
-        run: cargo tauri build --bundles deb,appimage
+        shell: bash
+        run: |
+          base=$(python3 -c "import json; print(json.load(open('tauri.conf.json'))['version'])")
+          extra=()
+          if [ -n "$DEV_N" ]; then
+            export SECURETEXT_BUILD_VERSION="$base-dev.$DEV_N"
+            extra=(--config "{\"version\":\"$SECURETEXT_BUILD_VERSION\"}")
+          fi
+          cargo tauri build --bundles deb,appimage "${extra[@]}"
       - name: Relay package and TURN server
         run: |
           cargo deb -p securetext-relay
@@ -130,7 +144,7 @@ jobs:
     steps:
       - name: System dependencies
         run: |
-          dnf install -y git gcc gcc-c++ make perl pkgconf-pkg-config openssl-devel \
+          dnf install -y git gcc gcc-c++ make perl python3 pkgconf-pkg-config openssl-devel \
             webkit2gtk4.1-devel libsoup3-devel gtk3-devel librsvg2-devel rpm-build alsa-lib-devel cmake
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -143,7 +157,17 @@ jobs:
         run: cargo install --locked tauri-cli --version "^2" && cargo install --locked cargo-generate-rpm
       - name: Desktop installer
         working-directory: desktop
-        run: cargo tauri build --bundles rpm
+        shell: bash
+        run: |
+          base=$(python3 -c "import json; print(json.load(open('tauri.conf.json'))['version'])")
+          extra=()
+          if [ -n "$DEV_N" ]; then
+            # RPM versions can't hold a pre-release; the release field does
+            # (0.dev.N sorts below a full release's 1, and up with N).
+            export SECURETEXT_BUILD_VERSION="$base-dev.$DEV_N"
+            extra=(--config "{\"bundle\":{\"linux\":{\"rpm\":{\"release\":\"0.dev.$DEV_N\"}}}}")
+          fi
+          cargo tauri build --bundles rpm "${extra[@]}"
       - name: Relay package
         run: cargo build --release --locked -p securetext-relay && cargo generate-rpm -p crates/securetext-relay
       - name: Collect
@@ -175,7 +199,16 @@ jobs:
         run: cargo install --locked tauri-cli --version "^2"
       - name: Desktop installers
         working-directory: desktop
-        run: cargo tauri build --bundles nsis,msi
+        shell: bash
+        run: |
+          base=$(python3 -c "import json; print(json.load(open('tauri.conf.json'))['version'])")
+          if [ -n "$DEV_N" ]; then
+            # MSI needs purely numeric versions, so dev builds ship NSIS only.
+            export SECURETEXT_BUILD_VERSION="$base-dev.$DEV_N"
+            cargo tauri build --bundles nsis
+          else
+            cargo tauri build --bundles nsis,msi
+          fi
       # Authenticode signing (so SmartScreen doesn't block the installer)
       # needs a code-signing certificate, which the project doesn't have
       # yet. When it does: store it as WINDOWS_CERTIFICATE (base64 .pfx) and
@@ -185,7 +218,7 @@ jobs:
         run: |
           mkdir -p out
           cp desktop/target/release/bundle/nsis/*.exe out/
-          cp desktop/target/release/bundle/msi/*.msi out/
+          if [ -z "$DEV_N" ]; then cp desktop/target/release/bundle/msi/*.msi out/; fi
           ls -la out
       - uses: actions/upload-artifact@v4
         with:
@@ -282,6 +315,7 @@ jobs:
           Start-Sleep -Seconds 5
           if (Test-Path $app) { throw "uninstall left the app behind" }
       - name: MSI installer
+        if: inputs.dev_tag == ''
         shell: pwsh
         run: |
           $msi = Get-ChildItem pkg\*.msi | Select-Object -First 1
@@ -327,6 +361,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -350,7 +385,6 @@ jobs:
         if: inputs.dev_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          DEV_TAG: ${{ inputs.dev_tag }}
           PLATFORMS: ${{ inputs.fedora_only && 'Fedora 44 only (.rpm), install-checked on a clean Fedora 44 runner' || 'Ubuntu, Fedora and Windows, install-checked on clean Ubuntu 22.04/24.04, Fedora 44 and Windows runners' }}
         run: |
           cat > notes.md <<NOTES
@@ -358,8 +392,47 @@ jobs:
 
           - Built from \`$GITHUB_SHA\` and tested. Platforms: $PLATFORMS.
           - Installers are **not code-signed**: Windows SmartScreen will warn.
-          - No signed update manifest: installed copies won't auto-update from this build.
+          - Updates: this dev build updates itself (over Tor, signed with the dev key) to later dev builds only; full releases never update to or from it.
           - Checksums: SHA256SUMS.
           NOTES
           gh release create "$DEV_TAG" dist/* --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
             --title "SecureText dev build ($DEV_TAG)" --notes-file notes.md
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.dev_tag != ''
+      # The dev channel's update feed. Signed here with the dev key, which
+      # only dev builds trust (full releases trust only the offline key, and
+      # their manifests name a different product), then posted to the
+      # rolling "dev-channel" pre-release that dev builds read.
+      - name: Sign and publish the dev update feed
+        if: inputs.dev_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEV_KEY: ${{ secrets.UPDATE_SIGNING_KEY_DEV }}
+          SECURETEXT_RELEASE_PASSPHRASE: ${{ secrets.UPDATE_SIGNING_PASSPHRASE_DEV }}
+          VERSION: ${{ format('{0}-dev.{1}', needs.version.outputs.version, github.run_number) }}
+        run: |
+          umask 077
+          printf '%s\n' "$DEV_KEY" > "$RUNNER_TEMP/dev.key"
+          trap 'rm -f "$RUNNER_TEMP/dev.key"' EXIT
+          args=()
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              SecureText_*.AppImage) args+=(--asset "linux-x86_64-appimage=$f") ;;
+              SecureText_*_amd64.deb) args+=(--asset "linux-x86_64-deb=$f") ;;
+              SecureText-*.x86_64.rpm) args+=(--asset "linux-x86_64-rpm=$f") ;;
+              SecureText_*-setup.exe) args+=(--asset "windows-x86_64-nsis=$f") ;;
+            esac
+          done
+          printf 'Dev build %s (commit %s).\n' "$VERSION" "${GITHUB_SHA:0:7}" > dev-notes.txt
+          release() { cargo run --release -q -p securetext-update --bin securetext-release -- "$@"; }
+          release manifest --channel dev --version "$VERSION" --notes-file dev-notes.txt \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$DEV_TAG" \
+            "${args[@]}" --key-file "$RUNNER_TEMP/dev.key" --out securetext-update.json
+          release verify securetext-update.json desktop/update-signing-dev.pub
+          if ! gh release view dev-channel --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create dev-channel --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+              --title "Dev channel (update feed)" \
+              --notes "Holds the signed update manifest for dev builds; installed dev builds check it over Tor. Installers are on the individual dev-N releases."
+          fi
+          gh release upload dev-channel securetext-update.json --repo "$GITHUB_REPOSITORY" --clobber

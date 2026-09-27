@@ -37,6 +37,13 @@ pub use manifest::{Asset, Manifest, SignedManifest};
 /// marked latest, so this URL never changes.
 pub const DESKTOP_MANIFEST_URL: &str =
     "https://github.com/erietechsolutions/SecureText/releases/latest/download/securetext-update.json";
+/// The dev channel's feed: a rolling pre-release (`dev-channel`) whose
+/// manifest is replaced by each dev build. GitHub never counts a
+/// pre-release as "latest", so full builds can't see it, and its manifest
+/// names a different product and is signed by a different key.
+pub const DEV_MANIFEST_URL: &str =
+    "https://github.com/erietechsolutions/SecureText/releases/download/dev-channel/securetext-update.json";
+pub const DEV_CHANNEL_TAG: &str = "dev-channel";
 pub const MANIFEST_FILE_NAME: &str = "securetext-update.json";
 
 /// A newer release this install can move to.
@@ -57,11 +64,12 @@ pub async fn check(
     client: &HttpsClient,
     manifest_url: &str,
     trusted: &[VerifyingKey],
+    product: &str,
     current_version: &str,
     kind: &InstallKind,
 ) -> anyhow::Result<Option<Offer>> {
     let raw = client.get(manifest_url, manifest::MAX_MANIFEST_BYTES).await?;
-    let manifest = SignedManifest::verify(&raw, trusted, manifest::DESKTOP_PRODUCT)?;
+    let manifest = SignedManifest::verify(&raw, trusted, product)?;
     if !manifest::is_upgrade(current_version, &manifest.version)? {
         return Ok(None);
     }
@@ -179,7 +187,7 @@ mod tests {
         let appimage = InstallKind::AppImage { path: "/nowhere".into() };
         let staging = tempfile::tempdir().unwrap();
 
-        let offer = check(&client, "https://github.com/good.json", &trusted, "0.1.0", &appimage)
+        let offer = check(&client, "https://github.com/good.json", &trusted, manifest::DESKTOP_PRODUCT, "0.1.0", &appimage)
             .await
             .unwrap()
             .expect("0.2.0 is newer");
@@ -188,16 +196,16 @@ mod tests {
         assert_eq!(std::fs::read(&staged).unwrap(), installer);
 
         // Already up to date: no offer.
-        assert!(check(&client, "https://github.com/good.json", &trusted, "0.2.0", &appimage).await.unwrap().is_none());
+        assert!(check(&client, "https://github.com/good.json", &trusted, manifest::DESKTOP_PRODUCT, "0.2.0", &appimage).await.unwrap().is_none());
         // A source build learns about the release but gets nothing to install.
-        let dev = check(&client, "https://github.com/good.json", &trusted, "0.1.0", &InstallKind::Development).await.unwrap();
+        let dev = check(&client, "https://github.com/good.json", &trusted, manifest::DESKTOP_PRODUCT, "0.1.0", &InstallKind::Development).await.unwrap();
         assert!(dev.unwrap().asset.is_none());
         // Not our key: refused outright.
         let other = SigningKey::generate(&mut rand::rngs::OsRng).verifying_key();
-        assert!(check(&client, "https://github.com/good.json", &[other], "0.1.0", &appimage).await.is_err());
+        assert!(check(&client, "https://github.com/good.json", &[other], manifest::DESKTOP_PRODUCT, "0.1.0", &appimage).await.is_err());
 
         // A file that doesn't match its signed hash is discarded.
-        let offer = check(&client, "https://github.com/bad.json", &trusted, "0.1.0", &appimage).await.unwrap().unwrap();
+        let offer = check(&client, "https://github.com/bad.json", &trusted, manifest::DESKTOP_PRODUCT, "0.1.0", &appimage).await.unwrap().unwrap();
         let err = download(&client, &offer, &appimage, staging.path()).await.unwrap_err();
         assert!(err.to_string().contains("does not match the signed hash"), "{err:#}");
         assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0, "nothing left staged");

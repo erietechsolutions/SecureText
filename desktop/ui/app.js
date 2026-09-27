@@ -1470,7 +1470,7 @@
       <div class="settings-section">
         <h4>Updates</h4>
         <p class="sub" id="s-update-line">${esc(updateLine(u))}</p>
-        ${u ? `<p class="sub">This is version ${esc(u.current_version)}.</p>
+        ${u ? `<p class="sub">This is version ${esc(u.current_version)}${u.channel === 'dev' ? ', a <strong>dev build</strong>: it updates only to newer dev builds' : ''}.</p>
         <label class="check"><input type="checkbox" id="s-auto" ${u.auto ? 'checked' : ''}> Check for updates automatically</label>
         <label>Download region <select id="s-region"><option value="">Any country (recommended)</option>
           ${UPDATE_REGIONS.map((cc) => `<option value="${cc}" ${u.region === cc ? 'selected' : ''}>${esc(countryName(cc))}</option>`).join('')}</select></label>

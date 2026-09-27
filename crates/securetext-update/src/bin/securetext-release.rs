@@ -38,7 +38,9 @@ fn run(args: Vec<String>) -> anyhow::Result<()> {
         Some("verify") => {
             let [_, file, public] = args.as_slice() else { anyhow::bail!("usage: verify <manifest> <public-key-file>") };
             let key = manifest::parse_public_key(&std::fs::read_to_string(public)?)?;
-            let m = SignedManifest::verify(&std::fs::read(file)?, &[key], manifest::DESKTOP_PRODUCT)?;
+            let raw = std::fs::read(file)?;
+            let m = SignedManifest::verify(&raw, &[key], manifest::DESKTOP_PRODUCT)
+                .or_else(|_| SignedManifest::verify(&raw, &[key], manifest::DESKTOP_DEV_PRODUCT))?;
             println!("OK: {} {} ({} assets)", m.product, m.version, m.assets.len());
             for (platform, asset) in &m.assets {
                 println!("  {platform}: {} bytes, sha256 {}", asset.size, asset.sha256);
@@ -103,6 +105,7 @@ fn build_manifest(args: &[String]) -> anyhow::Result<()> {
     let mut base_url = None;
     let mut assets: Vec<(String, PathBuf)> = Vec::new();
     let mut key_file = None;
+    let mut product = manifest::DESKTOP_PRODUCT.to_string();
     let mut out = PathBuf::from(securetext_update::MANIFEST_FILE_NAME);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -118,6 +121,13 @@ fn build_manifest(args: &[String]) -> anyhow::Result<()> {
                 assets.push((platform.to_string(), PathBuf::from(path)));
             }
             "--key-file" => key_file = Some(value()?),
+            "--channel" => {
+                product = match value()?.as_str() {
+                    "stable" => manifest::DESKTOP_PRODUCT.into(),
+                    "dev" => manifest::DESKTOP_DEV_PRODUCT.into(),
+                    other => anyhow::bail!("unknown channel {other} (stable or dev)"),
+                }
+            }
             "--out" => out = PathBuf::from(value()?),
             other => anyhow::bail!("unknown flag {other}"),
         }
@@ -144,10 +154,10 @@ fn build_manifest(args: &[String]) -> anyhow::Result<()> {
         );
     }
     let published_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
-    let m = Manifest { product: manifest::DESKTOP_PRODUCT.into(), version, notes, published_at, assets: map };
+    let m = Manifest { product: product.clone(), version, notes, published_at, assets: map };
     let signed = SignedManifest::sign(&m, &key);
     // Self-check before publishing anything.
-    SignedManifest::verify(signed.to_json().as_bytes(), &[key.verifying_key()], manifest::DESKTOP_PRODUCT)?;
+    SignedManifest::verify(signed.to_json().as_bytes(), &[key.verifying_key()], &product)?;
     std::fs::write(&out, signed.to_json())?;
     eprintln!("wrote {} for {} ({} assets)", out.display(), m.version, m.assets.len());
     Ok(())

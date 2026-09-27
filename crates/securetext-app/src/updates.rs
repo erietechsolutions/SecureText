@@ -25,6 +25,10 @@ pub struct UpdateConfig {
     /// This build's version (`CARGO_PKG_VERSION` of the shell).
     pub current_version: String,
     pub manifest_url: String,
+    /// The product the manifest must name (stable or dev channel).
+    pub product: String,
+    /// "stable" or "dev", for display.
+    pub channel: String,
     /// Update-signing public keys pinned into this build.
     pub trusted_keys: Vec<VerifyingKey>,
     pub install: InstallKind,
@@ -40,10 +44,22 @@ pub struct UpdateConfig {
 }
 
 impl UpdateConfig {
+    /// A dev build: the dev feed, the dev product, the dev key.
+    pub fn desktop_dev(current_version: String, trusted_keys: Vec<VerifyingKey>, staging_dir: PathBuf) -> Self {
+        Self {
+            manifest_url: securetext_update::DEV_MANIFEST_URL.into(),
+            product: securetext_update::manifest::DESKTOP_DEV_PRODUCT.into(),
+            channel: "dev".into(),
+            ..Self::desktop(current_version, trusted_keys, staging_dir)
+        }
+    }
+
     pub fn desktop(current_version: String, trusted_keys: Vec<VerifyingKey>, staging_dir: PathBuf) -> Self {
         Self {
             current_version,
             manifest_url: securetext_update::DESKTOP_MANIFEST_URL.into(),
+            product: securetext_update::manifest::DESKTOP_PRODUCT.into(),
+            channel: "stable".into(),
             trusted_keys,
             install: InstallKind::detect(),
             staging_dir,
@@ -62,6 +78,8 @@ pub struct UpdateStatus {
     pub auto: bool,
     /// Exit country for update downloads (`None`: any).
     pub region: Option<String>,
+    /// "stable" (full releases) or "dev" (dev builds).
+    pub channel: String,
     /// This install can apply updates itself (not a source build).
     pub can_install: bool,
     #[serde(flatten)]
@@ -162,6 +180,7 @@ impl Updater {
             current_version: self.config.current_version.clone(),
             auto: self.auto,
             region: self.exit_country.clone(),
+            channel: self.config.channel.clone(),
             can_install: self.config.install.platform_key().is_some(),
             state: self.state.clone(),
         }
@@ -214,11 +233,12 @@ impl Updater {
         self.next_check = Some(Instant::now() + Duration::from_secs_f64(next.max(60.0)));
         let url = self.config.manifest_url.clone();
         let keys = self.config.trusted_keys.clone();
+        let product = self.config.product.clone();
         let current = self.config.current_version.clone();
         let install = self.config.install.clone();
         let tx = net_tx.clone();
         tasks.spawn(async move {
-            let result = securetext_update::check(&client, &url, &keys, &current, &install)
+            let result = securetext_update::check(&client, &url, &keys, &product, &current, &install)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(NetEvent::Update(UpdateEvent::Checked(result)));

@@ -1,0 +1,5 @@
+# SecureText DEV-channel update-signing public key (Ed25519, base64).
+# Pinned into dev builds only (SECURETEXT_CHANNEL=dev). The private half lives
+# in the repository's Actions secrets, so the release pipeline can sign each
+# dev build automatically. Full releases never trust this key.
+zrbqvp9njgAaac2U3NXpD/6tKPaHzLu65RjPFbfZKMs=

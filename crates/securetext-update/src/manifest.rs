@@ -27,6 +27,10 @@ const SIGNATURE_CONTEXT: &[u8] = b"securetext-update-manifest-v1\0";
 /// some other artifact (the relay, a future mobile app) can't be fed to
 /// the desktop app.
 pub const DESKTOP_PRODUCT: &str = "securetext-desktop";
+/// Dev builds' manifests name this product instead, so a dev manifest can
+/// never be accepted by a full build (or the reverse), even if a key were
+/// mixed up.
+pub const DESKTOP_DEV_PRODUCT: &str = "securetext-desktop-dev";
 
 /// Manifests are small; anything bigger is refused before parsing.
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;

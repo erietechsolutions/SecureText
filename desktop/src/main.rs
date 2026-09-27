@@ -24,8 +24,25 @@ struct AppState {
 
 /// The update-signing public key(s) this build trusts (roadmap Phase 6).
 /// Reviewable in the repository; a build whose file holds no key simply
-/// has updates switched off.
+/// has updates switched off. Full releases trust only the offline key;
+/// dev builds trust only the dev key held by CI, so the two channels can
+/// never update into each other.
 const UPDATE_KEYS: &str = include_str!("../update-signing.pub");
+const DEV_UPDATE_KEYS: &str = include_str!("../update-signing-dev.pub");
+
+/// Set by the release pipeline for dev builds (`SECURETEXT_CHANNEL=dev`).
+fn dev_channel() -> bool {
+    option_env!("SECURETEXT_CHANNEL") == Some("dev")
+}
+
+/// The version this build reports: dev builds carry a pre-release such as
+/// 0.1.0-dev.42, so each dev build is newer than the last.
+fn app_version() -> String {
+    option_env!("SECURETEXT_BUILD_VERSION")
+        .filter(|v| !v.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+        .to_string()
+}
 
 /// How this copy was installed. The Tauri bundler stamps the package type
 /// into the binary when it builds an installer, which is more reliable
@@ -44,9 +61,14 @@ fn install_kind() -> install::InstallKind {
 }
 
 fn update_config(staging_dir: PathBuf) -> Option<UpdateConfig> {
-    match securetext_app::update::manifest::parse_public_key(UPDATE_KEYS) {
+    let keys = if dev_channel() { DEV_UPDATE_KEYS } else { UPDATE_KEYS };
+    match securetext_app::update::manifest::parse_public_key(keys) {
         Ok(key) => {
-            let mut config = UpdateConfig::desktop(env!("CARGO_PKG_VERSION").to_string(), vec![key], staging_dir);
+            let mut config = if dev_channel() {
+                UpdateConfig::desktop_dev(app_version(), vec![key], staging_dir)
+            } else {
+                UpdateConfig::desktop(app_version(), vec![key], staging_dir)
+            };
             config.install = install_kind();
             Some(config)
         }

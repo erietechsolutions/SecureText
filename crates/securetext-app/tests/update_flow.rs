@@ -59,6 +59,8 @@ fn config(dir: &std::path::Path, release: &Release, first_check: Duration) -> No
         update: Some(UpdateConfig {
             current_version: "0.1.0".into(),
             manifest_url: "https://github.com/latest.json".into(),
+            product: manifest::DESKTOP_PRODUCT.into(),
+            channel: "stable".into(),
             trusted_keys: vec![release.key.verifying_key()],
             install: InstallKind::AppImage { path: dir.join("SecureText.AppImage") },
             staging_dir: dir.join("updates"),
@@ -179,4 +181,57 @@ async fn fetches_a_real_github_release_asset_over_tor_live() {
 
 async fn securetext_net_client(dir: &std::path::Path) -> securetext_net::Client {
     securetext_net::bootstrap_with_dirs(&dir.join("state"), &dir.join("cache")).await.expect("bootstrap Tor")
+}
+
+/// Dev and full channels never cross: a dev build takes the next dev
+/// build from the dev feed; a full build refuses a dev manifest outright
+/// (different product), even if it trusted the same key.
+#[tokio::test]
+async fn dev_builds_update_from_dev_builds_and_full_builds_refuse_them() {
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let installer = b"SecureText dev.6 AppImage".to_vec();
+    let mut assets = BTreeMap::new();
+    assets.insert(
+        "linux-x86_64-appimage".to_string(),
+        Asset {
+            url: "https://github.com/o/r/releases/download/dev-6/SecureText.AppImage".into(),
+            sha256: manifest::sha256_hex(&installer),
+            size: installer.len() as u64,
+        },
+    );
+    let dev = Manifest {
+        product: manifest::DESKTOP_DEV_PRODUCT.into(),
+        version: "0.1.0-dev.6".into(),
+        notes: "dev build 6".into(),
+        published_at: 1,
+        assets,
+    };
+    let routes = vec![
+        ("/dev.json".to_string(), testing::http_ok(SignedManifest::sign(&dev, &key).to_json().as_bytes())),
+        ("/o/r/releases/download/dev-6/SecureText.AppImage".to_string(), testing::http_ok(&installer)),
+    ];
+    let (addr, roots) = testing::server(&["github.com"], routes).await;
+    let client = testing::client(addr, roots);
+
+    let run = |dir: &std::path::Path, version: &str, product: &str| {
+        let mut cfg = config(dir, &Release { key: key.clone(), installer: installer.clone(), client: client.clone() }, Duration::from_millis(100));
+        let u = cfg.update.as_mut().unwrap();
+        u.current_version = version.into();
+        u.product = product.into();
+        u.manifest_url = "https://github.com/dev.json".into();
+        cfg
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start(run(dir.path(), "0.1.0-dev.5", manifest::DESKTOP_DEV_PRODUCT)).await.unwrap();
+    let state = wait_for_state(&node, "the dev update", |s| matches!(s, UpdateState::Ready { .. })).await;
+    assert!(matches!(state, UpdateState::Ready { ref version, .. } if version == "0.1.0-dev.6"), "{state:?}");
+    node.shutdown().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start(run(dir.path(), "0.1.0", manifest::DESKTOP_PRODUCT)).await.unwrap();
+    let state = wait_for_state(&node, "the refusal", |s| matches!(s, UpdateState::Failed { .. })).await;
+    let UpdateState::Failed { error } = state else { unreachable!() };
+    assert!(error.contains("securetext-desktop-dev"), "{error}");
+    node.shutdown().await;
 }

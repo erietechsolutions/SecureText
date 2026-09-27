@@ -1816,7 +1816,7 @@ impl NodeState {
                     .unwrap_or_default(),
             })
             .collect();
-        out.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+        out.sort_by_key(|c| c.label.to_lowercase());
         out
     }
 
