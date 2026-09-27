@@ -11,6 +11,10 @@ RFC 9420). Voice/video calls (planned) are the one explicit, disclosed
 exception to the anonymity guarantee — see
 [docs/threat-model.md](docs/threat-model.md).
 
+# Dev Builds
+
+Please be aware that dev builds/releases are only supported on Fedora 44 or higher
+
 ## Status
 
 | Phase | Scope | Status |
