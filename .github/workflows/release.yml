@@ -368,11 +368,16 @@ jobs:
           $msi = Get-ChildItem pkg\*.msi | Select-Object -First 1
           $log = "$env:RUNNER_TEMP\msi.log"
           $proc = Start-Process msiexec -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart /l*v `"$log`"" -Wait -PassThru
-          if (-not (Test-Path "$env:ProgramFiles\SecureText\securetext-desktop.exe")) {
-            Get-Content $log | Select-String -Pattern "SECURETEXT|LaunchCondition|Return value 3|error" | Select-Object -Last 40
-            throw "MSI did not install (msiexec exit $($proc.ExitCode))"
+          # The MSI installs where a previous install (here, the NSIS test
+          # above) recorded, else Program Files.
+          $dir = (Get-ItemProperty 'HKCU:\Software\erietechsolutions\SecureText' -ErrorAction SilentlyContinue).InstallDir
+          if (-not $dir) { $dir = "$env:ProgramFiles\SecureText\" }
+          $exe = Join-Path $dir 'securetext-desktop.exe'
+          if (-not (Test-Path $exe)) {
+            Get-Content $log | Select-String -Pattern "SECURETEXT|LaunchCondition|Return value 3|INSTALLDIR" | Select-Object -Last 40
+            throw "MSI did not install to $dir (msiexec exit $($proc.ExitCode))"
           }
-          $app = Get-ChildItem "$env:ProgramFiles\SecureText\securetext-desktop.exe" -ErrorAction Stop
+          $app = Get-ChildItem $exe -ErrorAction Stop
           $p = Start-Process $app.FullName -PassThru
           Start-Sleep -Seconds 15
           if ($p.HasExited) { throw "the app exited early with code $($p.ExitCode)" }
