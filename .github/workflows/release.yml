@@ -28,6 +28,10 @@ on:
         description: "Also run the two-window GUI test over live Tor (slow)"
         type: boolean
         default: false
+      dev_tag:
+        description: "Publish a dev build as a GitHub pre-release under this tag (e.g. dev-1.0). No update manifest: installed copies are never offered it"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -309,7 +313,7 @@ jobs:
   draft-release:
     name: draft GitHub Release
     needs: [version, install-ubuntu, install-fedora, install-windows]
-    if: github.ref_type == 'tag' || inputs.draft_release
+    if: github.ref_type == 'tag' || inputs.draft_release || inputs.dev_tag != ''
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -322,6 +326,7 @@ jobs:
         working-directory: dist
         run: sha256sum * > SHA256SUMS && cat SHA256SUMS
       - name: Create the draft
+        if: inputs.dev_tag == ''
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
@@ -329,3 +334,22 @@ jobs:
           gh release create "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --draft \
             --title "SecureText $VERSION" \
             --notes "Draft built by CI. Not published until a maintainer signs the update manifest (scripts/sign-release.sh)."
+      # Dev builds: a published pre-release with no signed update manifest.
+      # GitHub never treats a pre-release as "latest", and installed copies
+      # only look at releases/latest, so nobody is updated to one.
+      - name: Publish the dev pre-release
+        if: inputs.dev_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEV_TAG: ${{ inputs.dev_tag }}
+        run: |
+          cat > notes.md <<NOTES
+          **Development build: not for real use.** SecureText has not had its independent security audit yet (see docs/audit/README.md).
+
+          - Built from \`$GITHUB_SHA\`, tested, and install-checked on clean Ubuntu 22.04/24.04, Fedora 44 and Windows runners.
+          - Installers are **not code-signed**: Windows SmartScreen will warn.
+          - No signed update manifest: installed copies won't auto-update from this build.
+          - Checksums: SHA256SUMS.
+          NOTES
+          gh release create "$DEV_TAG" dist/* --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+            --title "SecureText dev build ($DEV_TAG)" --notes-file notes.md
