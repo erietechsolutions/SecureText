@@ -372,6 +372,7 @@ impl NodeState {
                 if self.connections.get(&peer_key).is_some_and(|c| c.id == conn_id) {
                     self.connections.remove(&peer_key);
                     self.rich.presence.remove(&peer_key);
+                    self.downloads_on_disconnect(&peer_key);
                     self.emit(Event::Peer { key: to_hex(&peer_key), online: false });
                 }
             }
@@ -556,6 +557,8 @@ impl NodeState {
         for peer in stale {
             self.awaiting_ack.retain(|_, (p, _)| *p != peer);
             if self.connections.remove(&peer).is_some() {
+                self.rich.presence.remove(&peer);
+                self.downloads_on_disconnect(&peer);
                 eprintln!("[securetext] {} stopped acknowledging; reconnecting", short(&peer));
                 self.emit(Event::Peer { key: to_hex(&peer), online: false });
             }

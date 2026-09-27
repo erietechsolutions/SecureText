@@ -39,7 +39,7 @@ const CHUNK: u64 = 256 * 1024;
 /// for the user to ask.
 const AUTO_DOWNLOAD_IMAGE: u64 = 8 * 1024 * 1024;
 /// Re-ask (possibly someone else) if a chunk hasn't arrived by then.
-const CHUNK_TIMEOUT: Duration = Duration::from_secs(45);
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 const MIN_DISAPPEAR: i64 = 60;
 const MAX_DISAPPEAR: i64 = 30 * 24 * 3600;
 const MAX_STATUS_TEXT: usize = 80;
@@ -739,6 +739,26 @@ impl NodeState {
         let waiting: Vec<String> =
             self.rich.downloads.iter().filter(|(_, d)| d.source.is_none()).map(|(k, _)| k.clone()).collect();
         for file_id in waiting {
+            self.request_next_chunk(&file_id);
+        }
+    }
+
+    /// A peer went away: any download it was serving moves on to someone
+    /// else now, instead of waiting out `CHUNK_TIMEOUT` for a reply that
+    /// can't come.
+    pub(crate) fn downloads_on_disconnect(&mut self, peer: &[u8]) {
+        let affected: Vec<String> = self
+            .rich
+            .downloads
+            .iter()
+            .filter(|(_, d)| d.source.as_deref() == Some(peer))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for file_id in affected {
+            if let Some(d) = self.rich.downloads.get_mut(&file_id) {
+                d.source = None;
+                d.tried.push(peer.to_vec());
+            }
             self.request_next_chunk(&file_id);
         }
     }

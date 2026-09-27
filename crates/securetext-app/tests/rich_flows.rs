@@ -130,7 +130,8 @@ async fn presence_is_shared_with_connected_contacts() {
 }
 
 async fn wait_file(node: &NodeHandle, conversation: &str, file_id: &str, state: &str) {
-    let what = format!("file {file_id} to be {state}");
+    let label = node.status().await.map(|s| s.label).unwrap_or_default();
+    let what = format!("{label}'s copy of file {file_id} to be {state}");
     let file_id = file_id.to_string();
     let state = state.to_string();
     eventually(&what, || {
