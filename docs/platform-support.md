@@ -17,13 +17,6 @@
 | Debian Server | 13 or newer |
 | Fedora | 44 or newer |
 
-|---|---|
-| OS | Versions |
-| Ubuntu | 22.04 LTS and newer |
-| Ubuntu Server | 20.04 LTS and newer |
-| Debian Server | 13 or newer |
-| Fedora | 44 or newer |
-
 **Current verification (2026-09-26):** everything through Phase 5 has been
 built and verified on Fedora 44 only. Ubuntu and Windows are supported
 targets but not yet tested (roadmap.md tracks this per phase).
