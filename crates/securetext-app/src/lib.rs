@@ -259,6 +259,8 @@ pub enum Event {
     Message { conversation_id: String, message: MessageView },
     MessageStatus { conversation_id: String, id: String, status: String },
     Peer { key: String, online: bool },
+    /// Someone (or we ourselves, `key` = our key) now goes by `label`.
+    PeerRenamed { key: String, label: String },
     /// A message's reactions, thread count or attachment state changed.
     MessageUpdated { conversation_id: String, message: MessageView },
     /// Disappearing messages whose time ran out.
@@ -533,6 +535,13 @@ impl NodeHandle {
     /// profile's offline mailbox, or stop using one (`None`). Returns the
     /// relay now in use. Contacts learn the change through our contact
     /// card; invites created afterwards include it.
+    /// Change our display name. Contacts and server members we're connected
+    /// to see it right away; others the next time we connect. Returns the
+    /// name as stored (trimmed).
+    pub async fn set_display_name(&self, name: String) -> anyhow::Result<String> {
+        self.call(move |s| s.set_display_name(&name)).await
+    }
+
     pub async fn set_relay(&self, address: Option<String>) -> anyhow::Result<Option<String>> {
         self.call(move |s| s.set_relay(address.as_deref())).await
     }

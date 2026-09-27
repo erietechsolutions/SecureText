@@ -370,6 +370,16 @@ impl IdentityStore {
     /// and any `PersistentProvider`s opened against this path get sealed
     /// together whenever `seal()` is called, since it re-encrypts the
     /// whole file regardless of which connection wrote what.
+    /// Change the display label (a self-chosen name, never trusted by
+    /// anyone else). Persisted with the identity; `seal` to write it out.
+    pub fn set_label(&mut self, public: &mut PublicIdentity, label: impl Into<String>) -> Result<(), IdentityError> {
+        let mut updated = public.clone();
+        updated.label = label.into();
+        write_meta(&self.connection, &updated)?;
+        *public = updated;
+        Ok(())
+    }
+
     pub fn db_path(&self) -> &Path {
         &self.tmp_db_path
     }

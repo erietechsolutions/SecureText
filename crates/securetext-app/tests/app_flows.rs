@@ -199,3 +199,42 @@ async fn an_impostor_cannot_answer_for_a_contact() {
     assert_eq!(mine.iter().find(|m| m.body == "for bob only").unwrap().status, "pending");
     assert!(mallory.conversations().await.unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_display_name_reaches_contacts_and_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = MemoryNetwork::new();
+    let alice = start(dir.path(), "alice", &net).await;
+    let bob = start(dir.path(), "bob", &net).await;
+    let dm = befriend(&alice, &bob).await;
+    let alice_key = my_key(&alice).await;
+    let server = alice.create_server("Club".into()).await.unwrap();
+    invite(&alice, &server, &my_key(&bob).await).await;
+    alice.send_message(dm.clone(), "before".into()).await.unwrap();
+    wait_for_message(&bob, &dm, "before").await;
+
+    assert!(alice.set_display_name("   ".into()).await.is_err());
+    assert!(alice.set_display_name("x".repeat(65)).await.is_err());
+    assert!(alice.set_display_name("a\u{7}b".into()).await.is_err());
+    assert_eq!(alice.set_display_name("  Alice Liddell ".into()).await.unwrap(), "Alice Liddell");
+    assert_eq!(alice.status().await.unwrap().label, "Alice Liddell");
+
+    // Bob sees it in his contacts, as the DM's name, on her messages (old
+    // ones too) and in the server's member list.
+    eventually("bob to see alice's new name", || {
+        let (bob, dm, server, alice_key) = (bob.clone(), dm.clone(), server.clone(), alice_key.clone());
+        async move {
+            let contact = bob.contacts().await.ok()?.into_iter().any(|c| c.key == alice_key && c.label == "Alice Liddell");
+            let dm_named = bob.conversations().await.ok()?.into_iter().any(|c| c.id == dm && c.name == "Alice Liddell");
+            let old_msg = bob.messages(dm, 50).await.ok()?.into_iter().any(|m| m.body == "before" && m.sender_label == "Alice Liddell");
+            let member = bob.members(server).await.ok()?.into_iter().any(|m| m.key == alice_key && m.label == "Alice Liddell");
+            (contact && dm_named && old_msg && member).then_some(())
+        }
+    })
+    .await;
+
+    // It survives a restart.
+    alice.shutdown().await;
+    let alice = start(dir.path(), "alice", &net).await;
+    assert_eq!(alice.status().await.unwrap().label, "Alice Liddell");
+}

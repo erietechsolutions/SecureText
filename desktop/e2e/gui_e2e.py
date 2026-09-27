@@ -456,6 +456,21 @@ def channel_rules_stage(alice, bob):
     log("removing the rule lets Bob post again")
 
 
+def rename_stage(alice, bob):
+    """Alice changes her display name in Settings; Bob's member list and
+    her messages follow."""
+    alice.click("#me-settings")
+    alice.wait("settings", "return !!document.querySelector('#s-name');")
+    alice.js("document.querySelector('#s-name').value = '';")
+    alice.type("#s-name", "Alice Liddell")
+    alice.click("#s-name-save")
+    alice.wait("own name updated", has_text("#me-name", "Alice Liddell"))
+    alice.click(".modal [data-close]")
+    bob.wait("Bob sees the new name", has_text("#members", "Alice Liddell"), timeout=180)
+    log("a display name change reaches the other side")
+    bob.shot("29-renamed")
+
+
 def screen_share_check(alice, bob):
     alice.click("[data-action=call-screen]")
     alice.wait("sharing screen", has_text("#call-panel", "Stop sharing"), timeout=30)
@@ -585,6 +600,7 @@ def main():
         bob.shot("09-server-general")
         roles_stage(alice, bob)
         channel_rules_stage(alice, bob)
+        rename_stage(alice, bob)
 
         # A private channel, then removing Bob.
         alice.click("[data-action=new-channel]")

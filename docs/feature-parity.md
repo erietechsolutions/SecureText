@@ -25,6 +25,7 @@ Legend: ✅ built and verified · 🟡 partly there · ⬜ not built
 | File & image sharing | ✅ | Up to 25 MB; images inline |
 | Reactions | ✅ | |
 | Threads / replies | ✅ | One level of threads |
+| Display names | ✅ | Changeable in Settings. A re-signed contact card carries the new name to everyone connected now, and to others on the next connection. Names are self-chosen and never trusted; fingerprints identify people |
 | Presence & custom status | ✅ | Online / away / do not disturb, plus a short message |
 | Disappearing messages | ✅ | Per conversation; 1 hour / 1 day / 1 week, or custom 1 min–30 days via the API |
 | Editing & deleting messages | ⬜ | |

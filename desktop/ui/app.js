@@ -354,6 +354,18 @@
       case 'warning':
         toast(ev.message, 'error');
         break;
+      case 'peer_renamed': {
+        // Names already on screen (messages, lists) follow the new one.
+        for (const list of Object.values(state.msgs)) {
+          for (const m of list) if (m.sender_key === ev.key) m.sender_label = ev.label;
+        }
+        await refreshStatus();
+        await refreshConvs();
+        await refreshContacts();
+        render();
+        refreshMembers();
+        break;
+      }
       case 'presence':
         state.presence[ev.key] = { status: ev.status, text: ev.text };
         renderSidebar();
@@ -1592,6 +1604,12 @@
     const t = state.turn[0] || { url: '', username: '', credential: '' };
     modal(`<h3>Settings</h3>
       <div class="settings-section">
+        <h4>Profile</h4>
+        <p class="sub">Your display name is what contacts and server members see. It’s chosen by you and never verified, which is why people also see your key’s fingerprint.</p>
+        <div class="row"><label class="grow">Display name<input id="s-name" maxlength="64" autocomplete="off" value="${esc(s.label || '')}"></label>
+          <button class="btn small" id="s-name-save">Save name</button></div>
+      </div>
+      <div class="settings-section">
         <h4>Offline delivery</h4>
         <p class="sub">${esc(s.relay ? 'Using a relay: messages sent while you’re away wait there.' : 'No relay: messages reach you only while you’re online at the same time as the sender.')}</p>
         <button class="btn small" id="s-relay">${s.relay ? 'Change relay…' : 'Set up a relay…'}</button>
@@ -1625,6 +1643,19 @@
       <div class="actions"><button class="btn primary" data-close>Done</button></div>`,
     (root, close) => {
       $('#s-relay', root).addEventListener('click', () => { close(); showRelaySettings(); });
+      $('#s-name-save', root).addEventListener('click', async (e) => {
+        busy(e.target, true);
+        try {
+          const name = await call('set_display_name', { name: $('#s-name', root).value });
+          $('#s-name', root).value = name;
+          $('#m-err', root).textContent = '';
+          toast('Display name saved. Contacts you’re connected to see it now; others see it next time you connect.');
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+        } finally {
+          busy(e.target, false);
+        }
+      });
       $('#s-turn-save', root).addEventListener('click', async (e) => {
         const url = $('#s-turn-url', root).value.trim();
         const servers = url ? [{ url, username: $('#s-turn-user', root).value.trim(), credential: $('#s-turn-pass', root).value }] : [];

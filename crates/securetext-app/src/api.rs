@@ -116,6 +116,14 @@ pub async fn dispatch(node: &NodeHandle, cmd: &str, args: Value) -> Result<Value
             to_value(node.set_update_region(a.country).await.map_err(err)?)
         }
         "tor_circuits" => to_value(node.tor_circuits().await.map_err(err)?),
+        "set_display_name" => {
+            #[derive(Deserialize)]
+            struct Name {
+                name: String,
+            }
+            let a: Name = parse(args)?;
+            to_value(node.set_display_name(a.name).await.map_err(err)?)
+        }
         "set_relay" => {
             #[derive(Deserialize)]
             struct Relay {

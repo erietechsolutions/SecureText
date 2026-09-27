@@ -782,9 +782,13 @@ impl NodeState {
     /// away if they're already known.
     fn accept_card(&mut self, from: &[u8], card: &SignedCard) {
         if let Ok(Some(existing)) = self.store.peer(from) {
+            let label = clamp_chars(&card.card.label, MAX_NAME_CHARS);
+            if label != existing.label {
+                self.emit(Event::PeerRenamed { key: to_hex(from), label: label.clone() });
+            }
             let row = PeerRow {
                 mls_key: from.to_vec(),
-                label: clamp_chars(&card.card.label, MAX_NAME_CHARS),
+                label,
                 onion_address: card.card.onion_address.clone(),
                 noise_key: card.card.noise_public_key.clone(),
                 is_contact: existing.is_contact,
@@ -804,6 +808,32 @@ impl NodeState {
         self.presented_cards.insert(from.to_vec(), (card.clone(), Instant::now()));
     }
 
+    pub(crate) fn set_display_name(&mut self, name: &str) -> anyhow::Result<String> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "choose a display name");
+        anyhow::ensure!(name.chars().count() <= MAX_NAME_CHARS, "display names are limited to {MAX_NAME_CHARS} characters");
+        anyhow::ensure!(!name.chars().any(char::is_control), "display names can't contain control characters");
+        if name == self.public.label {
+            return Ok(name.to_string());
+        }
+        self.identity.set_label(&mut self.public, name)?;
+        self.dirty = true;
+        self.refresh_my_card()?;
+        self.announce_card();
+        self.emit(Event::PeerRenamed { key: to_hex(self.my_key()), label: name.to_string() });
+        Ok(name.to_string())
+    }
+
+    /// Send our current card to everyone we're connected to; others get it
+    /// in the Hello the next time we connect.
+    fn announce_card(&self) {
+        if let Some(card) = self.my_card.clone() {
+            for conn in self.connections.values() {
+                let _ = conn.tx.send(Outgoing { outbox_id: None, message: WireMessage::Hello { card: card.clone() } });
+            }
+        }
+    }
+
     pub(crate) fn set_relay(&mut self, link: Option<&str>) -> anyhow::Result<Option<String>> {
         match link.map(str::trim).filter(|l| !l.is_empty()) {
             Some(link) => {
@@ -819,13 +849,7 @@ impl NodeState {
         self.dirty = true;
         self.last_collect = None;
         self.refresh_my_card()?;
-        // Tell everyone we're connected to right away; others pick up the
-        // new card the next time we connect to them.
-        if let Some(card) = self.my_card.clone() {
-            for conn in self.connections.values() {
-                let _ = conn.tx.send(Outgoing { outbox_id: None, message: WireMessage::Hello { card: card.clone() } });
-            }
-        }
+        self.announce_card();
         self.maybe_collect();
         Ok(self.my_relay.as_ref().map(|r| r.link.clone()))
     }
@@ -1510,7 +1534,15 @@ impl NodeState {
                 let name = match c.kind {
                     ConversationKind::Server => server.map(|s| s.name.clone()).unwrap_or(c.name.clone()),
                     ConversationKind::Channel => meta.name.clone().unwrap_or(c.name.clone()),
-                    ConversationKind::Dm => c.name.clone(),
+                    // A DM is named after whoever's in it, as they call
+                    // themselves now.
+                    ConversationKind::Dm => self
+                        .groups
+                        .get(&c.group_id)
+                        .and_then(|g| g.members().map(|m| m.signature_key).find(|k| k.as_slice() != self.my_key()))
+                        .and_then(|k| self.store.peer(&k).ok().flatten())
+                        .map(|p| p.label)
+                        .unwrap_or(c.name.clone()),
                 };
                 ConversationView {
                     id: to_hex(&c.group_id),
