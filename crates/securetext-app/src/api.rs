@@ -114,6 +114,50 @@ pub async fn dispatch(node: &NodeHandle, cmd: &str, args: Value) -> Result<Value
             let a: Relay = parse(args)?;
             to_value(node.set_relay(a.address).await.map_err(err)?)
         }
+        "start_call" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Start {
+                conversation_id: String,
+                #[serde(default)]
+                video: bool,
+            }
+            let a: Start = parse(args)?;
+            to_value(node.start_call(a.conversation_id, a.video).await.map_err(err)?)
+        }
+        "accept_call" => to_value(node.accept_call().await.map_err(err)?),
+        "decline_call" => to_value(node.decline_call().await.map_err(err)?),
+        "hang_up" => to_value(node.hang_up().await.map_err(err)?),
+        "set_call_muted" => {
+            #[derive(Deserialize)]
+            struct Muted {
+                muted: bool,
+            }
+            let a: Muted = parse(args)?;
+            to_value(node.set_call_muted(a.muted).await.map_err(err)?)
+        }
+        "call_status" => to_value(node.call_status().await.map_err(err)?),
+        "call_stats" => to_value(node.call_stats().await.map_err(err)?),
+        "send_video_frame" => {
+            #[derive(Deserialize)]
+            struct Frame {
+                jpeg: String,
+            }
+            let a: Frame = parse(args)?;
+            let jpeg = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, a.jpeg)
+                .map_err(|e| format!("bad frame: {e}"))?;
+            to_value(node.send_video_frame(jpeg).await.map_err(err)?)
+        }
+        "call_heard" => to_value(node.call_heard().await.map_err(err)?),
+        "turn_servers" => to_value(node.turn_servers().await.map_err(err)?),
+        "set_turn_servers" => {
+            #[derive(Deserialize)]
+            struct Servers {
+                servers: Vec<crate::call::TurnServer>,
+            }
+            let a: Servers = parse(args)?;
+            to_value(node.set_turn_servers(a.servers).await.map_err(err)?)
+        }
         "update_status" => to_value(node.update_status().await.map_err(err)?),
         "check_for_updates" => to_value(node.check_for_updates().await.map_err(err)?),
         "download_update" => to_value(node.download_update().await.map_err(err)?),

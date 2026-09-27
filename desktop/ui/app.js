@@ -93,6 +93,8 @@
     unread: {},
     members: [],
     update: null,
+    call: null,
+    turn: [],
   };
 
   const conv = (id) => state.convs.find((c) => c.id === id);
@@ -163,7 +165,7 @@
   async function enterApp() {
     $('#app').hidden = false;
     onEvent(handleEvent);
-    await Promise.all([refreshStatus(), refreshConvs(), refreshContacts(), refreshUpdate()]);
+    await Promise.all([refreshStatus(), refreshConvs(), refreshContacts(), refreshUpdate(), refreshCall()]);
     const open = params.get('open');
     if (open && conv(open)) await select(conv(open));
     else render();
@@ -282,6 +284,12 @@
         state.update = ev.status;
         renderUpdate();
         break;
+      case 'call':
+        onCallEvent(ev.call, ev.ended);
+        break;
+      case 'call_video':
+        showRemoteFrame(ev.peer_key, ev.jpeg);
+        break;
       case 'peer':
         if (ev.online) state.online.add(ev.key);
         else state.online.delete(ev.key);
@@ -369,6 +377,7 @@
   function renderMain() {
     const c = conv(state.view.convId);
     const title = $('#main-title');
+    renderHeadActions(c);
     if (!c) {
       title.innerHTML = '<span>Home</span>';
       $('#messages').innerHTML = welcomeHtml();
@@ -520,6 +529,208 @@
   }
 
   // ------------------------------------------------------------------
+  // Calls (Phase 7): the one feature that doesn't go over Tor, so every
+  // call starts with a plain statement of what that means.
+  // ------------------------------------------------------------------
+  const video = { stream: null, timer: null, source: 'camera' };
+
+  async function refreshCall() {
+    try {
+      state.call = await call('call_status');
+    } catch (e) {
+      state.call = null;
+    }
+    renderCall();
+  }
+
+  function renderHeadActions(c) {
+    const box = $('#head-actions');
+    const can = c && c.kind !== 'server' && !c.removed && !state.call;
+    box.innerHTML = can
+      ? `<button class="icon-btn" data-action="call-voice" title="Start a voice call" aria-label="Start a voice call">📞︎</button>
+         <button class="icon-btn" data-action="call-video" title="Start a video call" aria-label="Start a video call">🎥︎</button>`
+      : '';
+  }
+
+  function disclosureHtml(turnWho) {
+    return `<div class="explain disclosure">
+        <p><strong>Calls don’t go through Tor.</strong> Voice and video need a faster connection than Tor can give, so a call travels over the regular internet through a relay server (TURN).</p>
+        <p><strong>Who can see what.</strong> The relay’s operator${turnWho ? ` (${esc(turnWho)})` : ''} can see your IP address and that you’re on a call. The other people on the call can’t: they only ever see the relay’s address.</p>
+        <p><strong>What stays private.</strong> What you say and show is end-to-end encrypted. The relay can’t hear or see it. Your messages aren’t affected; they always go over Tor.</p>
+      </div>`;
+  }
+
+  function confirmStartCall(withVideo) {
+    const c = conv(state.view.convId);
+    if (!c) return;
+    modal(`<h3>${withVideo ? 'Start a video call' : 'Start a call'} ${c.kind === 'dm' ? 'with ' + esc(c.name) : 'in #' + esc(c.name)}?</h3>
+      ${disclosureHtml('the server you set in Settings → Calls')}
+      <p class="form-error" id="m-err"></p>
+      <div class="actions"><button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="m-go">Start call</button></div>`,
+    (root, close) => {
+      $('#m-go', root).addEventListener('click', async (e) => {
+        busy(e.target, true);
+        try {
+          state.call = await call('start_call', { conversationId: c.id, video: withVideo });
+          close();
+          renderCall();
+          if (withVideo) startCamera();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+          busy(e.target, false);
+        }
+      });
+    });
+  }
+
+  function showIncomingCall(cv) {
+    const where = conv(cv.conversation_id);
+    const place = where && where.kind === 'channel' ? ` in #${esc(where.name)}` : '';
+    modal(`<h3>${esc(cv.caller_label)} is calling${place}${cv.video ? ' (video)' : ''}</h3>
+      ${disclosureHtml(cv.turn === 'yours' ? 'the server you set in Settings → Calls' : 'the caller’s relay, since you haven’t set your own')}
+      <p class="form-error" id="m-err"></p>
+      <div class="actions"><button class="btn danger" id="m-decline">Decline</button><button class="btn primary" id="m-accept">Join call</button></div>`,
+    (root, close) => {
+      root.dataset.incoming = cv.call_id;
+      $('#m-decline', root).addEventListener('click', async () => {
+        close();
+        try { await call('decline_call'); } catch (_) { /* already gone */ }
+      });
+      $('#m-accept', root).addEventListener('click', async (e) => {
+        busy(e.target, true);
+        try {
+          state.call = await call('accept_call');
+          close();
+          renderCall();
+          if (cv.video) startCamera();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+          busy(e.target, false);
+        }
+      });
+    });
+  }
+
+  function onCallEvent(cv, ended) {
+    const before = state.call;
+    state.call = cv;
+    if (cv && cv.state === 'incoming' && (!before || before.call_id !== cv.call_id)) showIncomingCall(cv);
+    if (!cv) {
+      const open = document.querySelector('#modal-root .modal[data-incoming]');
+      if (open) $('#modal-root').innerHTML = '';
+      stopCamera();
+      if (ended && before) toast(`Call ended: ${ended}.`);
+    }
+    renderCall();
+  }
+
+  function renderCall() {
+    const panel = $('#call-panel');
+    const cv = state.call;
+    renderHeadActions(conv(state.view.convId));
+    if (!cv || cv.state === 'incoming') {
+      panel.hidden = true;
+      panel.innerHTML = '';
+      return;
+    }
+    panel.hidden = false;
+    const people = cv.participants.map((p) => `<div class="call-person ${p.state === 'connected' ? 'on' : ''}" data-peer="${esc(p.key)}">
+        ${cv.video ? `<img class="tile" alt="" data-video="${esc(p.key)}">` : avatar(p.label, p.key, undefined)}
+        <span class="who">${esc(p.label)}</span><span class="sub">${esc(p.state)}</span></div>`).join('');
+    const status = cv.state === 'outgoing' ? 'Ringing…' : `${cv.participants.filter((p) => p.state === 'connected').length} connected`;
+    panel.innerHTML = `<div class="call-head">
+        <span class="call-dot"></span>
+        <span class="grow"><strong>${cv.video ? 'Video call' : 'Call'}</strong> · ${esc(cv.conversation_name)} · ${esc(status)}</span>
+        <span class="sub" title="Calls go through a TURN relay, not Tor">relayed via ${cv.turn === 'yours' ? 'your' : 'the caller’s'} TURN server</span>
+      </div>
+      <div class="call-people">
+        ${cv.video ? `<div class="call-person self"><video id="self-view" class="tile" autoplay muted playsinline></video><span class="who">You${video.stream && video.source === 'screen' ? ' (screen)' : ''}</span></div>` : ''}
+        ${people || '<div class="empty-note">Waiting for someone to join…</div>'}
+      </div>
+      <div class="call-controls">
+        <button class="btn small" data-action="call-mute">${cv.muted ? 'Unmute' : 'Mute'}</button>
+        ${cv.video ? `<button class="btn small" data-action="call-camera">${video.stream && video.source === 'camera' ? 'Camera off' : 'Camera on'}</button>` : ''}
+        ${cv.video && navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia ? `<button class="btn small" data-action="call-screen">${video.stream && video.source === 'screen' ? 'Stop sharing' : 'Share screen'}</button>` : ''}
+        <button class="btn small danger" data-action="call-hangup">${cv.state === 'outgoing' ? 'Cancel' : 'Leave'}</button>
+      </div>`;
+    const self = $('#self-view');
+    if (self && video.stream) self.srcObject = video.stream;
+    for (const [key, src] of Object.entries(lastFrames)) {
+      const img = panel.querySelector(`img[data-video="${CSS.escape(key)}"]`);
+      if (img) img.src = src;
+    }
+  }
+
+  const lastFrames = {};
+  function showRemoteFrame(peerKey, jpegB64) {
+    const src = 'data:image/jpeg;base64,' + jpegB64;
+    lastFrames[peerKey] = src;
+    const img = document.querySelector(`#call-panel img[data-video="${CSS.escape(peerKey)}"]`);
+    if (img) img.src = src;
+  }
+
+  // Camera frames are captured here (the webview's camera access works on
+  // every platform) and handed to the node as small JPEGs, which it seals
+  // with the call key and sends over the relayed WebRTC connection.
+  async function startCamera(source) {
+    if (video.stream) return;
+    video.source = source || 'camera';
+    try {
+      video.stream = video.source === 'screen'
+        ? await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+        : await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 }, audio: false });
+    } catch (e) {
+      toast(`Couldn’t ${video.source === 'screen' ? 'share your screen' : 'open the camera'}: ${errText(e)}`, 'error');
+      return;
+    }
+    // Sharing stopped from the system's own controls.
+    video.stream.getVideoTracks().forEach((t) => t.addEventListener('ended', () => { stopCamera(); renderCall(); }));
+    const el = document.createElement('video');
+    el.muted = true;
+    el.playsInline = true;
+    el.srcObject = video.stream;
+    await el.play().catch(() => {});
+    const canvas = $('#call-canvas');
+    const ctx = canvas.getContext('2d');
+    let sending = false;
+    video.timer = setInterval(() => {
+      if (sending || !state.call || state.call.state === 'incoming') return;
+      ctx.drawImage(el, 0, 0, canvas.width, canvas.height);
+      const data = canvas.toDataURL('image/jpeg', 0.6);
+      const jpeg = data.slice(data.indexOf(',') + 1);
+      if (jpeg.length > 76000) return; // the node refuses frames over 60 KiB
+      sending = true;
+      call('send_video_frame', { jpeg }).catch(() => {}).finally(() => { sending = false; });
+    }, 100);
+    renderCall();
+  }
+
+  function stopCamera() {
+    if (video.timer) clearInterval(video.timer);
+    video.timer = null;
+    if (video.stream) video.stream.getTracks().forEach((t) => t.stop());
+    video.stream = null;
+  }
+
+  async function callAction(action) {
+    try {
+      if (action === 'call-voice') return confirmStartCall(false);
+      if (action === 'call-video') return confirmStartCall(true);
+      if (action === 'call-mute') await call('set_call_muted', { muted: !state.call.muted });
+      if (action === 'call-camera' || action === 'call-screen') {
+        const wanted = action === 'call-screen' ? 'screen' : 'camera';
+        const was = video.stream ? video.source : null;
+        stopCamera();
+        if (was !== wanted) await startCamera(wanted);
+      }
+      if (action === 'call-hangup') { stopCamera(); await call('hang_up'); state.call = null; }
+      await refreshCall();
+    } catch (e) {
+      toast(errText(e), 'error');
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Updates (fetched over Tor, signature-checked by the node)
   // ------------------------------------------------------------------
   const RELEASES_URL = 'https://github.com/erietechsolutions/SecureText/releases';
@@ -629,14 +840,26 @@
       <div class="actions"><button class="btn primary" data-close>Got it</button></div>`);
   }
 
-  function showSettings() {
+  async function showSettings() {
     const s = state.status || {};
     const u = state.update;
+    try { state.turn = await call('turn_servers'); } catch (_) { state.turn = []; }
+    const t = state.turn[0] || { url: '', username: '', credential: '' };
     modal(`<h3>Settings</h3>
       <div class="settings-section">
         <h4>Offline delivery</h4>
         <p class="sub">${esc(s.relay ? 'Using a relay: messages sent while you’re away wait there.' : 'No relay: messages reach you only while you’re online at the same time as the sender.')}</p>
         <button class="btn small" id="s-relay">${s.relay ? 'Change relay…' : 'Set up a relay…'}</button>
+      </div>
+      <div class="settings-section">
+        <h4>Calls</h4>
+        <p class="sub">Calls are relayed through a TURN server over the regular internet, not Tor. Its operator can see your IP address, but not what’s said. Use one you trust, such as one you run yourself with <code>securetext-turn</code>. If you leave this empty, you can still join calls using the caller’s server.</p>
+        <label>TURN server<input id="s-turn-url" spellcheck="false" placeholder="turn:turn.example.org:3478" value="${esc(t.url)}"></label>
+        <div class="row">
+          <label class="grow">Username<input id="s-turn-user" spellcheck="false" autocomplete="off" value="${esc(t.username)}"></label>
+          <label class="grow">Password<input id="s-turn-pass" type="password" autocomplete="off" value="${esc(t.credential)}"></label>
+        </div>
+        <div class="row"><button class="btn small" id="s-turn-save">Save call relay</button></div>
       </div>
       <div class="settings-section">
         <h4>Updates</h4>
@@ -654,6 +877,20 @@
       <div class="actions"><button class="btn primary" data-close>Done</button></div>`,
     (root, close) => {
       $('#s-relay', root).addEventListener('click', () => { close(); showRelaySettings(); });
+      $('#s-turn-save', root).addEventListener('click', async (e) => {
+        const url = $('#s-turn-url', root).value.trim();
+        const servers = url ? [{ url, username: $('#s-turn-user', root).value.trim(), credential: $('#s-turn-pass', root).value }] : [];
+        busy(e.target, true);
+        try {
+          state.turn = await call('set_turn_servers', { servers });
+          $('#m-err', root).textContent = '';
+          toast(servers.length ? 'Call relay saved.' : 'Call relay removed.');
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+        } finally {
+          busy(e.target, false);
+        }
+      });
       const auto = $('#s-auto', root);
       if (auto) auto.addEventListener('change', async () => {
         try {
@@ -908,6 +1145,8 @@
       case 'new-channel': return showNewChannel();
       case 'invite-server': return showInviteToServer();
       case 'settings': return showSettings();
+      case 'call-voice': case 'call-video': case 'call-mute': case 'call-camera': case 'call-screen': case 'call-hangup':
+        return callAction(t.dataset.action);
       case 'update-notes': return showUpdateNotes();
       case 'apply-update': return applyUpdate(t);
     }

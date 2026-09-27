@@ -35,8 +35,9 @@ use securetext_identity::IdentityStore;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-pub use node::{fingerprint, MAX_MESSAGE_CHARS};
-use node::{Job, NetEvent, NodeState, Opened, Timing};
+pub use node::{fingerprint, CallParticipantView, CallView, MAX_MESSAGE_CHARS};
+use node::{CallSetup, Job, NetEvent, NodeState, Opened, Timing};
+pub use securetext_call as call;
 pub use transport::{MemoryNetwork, TorTransport, Transport};
 pub use updates::{tor_https_client, UpdateConfig, UpdateState, UpdateStatus};
 pub use securetext_update as update;
@@ -77,6 +78,10 @@ pub struct NodeConfig {
     pub relay_poll_interval: Duration,
     /// Automatic updates (desktop builds only; `None` disables them).
     pub update: Option<UpdateConfig>,
+    /// Microphone and speakers for calls (`None`: calls unavailable).
+    pub call_audio: Option<Arc<dyn call::AudioBackend>>,
+    /// Tests: accept TURN relays on 127.0.0.1.
+    pub call_allow_loopback: bool,
 }
 
 impl NodeConfig {
@@ -91,6 +96,8 @@ impl NodeConfig {
             presence_interval: Duration::from_secs(600),
             relay_poll_interval: Duration::from_secs(90),
             update: None,
+            call_audio: Some(Arc::new(call::CpalBackend)),
+            call_allow_loopback: false,
         }
     }
 }
@@ -181,6 +188,10 @@ pub enum Event {
     MessageStatus { conversation_id: String, id: String, status: String },
     Peer { key: String, online: bool },
     Update { status: UpdateStatus },
+    /// The call changed (or ended: `call` is `None` and `ended` says why).
+    Call { call: Option<CallView>, ended: Option<String> },
+    /// A video frame (base64 JPEG) from a call participant.
+    CallVideo { peer_key: String, jpeg: String },
 }
 
 /// A running node. Cheap to clone; every clone talks to the same node.
@@ -223,6 +234,9 @@ impl NodeHandle {
         let mut state = NodeState::new(opened, events.clone(), net_tx.clone(), timing)?;
         if let Some(update) = config.update {
             state.enable_updates(update);
+        }
+        if let Some(audio) = config.call_audio {
+            state.enable_calls(CallSetup { audio, allow_loopback: config.call_allow_loopback });
         }
 
         match config.network {
@@ -360,6 +374,64 @@ impl NodeHandle {
     /// card; invites created afterwards include it.
     pub async fn set_relay(&self, address: Option<String>) -> anyhow::Result<Option<String>> {
         self.call(move |s| s.set_relay(address.as_deref())).await
+    }
+
+    // ---- calls (Phase 7) ----
+
+    /// Ring everyone in a DM or channel. Needs a TURN server (see
+    /// [`Self::set_turn_servers`]) and at least one member online.
+    pub async fn start_call(&self, conversation_id: String, video: bool) -> anyhow::Result<CallView> {
+        self.call(move |s| s.start_call(&conversation_id, video)).await
+    }
+
+    pub async fn accept_call(&self) -> anyhow::Result<CallView> {
+        self.call(|s| s.accept_call()).await
+    }
+
+    pub async fn decline_call(&self) -> anyhow::Result<()> {
+        self.call(|s| s.decline_call()).await
+    }
+
+    pub async fn hang_up(&self) -> anyhow::Result<()> {
+        self.call(|s| s.hang_up()).await
+    }
+
+    pub async fn set_call_muted(&self, muted: bool) -> anyhow::Result<()> {
+        self.call(move |s| s.set_call_muted(muted)).await
+    }
+
+    pub async fn call_status(&self) -> anyhow::Result<Option<CallView>> {
+        self.call(|s| Ok(s.call_view())).await
+    }
+
+    /// How each participant's media is actually carried (candidate types,
+    /// bytes), straight from WebRTC's stats.
+    pub async fn call_stats(&self) -> anyhow::Result<Vec<call::PeerStats>> {
+        let engine = self.call(|s| Ok(s.call_engine())).await?;
+        Ok(node::call_stats(engine).await)
+    }
+
+    /// Send one camera frame (JPEG bytes) to everyone in the call.
+    pub async fn send_video_frame(&self, jpeg: Vec<u8>) -> anyhow::Result<()> {
+        let engine = self.call(|s| Ok(s.call_engine())).await?;
+        match engine {
+            Some(engine) => engine.send_video(&jpeg).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Test audio only: what the synthetic speaker played recently (pitch
+    /// and how much was audible), proving audio crossed the call intact.
+    pub async fn call_heard(&self) -> anyhow::Result<Option<call::audio::Heard>> {
+        self.call(|s| Ok(s.heard())).await
+    }
+
+    pub async fn turn_servers(&self) -> anyhow::Result<Vec<call::TurnServer>> {
+        self.call(|s| s.turn_servers()).await
+    }
+
+    pub async fn set_turn_servers(&self, servers: Vec<call::TurnServer>) -> anyhow::Result<Vec<call::TurnServer>> {
+        self.call(move |s| s.set_turn_servers(servers)).await
     }
 
     pub async fn update_status(&self) -> anyhow::Result<Option<UpdateStatus>> {

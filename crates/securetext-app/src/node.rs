@@ -7,6 +7,8 @@
 //! fork the group). Network I/O happens in separate per-connection tasks
 //! that only ever hand frames to and from this one.
 
+mod calls;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +28,8 @@ use tokio::task::JoinSet;
 use crate::relay::{self, MyRelay};
 use crate::store::{ConversationRow, MessageRow, PeerRow, Store};
 use crate::transport::{BoxedStream, Listening, Transport};
+pub use calls::{stats as call_stats, CallParticipantView, CallView};
+pub(crate) use calls::CallSetup;
 use crate::updates::{ExitFactory, UpdateConfig, UpdateEvent, UpdateStatus, Updater};
 use crate::wire::{
     self, to_hex, ContactCard, ConversationInfo, ConversationKind, Payload, SignedCard, WireMessage,
@@ -61,6 +65,7 @@ pub(crate) enum NetEvent {
         exit: Option<ExitFactory>,
     },
     Update(UpdateEvent),
+    Call(calls::CallNet),
     TransportFailed(String),
     Incoming(BoxedStream),
     Connected {
@@ -116,6 +121,9 @@ struct PendingWelcome {
     roster: Vec<SignedCard>,
     received: Instant,
 }
+
+/// How long a live-only frame waits for a connection to its recipient.
+const LIVE_HOLD: Duration = Duration::from_secs(30);
 
 /// How many early channel Welcomes are held, and for how long.
 const MAX_PENDING_WELCOMES: usize = 64;
@@ -180,6 +188,12 @@ pub(crate) struct NodeState {
     net_tx: mpsc::UnboundedSender<NetEvent>,
     timing: Timing,
     updater: Option<Updater>,
+    call: Option<calls::CallState>,
+    call_setup: Option<CallSetup>,
+    /// Live-only frames (call signals) for peers we're still dialing: sent
+    /// if the connection comes up within `LIVE_HOLD`, otherwise dropped.
+    /// Never persisted and never left at a relay.
+    live_pending: HashMap<Vec<u8>, Vec<(Instant, WireMessage)>>,
     dirty: bool,
     pub(crate) stopping: bool,
 }
@@ -250,6 +264,9 @@ impl NodeState {
             net_tx,
             timing,
             updater: None,
+            call: None,
+            call_setup: None,
+            live_pending: HashMap::new(),
             dirty: false,
             stopping: false,
         })
@@ -274,6 +291,7 @@ impl NodeState {
     }
 
     pub(crate) fn shutdown(&mut self) {
+        let _ = self.hang_up();
         self.dirty = true;
         self.seal_if_dirty();
         self.stopping = true;
@@ -315,6 +333,7 @@ impl NodeState {
                 self.maybe_collect();
             }
             NetEvent::TransportFailed(error) => self.set_network(NetworkState::Error(error)),
+            NetEvent::Call(event) => self.on_call_net(event),
             NetEvent::Update(event) => {
                 if let Some(updater) = &mut self.updater {
                     updater.on_event(event, &mut self.tasks, &self.net_tx);
@@ -388,6 +407,11 @@ impl NodeState {
             }
             self.maybe_collect();
         }
+        self.call_tick();
+        self.live_pending.retain(|_, held| {
+            held.retain(|(queued, _)| queued.elapsed() < LIVE_HOLD);
+            !held.is_empty()
+        });
         if let Some(updater) = &mut self.updater {
             let before = updater.status();
             updater.tick(&mut self.tasks, &self.net_tx);
@@ -401,6 +425,10 @@ impl NodeState {
     // =====================================================================
     // Updates (Phase 6)
     // =====================================================================
+
+    pub(crate) fn enable_calls(&mut self, setup: CallSetup) {
+        self.call_setup = Some(setup);
+    }
 
     pub(crate) fn enable_updates(&mut self, config: UpdateConfig) {
         // On unless the user turned them off.
@@ -829,6 +857,13 @@ impl NodeState {
                 let _ = tx.send(Outgoing { outbox_id: Some(row.id), message: row.frame });
             }
         }
+        if let Some(held) = self.live_pending.remove(&peer_key) {
+            for (queued, message) in held {
+                if queued.elapsed() < LIVE_HOLD {
+                    let _ = tx.send(Outgoing { outbox_id: None, message });
+                }
+            }
+        }
         self.connections.insert(peer_key.clone(), Conn { id: conn_id, tx });
         self.emit(Event::Peer { key: to_hex(&peer_key), online: true });
     }
@@ -1081,6 +1116,11 @@ impl NodeState {
                 if self.store.insert_message(&row)? {
                     let view = self.message_view(&row);
                     self.emit(Event::Message { conversation_id: to_hex(gid), message: view });
+                }
+            }
+            Payload::Call { call_id, signal } => {
+                if !conversation.removed {
+                    self.on_call_signal(gid, sender, call_id, signal);
                 }
             }
             Payload::Roster { cards } => {

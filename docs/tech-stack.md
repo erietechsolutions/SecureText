@@ -33,7 +33,7 @@ question) — both are now settled below.
 | Symmetric crypto primitives | `RustCrypto` crates (`chacha20poly1305`, `ed25519-dalek`, `x25519-dalek`) | Widely used, individually audited primitive crates rather than a monolithic library |
 | Password/passphrase KDF | `argon2` crate (Argon2id) | Memory-hard, current best practice over PBKDF2/bcrypt |
 | Local storage | SQLite via `rusqlite` + SQLCipher | Encrypted at rest; SQL is sufficient for message/channel/member metadata at this scale |
-| Voice/video | WebRTC via `webrtc-rs` | Native Rust WebRTC implementation; used only for the Phase 7 calls exception (architecture.md §9), which is deliberately outside the Tor transport |
+| Voice/video | `webrtc-rs` (`webrtc` 0.17, `turn` 0.17), `opus` 0.4 (libopus built in via `opusic-sys`), `cpal` | Native Rust WebRTC, used only for the Phase 7 calls exception (architecture.md §9), which is deliberately outside the Tor transport. Media runs in Rust because distro WebKitGTK builds lack WebRTC (Phase 7 findings). The `turn` crate also provides `securetext-turn` |
 | Invite link encoding | `base64` (`marshallpierce/rust-base64`) | Extremely widely used (1.5B+ downloads), MIT/Apache-2.0, actively maintained — vetted per this doc's own standing rule below; used to keep byte fields (keys, key packages) compact within an invite link's JSON payload instead of serde_json's default number-array encoding |
 
 **Dropped from the stack:** `rust-libp2p`. It was chosen when the network
@@ -190,7 +190,9 @@ rather than guessed in advance:
 3. **`webrtc-rs` vs. FFI to `libwebrtc`** — `webrtc-rs` is younger than
    Google's `libwebrtc`; verify it covers everything needed (in particular
    ICE/TURN interop for the forced-relay calling mode) before Phase 7, or
-   plan an FFI fallback.
+   plan an FFI fallback. *(Resolved in Phase 7: relay-only ICE through its
+   TURN client works, verified with its TURN server and over the GUI. It
+   hasn't yet been tested against coturn or across real NATs.)*
 4. **Bridge configuration UX** — auto-detect-and-prompt vs. explicit
    settings toggle for obfs4 bridges (architecture.md §5); needs a decision
    before Phase 1's exit criteria are finalized. Not yet implemented in
@@ -459,6 +461,49 @@ loopback interface had gone down after a KDE network toggle
 own lock screen unless given `--no-lockscreen`; and WebKitWebDriver
 doesn't pass the app's stderr through, so the E2E script dumps each node's
 state through the app's own API when a step fails.
+
+## Phase 7 implementation findings
+
+- **Distro WebKitGTK has no WebRTC.** The plan was calls inside the
+  webview (it's what a browser would do). A probe inside the running app
+  found `RTCPeerConnection` undefined even with WebKit's `enable-webrtc`
+  setting on. Checking the libraries themselves showed that
+  `libwebkit2gtk-4.1` in **Ubuntu 24.04 (2.52.6), Fedora 44 (2.54.0) and
+  the GNOME 50 runtime** is built without the WebRTC bindings (no
+  `JSRTCPeerConnection` symbols at all). `getUserMedia` does work there
+  (camera and microphone), and so does WebKit's mock-device setting used
+  in tests. So media moved to Rust, and only camera capture stays in the
+  webview. Windows' WebView2 does have WebRTC, but one code path for every
+  platform was preferred.
+- **wry sets neither WebRTC nor media capture**, and doesn't answer
+  WebKitGTK's permission requests, which then default to *deny*. The
+  desktop shell sets `enable-media-stream` itself (plus `enable-webrtc` for
+  the future) and allows camera/microphone requests only. The page is
+  reloaded once after, because a page's available APIs are fixed when it
+  loads.
+- **webrtc-rs candidate-pair stats have no byte counts.** Use the ICE
+  transport's stats for bytes, and the nominated pair for the candidate
+  types in use.
+- **Estimating a tone's pitch from zero crossings** has to skip silent
+  stretches, or playback gaps read as a lower pitch (a first GUI run
+  "heard" 607 Hz for a 660 Hz tone). The analyser now reports pitch over
+  audible blocks and, separately, the audible fraction, which shows
+  dropouts directly.
+- **Call signals must survive a connection that's still being dialed.** In
+  a channel, two members may never have connected directly. Dropping
+  signals for non-connected members broke three-way calls (caught by the
+  test). They're now held for up to 30 s while the connection is dialed,
+  and still never persisted.
+- **`opus` 0.3's `audiopus_sys` is unmaintained** (RUSTSEC-2026-0150), and
+  its bundled build fails with CMake 4, which would have broken Windows
+  builds. `cargo-deny` flagged it. Moved to `opus` 0.4 (`opusic-sys`), which
+  builds libopus into the binary, so packages don't need a libopus
+  dependency; only ALSA remains on Linux.
+- **Headless GUI testing:** a leftover virtual compositor from an earlier
+  run keeps the Wayland socket, and new WebDriver sessions then hang
+  silently. The document portal can also be absent (`flatpak run
+  --no-documents-portal`). Clean up by exact process name. `pkill -f` on a
+  pattern also matches the shell running it.
 
 ## Standing rule: crypto/network-adjacent dependency vetting
 

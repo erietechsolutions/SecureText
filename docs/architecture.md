@@ -209,35 +209,60 @@ is orthogonal to the transport choice — see threat-model.md's non-goals):
 
 ## 9. Voice & video (Phase 7) — the disclosed exception
 
-Per the explicit design decision (see threat-model.md's disclosed
-exception): calls use a **separate, faster path than text messaging**,
-trading some anonymity for usable call quality, rather than routing
-real-time media over Tor.
+Per the explicit design decision (threat-model.md's disclosed exception),
+call media takes a faster path than Tor. The anonymity it gives up is kept
+as small as it can be, and the user is told about it before every call.
+As built (`crates/securetext-call`, `securetext-app/src/node/calls.rs`):
 
-- **WebRTC** for media transport (SRTP), using STUN/TURN/ICE for NAT
-  traversal — this reintroduces, *for calls only*, the NAT-traversal
-  machinery that §3 otherwise eliminates for messaging.
-- **Mitigation to preserve as much anonymity as practical:** default to a
-  **forced-relay mode** (media always routed through a TURN-style relay
-  rather than attempting a direct peer connection), so participants don't
-  learn each other's raw IP directly — the relay operator can see both
-  IPs, which is the accepted exposure for this feature, but the other call
-  participant does not. This mirrors how mainstream E2EE calling apps
-  (e.g., Signal's "always relay calls" setting) handle the same tradeoff.
-- **Call signaling** (who is being called, ringing, accept/decline) still
-  goes over the Tor-routed MLS channel like any other message — only the
-  real-time media stream itself uses the separate path, once a call is
-  accepted.
-- Call content itself remains E2EE: layer SecureText's own MLS-derived key
-  material on top of WebRTC's DTLS-SRTP rather than relying solely on
-  WebRTC's default, which doesn't guarantee confidentiality end-to-end when
-  media is server-relayed.
-- **UI requirement:** the calling UI must disclose that starting a call
-  uses a faster, non-anonymous connection, so users don't assume the
-  always-on text anonymity guarantee extends to calls (threat-model.md).
-- This design is a placeholder for Phase 7 — the exact mechanism should be
-  re-validated against threat-model.md's disclosed-exception language once
-  Phase 7 actually starts.
+- **Signaling stays on Tor and in MLS.** Ring, join, leave and the WebRTC
+  offers and answers are MLS application messages in the conversation's
+  own group (a DM or a channel). Only members can read them, and MLS
+  authenticates the sender. They're sent *live only*: to members connected
+  now, or held for up to 30 s while a connection is dialed. They never go
+  into the outbox or to an offline-delivery relay, since a ring delivered
+  hours later is worse than none.
+- **Media always goes through a TURN relay (forced relay).** Every peer
+  connection uses `iceTransportPolicy = relay` with mDNS candidates off, so
+  this device never offers a host or server-reflexive address. As a second
+  line of defense, an SDP holding any candidate that isn't `typ relay` is
+  refused before it's sent. Other participants only ever see a TURN
+  server's address.
+  - The **TURN operator** sees the IP addresses of the people using it and
+    when they're on a call. That's the accepted, disclosed exposure. Each
+    person uses their own TURN server if they've set one (Settings →
+    Calls), otherwise the caller's, which travels in the MLS-encrypted
+    ring.
+  - `securetext-turn` is a small TURN server anyone can run; coturn works
+    too.
+- **End-to-end encryption, two layers.**
+  1. DTLS-SRTP runs peer to peer *through* the relay. TURN only forwards
+     packets, and the DTLS fingerprints are inside MLS-authenticated
+     signaling, so the relay can't read media or sit in the middle.
+  2. Independently of WebRTC's own crypto, every audio and video frame is
+     sealed with ChaCha20-Poly1305 under a per-call key. The caller
+     generates it at random and distributes it only inside the
+     MLS-encrypted ring. It's bound to the call ID and media kind, so a
+     frame can't be replayed into another call or as the other kind.
+     Frames that don't authenticate are dropped.
+- **Topology: a small mesh.** Each participant connects to each other one
+  (there's no media server). Whoever joins announces it, and everyone
+  already in the call offers them a connection. If two offer each other at
+  once, the lower identity key's offer wins. This is fine for small groups;
+  bandwidth grows with the number of participants.
+- **Where media runs.** Media runs in Rust (webrtc-rs, Opus at 48 kHz/32
+  kb/s, cpal for devices), **not in the webview**. The WebKitGTK builds that
+  Ubuntu 24.04 and Fedora 44 ship (and the GNOME 50 runtime) are compiled
+  without WebRTC: `RTCPeerConnection` doesn't exist in them
+  (tech-stack.md). The webview's camera API does work, so video frames are
+  captured there, sent to the node as small JPEGs (320×240, about 10 fps),
+  sealed, and carried over a WebRTC data channel on the same relayed
+  connection.
+- **Known limits:**
+  - There's no echo cancellation yet (use headphones).
+  - Video is low resolution.
+  - A member removed from the conversation during a call keeps that call's
+    key until it ends.
+  - The TURN operator can see traffic volume and timing.
 
 ## 10. Updates (Phase 6)
 

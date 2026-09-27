@@ -31,20 +31,34 @@
     "category": "SocialNetworking",
     "shortDescription": "Anonymous, end-to-end encrypted chat over Tor",
     "longDescription": "SecureText is a Discord-style messenger with no accounts and no central server. Every message is end-to-end encrypted (MLS) and travels only over Tor onion services, so nobody can read it or tell who is talking to whom.",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.png", "icons/icon.ico"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
     "linux": {
       "deb": {
-        "section": "net"
+        "section": "net",
+        "depends": [
+          "libasound2t64 | libasound2"
+        ]
       },
       "rpm": {
-        "release": "1"
+        "release": "1",
+        "depends": [
+          "alsa-lib"
+        ]
       },
       "appimage": {
         "bundleMediaFramework": false
       }
     },
     "windows": {
-      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
       "nsis": {
         "installMode": "currentUser",
         "displayLanguageSelector": false

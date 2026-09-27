@@ -83,6 +83,12 @@ async fn unlock(
     }
     let mut config = NodeConfig::tor(state.profile_dir.clone(), label, passphrase);
     config.update = update_config(state.update_dir.clone());
+    // Automated GUI tests only: a synthetic tone instead of the microphone
+    // and speakers, and a TURN server on this machine.
+    if let Some(tone) = std::env::var("SECURETEXT_TEST_TONE").ok().and_then(|t| t.parse::<f32>().ok()) {
+        config.call_audio = Some(std::sync::Arc::new(securetext_app::call::ToneBackend::new(tone)));
+        config.call_allow_loopback = true;
+    }
     let node = NodeHandle::start(config).await.map_err(|e| format!("{e:#}"))?;
 
     let mut events = node.subscribe();
@@ -147,9 +153,50 @@ async fn apply_update(app: tauri::AppHandle, state: State<'_, AppState>) -> Resu
     }
 }
 
+/// Linux: turn on WebRTC and camera/microphone capture in WebKitGTK
+/// (both off by default) so calls work, and answer the webview's
+/// permission prompts: camera/microphone yes, everything else no. The only
+/// page this webview ever shows is our own bundled UI (the CSP forbids
+/// remote content), and it asks for media only after the user has seen the
+/// call disclosure and started or accepted a call.
+///
+/// `SECURETEXT_MOCK_MEDIA=1` swaps real devices for WebKit's synthetic
+/// camera and microphone, for automated call tests on machines without
+/// either.
+#[cfg(target_os = "linux")]
+fn configure_webview(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    window.with_webview(|webview| {
+        use webkit2gtk::{PermissionRequestExt, SettingsExt, UserMediaPermissionRequest, WebViewExt};
+        use webkit2gtk::glib::object::Cast;
+        let view = webview.inner();
+        if let Some(settings) = WebViewExt::settings(&view) {
+            settings.set_enable_webrtc(true);
+            settings.set_enable_media_stream(true);
+            if std::env::var_os("SECURETEXT_MOCK_MEDIA").is_some() {
+                settings.set_enable_mock_capture_devices(true);
+            }
+        }
+        // Which web APIs a page gets is fixed when it loads, and the first
+        // load has already started by now: load it again with WebRTC on.
+        view.reload();
+        view.connect_permission_request(|_, request| {
+            if request.downcast_ref::<UserMediaPermissionRequest>().is_some() {
+                request.allow();
+            } else {
+                request.deny();
+            }
+            true
+        });
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                configure_webview(&window)?;
+            }
             // SECURETEXT_PROFILE_DIR lets one machine run several profiles
             // (e.g. testing two users side by side) and points the profile
             // somewhere with a clean ownership chain when the default app

@@ -15,6 +15,12 @@ running with its own profile directory and automation enabled:
         WebKitWebDriver --port=4445 &
     python3 desktop/e2e/gui_e2e.py --binary desktop/target/debug/securetext-desktop \
         [--relay securetext-relay1:...]   # adds the Phase 5 offline-delivery stage
+        [--turn turn:127.0.0.1:3478,user,password]   # adds the Phase 7 call stage
+
+For the call stage, also start each driver with SECURETEXT_MOCK_MEDIA=1 and
+a different SECURETEXT_TEST_TONE (Alice 440, Bob 660), and run a TURN
+server (`securetext-turn --listen 127.0.0.1:3478 --public-ip 127.0.0.1
+--user user:password`).
 
 The windows need a display. Headless, a virtual compositor works (e.g.
 `dbus-run-session -- kwin_wayland --virtual --no-lockscreen --socket X`
@@ -50,7 +56,7 @@ class Window:
         req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=120) as res:
+            with urllib.request.urlopen(req, timeout=300) as res:
                 return json.loads(res.read() or b"{}").get("value")
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"[{self.name}] {method} {path}: {e.read().decode(errors='replace')}") from None
@@ -190,6 +196,70 @@ def send(w, body):
     w.click("#composer button[type=submit]")
 
 
+def call_stage(alice, bob, turn, screen_share=False):
+    """Phase 7: a video call from the DM. Signaling goes over the live-Tor
+    connection between the two apps; media goes through the TURN server
+    given on the command line. Run the apps with SECURETEXT_TEST_TONE
+    (a different pitch each) and SECURETEXT_MOCK_MEDIA=1, so what each one
+    hears and sees can be checked."""
+    url, user, password = turn.split(",", 2)
+    alice.click("#me-settings")
+    alice.type("#s-turn-url", url)
+    alice.type("#s-turn-user", user)
+    alice.type("#s-turn-pass", password)
+    alice.shot("16-call-settings")
+    alice.click("#s-turn-save")
+    alice.wait("TURN server saved", "return !!document.querySelector('.toast');")
+    alice.click(".modal [data-close]")
+
+    alice.wait("call button", "return !!document.querySelector('[data-action=call-video]');")
+    alice.click("[data-action=call-video]")
+    alice.wait("call disclosure", has_text(".modal", "Calls don\u2019t go through Tor"))
+    alice.shot("17-call-disclosure")
+    alice.click("#m-go")
+    bob.wait("incoming call", has_text(".modal", "is calling"), timeout=180)
+    bob.shot("18-incoming-call")
+    bob.click("#m-accept")
+    for w in (alice, bob):
+        w.wait("call connected", has_text("#call-panel", "1 connected"), timeout=180)
+    log("call connected on both sides")
+    time.sleep(5)
+
+    tones = {"Alice": 440.0, "Bob": 660.0}
+    for w, other in ((alice, "Bob"), (bob, "Alice")):
+        stats = w.invoke("call_stats").get("ok")
+        assert stats and all(s["local_candidate"] == "relay" and s["remote_candidate"] == "relay" for s in stats), stats
+        heard = w.invoke("call_heard").get("ok")
+        log(f"[{w.name}] media relayed both ways ({stats[0]['bytes_received']} bytes in); heard {heard}")
+        assert heard and abs(heard["frequency"] - tones[other]) < 25, f"{w.name} heard {heard}, expected {other}'s {tones[other]}"
+        assert heard["audible_fraction"] > 0.5, f"{w.name}: too many dropouts: {heard}"
+        w.wait("remote video frame", "const i = document.querySelector('#call-panel img[data-video]');"
+               " return !!i && (i.getAttribute('src') || '').startsWith('data:image/jpeg');", timeout=60)
+    log("each side hears the other's tone and sees the other's camera")
+    alice.shot("19-in-call")
+    bob.shot("19-in-call")
+
+    # Screen sharing replaces Alice's camera; Bob keeps receiving frames.
+    # Opt-in: the system's screen picker (xdg-desktop-portal) has to be
+    # answered by hand, so this needs a real desktop session.
+    if screen_share:
+        screen_share_check(alice, bob)
+
+    bob.click("[data-action=call-hangup]")
+    alice.wait("call ended for Alice", "return document.querySelector('#call-panel').hidden;", timeout=120)
+    log("hang-up ended the call on both sides")
+
+
+def screen_share_check(alice, bob):
+    alice.click("[data-action=call-screen]")
+    alice.wait("sharing screen", has_text("#call-panel", "Stop sharing"), timeout=30)
+    bob.js("document.querySelector('#call-panel img[data-video]').removeAttribute('src');")
+    bob.wait("screen frames arriving", "const i = document.querySelector('#call-panel img[data-video]');"
+             " return !!i && (i.getAttribute('src') || '').startsWith('data:image/jpeg');", timeout=60)
+    log("screen share frames reach the other side")
+    bob.shot("20-screen-share")
+
+
 def relay_stage(alice, bob, args, binary):
     """Phase 5 over live Tor: Bob picks a relay and goes offline; Alice's
     message is left there; Alice goes offline; Bob comes back and gets it."""
@@ -240,6 +310,8 @@ def main():
     ap.add_argument("--bob-port", type=int, default=4445)
     ap.add_argument("--shots", default="e2e-shots")
     ap.add_argument("--relay", help="a securetext-relay1: address; adds the offline-delivery stage")
+    ap.add_argument("--turn", help="turn:host:port,username,password; adds the call stage")
+    ap.add_argument("--screen-share", action="store_true", help="also share a screen in the call (answer the system picker by hand)")
     args = ap.parse_args()
     os.makedirs(args.shots, exist_ok=True)
     binary = os.path.abspath(args.binary)
@@ -277,6 +349,8 @@ def main():
         log("bob received alice's reply")
         alice.shot("07-dm-conversation")
         bob.shot("07-dm-conversation")
+        if args.turn:
+            call_stage(alice, bob, args.turn, args.screen_share)
 
         # Alice creates a server and invites Bob.
         alice.click("#rail-add")

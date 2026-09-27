@@ -26,7 +26,7 @@ exception to the anonymity guarantee — see
 | 4 | Desktop client (Tauri) | ✅ Verified through the GUI over live Tor · real-user test pending |
 | 5 | Offline delivery (relays) | ✅ Verified deterministically and over live Tor |
 | 6 | Desktop installers & auto-updates | ✅ Built and verified locally · first signed release pending |
-| 7 | Voice & video | Not started |
+| 7 | Voice & video | ✅ Built · verified via the GUI · real devices/networks pending |
 | 8 | Rich features (files, reactions, threads…) | Not started |
 | 9 | Hardening & third-party audit | Not started |
 | 10 | Mobile core compatibility | Not started |
@@ -54,6 +54,13 @@ each phase's verification did and didn't cover.
 - **Confirmed delivery.** A message counts as sent only once the
   recipient's app acknowledges it.
 
+- **Voice and video calls** in DMs and channels. This is the one feature
+  that doesn't go over Tor, and the app says so before every call. Media
+  always goes through a TURN relay server, so the other people on the call
+  never learn your IP address (the relay's operator does). Calls are
+  end-to-end encrypted under a key shared inside MLS. Set a TURN server in
+  Settings → Calls, or join using the caller's; `securetext-turn` is one
+  you can run yourself.
 - **Automatic updates, privately.** The app checks GitHub Releases over
   Tor at random times and installs only updates signed by the SecureText
   release key, when you choose to restart (Settings → Updates).
@@ -71,15 +78,15 @@ source. How releases are made and signed: [docs/releasing.md](docs/releasing.md)
 You need a Rust toolchain ([rustup](https://rustup.rs)).
 
 ```sh
-cargo test --workspace   # the core crates; no GUI system packages needed
+cargo test --workspace   # the core crates (needs ALSA headers and CMake for calls; no GUI packages)
 ```
 
 The desktop app is a [Tauri 2](https://tauri.app) app and needs its system
 prerequisites (see Tauri's prerequisites guide for the full list):
 
-- **Fedora:** `sudo dnf install webkit2gtk4.1-devel libsoup3-devel gtk3-devel openssl-devel librsvg2-devel`
-- **Ubuntu:** `sudo apt install libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev build-essential libssl-dev librsvg2-dev`
-- **Windows:** Microsoft C++ Build Tools and WebView2 (preinstalled on Windows 11)
+- **Fedora:** `sudo dnf install webkit2gtk4.1-devel libsoup3-devel gtk3-devel openssl-devel librsvg2-devel alsa-lib-devel cmake`
+- **Ubuntu:** `sudo apt install libwebkit2gtk-4.1-dev libsoup-3.0-dev libgtk-3-dev build-essential libssl-dev librsvg2-dev libasound2-dev cmake`
+- **Windows:** Microsoft C++ Build Tools, CMake, and WebView2 (preinstalled on Windows 11)
 
 ```sh
 cd desktop
@@ -126,6 +133,7 @@ running it headlessly.
 - `crates/securetext-app`: the application core (node, storage, peer protocol, relay client)
 - `crates/securetext-relay`: store-and-forward relay server
 - `crates/securetext-update`: signed, Tor-only updates (and the `securetext-release` signing tool)
+- `crates/securetext-call`: call engine (relay-only WebRTC, Opus, per-call media key) and `securetext-turn`
 - `crates/securetext-cli`: proof-of-integration CLI and live-Tor demos
 - `desktop/`: Tauri desktop client (own Cargo workspace), its web UI, and the GUI end-to-end test
 - `packaging/`, `scripts/`, `.github/workflows/`: installers, relay packaging, release pipeline

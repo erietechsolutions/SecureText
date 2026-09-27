@@ -74,10 +74,12 @@
     <main class="main">
       <header class="main-head">
         <div class="main-title" id="main-title"></div>
+        <div class="head-actions" id="head-actions"></div>
         <button class="net-pill" id="net-pill" type="button" aria-haspopup="dialog"></button>
       </header>
       <div id="net-banner" class="net-banner" hidden></div>
       <div id="update-banner" class="update-banner" hidden></div>
+      <section id="call-panel" class="call-panel" hidden aria-label="Call"></section>
       <div class="messages" id="messages" aria-live="polite"></div>
       <form class="composer" id="composer" hidden>
         <textarea id="composer-input" rows="1" maxlength="4000" placeholder="Message" aria-label="Message"></textarea>
@@ -93,6 +95,7 @@
   </div>
 
   <div id="modal-root"></div>
+  <canvas id="call-canvas" width="320" height="240" hidden></canvas>
   <div id="toasts" class="toasts" aria-live="assertive"></div>
 
   <script src="app.js"></script>

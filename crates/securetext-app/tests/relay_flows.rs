@@ -53,6 +53,8 @@ fn config(dir: &std::path::Path, name: &str, net: &MemoryNetwork) -> NodeConfig 
         presence_interval: Duration::from_secs(3600),
         relay_poll_interval: Duration::from_millis(200),
         update: None,
+        call_audio: None,
+        call_allow_loopback: false,
     }
 }
 

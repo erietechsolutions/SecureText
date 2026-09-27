@@ -12,6 +12,7 @@ securetext-net = { path = "../securetext-net" }
 securetext-invite = { path = "../securetext-invite" }
 securetext-relay = { path = "../securetext-relay" }
 securetext-update = { path = "../securetext-update" }
+securetext-call = { path = "../securetext-call" }
 openmls.workspace = true
 openmls_traits.workspace = true
 openmls_rust_crypto.workspace = true

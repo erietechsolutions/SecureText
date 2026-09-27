@@ -14,7 +14,7 @@ this is a security-sensitive project where shortcuts compound.
 | 4 | Desktop client (Tauri) | ✅ Verified through the GUI over live Tor · real-user test pending |
 | 5 | Offline delivery (relays) | ✅ Verified deterministically and over live Tor |
 | 6 | Desktop installers & auto-updates | ✅ Built and verified locally · CI install runs and first signed release pending |
-| 7 | Voice & video (the disclosed exception) | Not started |
+| 7 | Voice & video (the disclosed exception) | ✅ Built · verified via GUI with live-Tor signaling · real devices/networks pending |
 | 8 | Rich features | Not started |
 | 9 | Hardening & third-party audit | Not started · required before any production claim |
 | 10 | Mobile core compatibility | Not started |
@@ -528,16 +528,100 @@ possible. Full procedure: releasing.md. Design: architecture.md §10.
   - the end-to-end update needs the maintainer's key (releasing.md) and a
     public repository.
 
-## Phase 7 — Voice & Video (the disclosed exception)
-- WebRTC integration for calls and screen share, keyed from the existing
-  MLS session material, using the forced-relay design from
-  architecture.md §9 (never a direct peer connection for media)
-- Calling UI explicitly discloses the reduced anonymity guarantee for
-  calls before a call starts (threat-model.md)
+## Phase 7 — Voice & Video (the disclosed exception) *(built; verified through the GUI with live-Tor signaling · real-network and real-device tests pending)*
+Design as built: architecture.md §9.
+- [x] Calls in DMs and channels: voice or video, one call at a time, a
+      small mesh (each participant connects to each other one). Ring,
+      accept/decline, join and leave, mute, camera on/off, and a ring
+      timeout. Everyone else in a channel call carries on when one person
+      leaves.
+- [x] **Forced relay, never direct:**
+  - `iceTransportPolicy = relay` with mDNS candidates off;
+  - an SDP containing anything but relay candidates is refused before it
+    leaves the device;
+  - each person uses their own TURN server (Settings → Calls) or the
+    caller's;
+  - `securetext-turn` is a TURN server anyone can run (release asset).
+- [x] **Keyed from MLS:**
+  - signaling (including the DTLS fingerprints) travels as MLS messages in
+    the conversation's group, sent live only and never queued or relayed;
+  - a random per-call key, distributed only inside the MLS-encrypted ring,
+    seals every audio and video frame (ChaCha20-Poly1305, bound to the call
+    and media kind) on top of DTLS-SRTP.
+- [x] **Disclosure before every call:** a dialog before starting or joining
+      says calls don't go through Tor, names whose relay sees the IP, says
+      the other participants don't see it, and says what stays private. The
+      in-call panel shows "relayed via your/the caller's TURN server".
+- [x] Media in Rust (webrtc-rs, Opus 48 kHz, cpal), because Ubuntu's and
+      Fedora's WebKitGTK are built without WebRTC (tech-stack.md, Phase 7
+      findings). Camera frames come from the webview and travel as sealed
+      JPEGs over a data channel on the same relayed connection.
+- [x] Screen sharing through the webview's `getDisplayMedia` (the system's
+      screen picker), feeding the same frame path. **Unverified:** the
+      picker can't be answered in the headless test environment; it's an
+      opt-in step of the GUI test (`--screen-share`) for a real desktop.
+- **Verification:**
+  - ✅ `crates/securetext-call` (10 tests), two engines through a real TURN
+    server:
+    - each hears the other's tone at the right pitch after Opus → seal →
+      SRTP → TURN → unseal → decode;
+    - WebRTC's own stats show relay/relay;
+    - video frames arrive intact;
+    - mute sends silence;
+    - a participant without the call key hears nothing;
+    - no TURN server means no call;
+    - unit tests cover the frame cipher (wrong key, call, kind, or a
+      tampered frame all fail), Opus, the mixer, resampling, and the
+      dropout-aware pitch analysis.
+  - ✅ **Mutation checks.** With the relay-only ICE policy removed, the
+    engine's SDP guard refuses to send host candidates and the test fails.
+    With the guard removed as well, the test's own SDP check fails.
+  - ✅ `securetext-app/tests/call_flows.rs`, with real nodes, real MLS
+    signaling and a real TURN server:
+    - a DM call rings, is accepted using the caller's TURN server, connects
+      relay-to-relay, carries each voice to the other and no echo, mutes,
+      and hang-up ends both sides with the reason given;
+    - declining ends the caller's side;
+    - **a three-person channel call:** everyone hears both others, never
+      themselves, all relayed. The call's own signaling connected two
+      members who had never been connected, which a first version got
+      wrong (the fix holds live signals while dialing). When one person
+      leaves, the other two carry on.
+  - ✅ **GUI, with signaling over live Tor**
+    (`gui_e2e.py --turn …`, apps using synthetic tones and WebKit's mock
+    camera):
+    - Alice sets a TURN server in Settings and starts a video call through
+      the disclosure dialog; Bob joins from the incoming-call dialog;
+    - both panels show the call connected, and stats show relay/relay with
+      about 620 KB of media each way;
+    - each app heard the other's tone at exactly its pitch (440/660 Hz)
+      with no dropouts;
+    - each side's camera frames were shown on the other;
+    - hang-up ended the call for both.
+    
+    The rest of the Phase 4 flow still passes in the same run.
+  - ⏳ **Not yet done:**
+    - real microphones and speakers, and real cameras (tests used synthetic
+      tones and WebKit's mock camera);
+    - Windows;
+    - a TURN server on another machine, across real NATs (the tests used
+      loopback);
+    - coturn interop;
+    - a packet capture confirming no direct peer-to-peer traffic (the relay
+      evidence is WebRTC's own stats plus the SDP check);
+    - a clarity review of the disclosure text by someone other than its
+      author;
+    - screen sharing (see above);
+    - echo cancellation (not implemented; headphones recommended).
 - **Exit criteria:** a 1:1 call and a group call both work at usable
   quality; a network capture confirms media is relayed (never direct
-  peer-to-peer) so participants don't learn each other's raw IP; the
-  disclosure UI is reviewed for clarity, not just presence.
+  peer to peer) so participants don't learn each other's raw IP; the
+  disclosure UI is reviewed for clarity, not just presence. **Partly met:**
+  - 1:1 and group calls work end to end, with audio verified by pitch;
+  - relay-only is enforced and verified from WebRTC's stats and the SDPs
+    (not yet by packet capture);
+  - "usable quality" with real devices on real networks, and an independent
+    review of the disclosure text, are still to do.
 
 ## Phase 8 — Rich Features
 - Encrypted file/image sharing, reactions, threads, presence/status,

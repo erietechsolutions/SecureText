@@ -443,3 +443,21 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
   .net-pill .label { display: none; }
 }
 .explain code { font: 12.5px var(--mono); background: var(--bg-active); padding: 1px 5px; border-radius: 4px; }
+
+/* ---- calls ---- */
+.head-actions { display: flex; gap: 4px; margin-left: auto; margin-right: 8px; }
+.call-panel { flex: none; border-bottom: 1px solid var(--line); background: var(--bg-side); padding: 10px 16px; display: grid; gap: 10px; }
+.call-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.call-head .grow { flex: 1; }
+.call-head .sub { color: var(--text-3); font-size: 12px; }
+.call-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); animation: pulse 1.6s ease-in-out infinite; }
+.call-people { display: flex; flex-wrap: wrap; gap: 10px; }
+.call-person { display: grid; justify-items: center; gap: 4px; padding: 8px; border-radius: var(--radius); background: var(--bg-raised); min-width: 96px; opacity: 0.7; }
+.call-person.on, .call-person.self { opacity: 1; }
+.call-person .who { font-size: 13px; font-weight: 600; }
+.call-person .sub { font-size: 11px; color: var(--text-3); }
+.call-person .tile { width: 160px; height: 120px; border-radius: 8px; background: #000; object-fit: cover; }
+.call-controls { display: flex; gap: 8px; }
+.disclosure { margin-bottom: 4px; }
+.settings-section label { display: grid; gap: 4px; font-size: 13px; }
+.settings-section .row .grow { flex: 1; }

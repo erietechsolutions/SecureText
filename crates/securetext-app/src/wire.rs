@@ -180,6 +180,43 @@ pub enum Payload {
     /// authenticates the admin as the sender; each card's own signature
     /// authenticates its contents.
     Roster { cards: Vec<SignedCard> },
+    /// Call signaling (Phase 7). Travels like any other group message, so
+    /// only members can read it and MLS authenticates who sent it. That's
+    /// what makes the DTLS fingerprints in the SDP trustworthy. Sent live
+    /// only, never queued or left at a relay: a ring that arrives late is
+    /// useless.
+    Call { call_id: String, signal: CallSignal },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "s", rename_all = "snake_case")]
+pub enum CallSignal {
+    /// Start of a call. `key` seals every media frame (securetext-call's
+    /// crypto module); `turn` is the caller's TURN server, which members
+    /// without their own may use.
+    Ring {
+        video: bool,
+        #[serde(with = "b64")]
+        key: Vec<u8>,
+        turn: Vec<securetext_call::TurnServer>,
+        started_at: i64,
+    },
+    /// The sender is now in the call. Participants already in it offer
+    /// them a connection.
+    Join,
+    /// WebRTC session descriptions, addressed to one participant.
+    Offer {
+        #[serde(with = "b64")]
+        to: Vec<u8>,
+        sdp: String,
+    },
+    Answer {
+        #[serde(with = "b64")]
+        to: Vec<u8>,
+        sdp: String,
+    },
+    Leave,
+    Decline,
 }
 
 impl Payload {

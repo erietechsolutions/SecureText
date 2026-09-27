@@ -66,6 +66,8 @@ fn config(dir: &std::path::Path, release: &Release, first_check: Duration) -> No
             interval: Duration::from_secs(24 * 3600),
             client_override: Some(release.client.clone()),
         }),
+        call_audio: None,
+        call_allow_loopback: false,
     }
 }
 

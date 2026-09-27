@@ -62,13 +62,16 @@ it belongs in v1.
 - **Voice/video call IP exposure (explicit, disclosed exception).** Per the
   Phase 7 design decision, calls use a separate, faster transport than text
   messaging to keep call quality usable — this means a call participant's
-  IP is exposed to the relay/TURN-equivalent infrastructure handling the
-  call, and potentially to the other participant depending on the final
-  Phase 7 design, for the *duration of that call only*. Text, group, and
+  IP is exposed to the TURN relay handling the call, for the *duration of
+  that call only*. As built (architecture.md §9), relaying is forced, so
+  **other participants never see your IP**, only the relay's. The relay's
+  operator sees who uses it, when, and how much, but not content (media is
+  end-to-end encrypted twice over). Text, group, and
   file messaging are unaffected and remain fully Tor-routed. **This must be
-  disclosed clearly in the calling UI** (e.g., "starting a call uses a
-  faster, non-anonymous connection") so users aren't misled about a
-  guarantee that doesn't apply to that feature.
+  disclosed clearly in the calling UI**. It is: a dialog before starting or
+  joining any call says calls don't go through Tor, who can see the IP (the
+  relay operator, named), who can't (the other participants), and what
+  stays private.
 - **Availability guarantees.** A P2P system with no mandatory central
   infrastructure has weaker delivery guarantees than a centralized service —
   offline-offline delivery depends on relay availability, and Tor's own

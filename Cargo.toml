@@ -8,6 +8,7 @@ members = [
     "crates/securetext-relay",
     "crates/securetext-app",
     "crates/securetext-update",
+    "crates/securetext-call",
     "crates/securetext-cli",
 ]
 
