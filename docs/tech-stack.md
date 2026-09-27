@@ -49,8 +49,8 @@ serves the "efficient and secure" goal rather than trading against it.
 |---|---|---|
 | Desktop shell | **Tauri** | Rust backend (shares the core directly, no FFI boundary for desktop), web frontend for fast UI iteration, much smaller binary/resource footprint than Electron; ships native installers for all three target OSes (see platform-support.md) |
 | Frontend framework | React or Svelte (pick during Phase 4 UI work, not a Phase 0 blocker) | Either works fine inside Tauri; decision deferred since it doesn't affect the core architecture |
-| Mobile (Phase 10) | **To decide in Phase 10:** Tauri 2 mobile (reuses `desktop/ui` and calls the Rust core directly) vs. a React Native/Flutter shell calling the core via UniFFI (the original plan) | Either way the audited Rust core is reused instead of reimplementing crypto/networking per platform; Tauri mobile became the likely lower-effort option once the desktop client was built on Tauri |
-| Installers & updates (Phase 6) | Tauri bundler, GitHub Releases, GitHub Actions; our own updater (`securetext-update`: Ed25519 via `ed25519-dalek`, TLS via `rustls` + bundled `webpki-roots`, a minimal HTTP/1.1 client) | Native installers per OS from one codebase. Tauri's updater plugin was passed over because it fetches over the clearnet; ours runs only over arti exit streams, and is small enough to audit. Updates are signature-verified against an offline key and fetched **over Tor only** |
+| Mobile (Phase 10) | **To decide in Phase 10:** Tauri 2 mobile (reuses `desktop/ui` and calls the Rust core directly) vs. a React Native/Flutter shell calling the core via UniFFI (the original plan) | Either way the Rust core is reused instead of reimplementing crypto/networking per platform; Tauri mobile became the likely lower-effort option once the desktop client was built on Tauri |
+| Installers & updates (Phase 6) | Tauri bundler, GitHub Releases, GitHub Actions; our own updater (`securetext-update`: Ed25519 via `ed25519-dalek`, TLS via `rustls` + bundled `webpki-roots`, a minimal HTTP/1.1 client) | Native installers per OS from one codebase. Tauri's updater plugin was passed over because it fetches over the clearnet; ours runs only over arti exit streams, and is small enough to review. Updates are signature-verified against an offline key and fetched **over Tor only** |
 
 ## Infrastructure (minimal, by design)
 
@@ -510,7 +510,7 @@ state through the app's own API when a step fails.
 - **`tempfile::tempdir()` doesn't make private directories.** It follows
   the umask (usually giving 0755). The profile's decrypted working copy
   lived in one from Phase 1 on, readable by other local users (finding
-  P9-01, audit/README.md). Use `tempfile::Builder::permissions(0o700)`,
+  P9-01, security-review.md). Use `tempfile::Builder::permissions(0o700)`,
   and create sensitive files 0600 before anything else opens them.
 - **yamux's defaults are for trusted peers:** 512 streams and a 1 GiB
   receive window per connection. Anything facing anonymous peers should

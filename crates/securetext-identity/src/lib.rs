@@ -58,7 +58,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///   power cut leaves it behind. So on Linux it goes under
 ///   `$XDG_RUNTIME_DIR`, which is per-user, in memory (tmpfs) and wiped at
 ///   logout. Elsewhere it falls back to the system temp directory; Windows'
-///   %TEMP% is on disk (docs/audit/README.md).
+///   %TEMP% is on disk (docs/security-review.md, P9-02).
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();

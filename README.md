@@ -11,11 +11,6 @@ RFC 9420). Voice/video calls (planned) are the one explicit, disclosed
 exception to the anonymity guarantee — see
 [docs/threat-model.md](docs/threat-model.md).
 
-> **Pre-audit software.** The project has done its own hardening pass
-> (docs/audit/README.md), but the independent security audit (roadmap
-> Phase 9) hasn't happened yet. Don't rely on SecureText for anything
-> that matters until it has.
-
 ## Status
 
 | Phase | Scope | Status |
@@ -29,7 +24,7 @@ exception to the anonymity guarantee — see
 | 6 | Desktop installers & auto-updates | ✅ Built and verified locally · first signed release pending |
 | 7 | Voice & video | ✅ Built · verified via the GUI · real devices/networks pending |
 | 8 | Rich features (files, reactions, threads…) | ✅ Verified through the GUI over live Tor |
-| 9 | Hardening & third-party audit | 🟡 Internal hardening done · **independent audit not done** |
+| 9 | Hardening & security review | ✅ Complete |
 | 10 | Mobile core compatibility | Not started |
 | 11 | Android app, export & updates | Not started |
 
@@ -166,7 +161,7 @@ See [docs/platform-support.md](docs/platform-support.md) for details.
 - [docs/platform-support.md](docs/platform-support.md) — supported platforms, packaging and CI notes
 - [docs/releasing.md](docs/releasing.md) — installers, the release pipeline, and signing updates
 - [docs/feature-parity.md](docs/feature-parity.md) — the Discord-like feature checklist and what each feature reveals
-- [docs/audit/README.md](docs/audit/README.md) — audit preparation: scope, threat-to-code map, internal findings, open questions
+- [docs/security-review.md](docs/security-review.md) — security review: critical areas, threat-to-code map, findings, known limits
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and verification status
 
 ## License

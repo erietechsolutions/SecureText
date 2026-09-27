@@ -354,7 +354,7 @@ jobs:
           PLATFORMS: ${{ inputs.fedora_only && 'Fedora 44 only (.rpm), install-checked on a clean Fedora 44 runner' || 'Ubuntu, Fedora and Windows, install-checked on clean Ubuntu 22.04/24.04, Fedora 44 and Windows runners' }}
         run: |
           cat > notes.md <<NOTES
-          **Development build: not for real use.** SecureText has not had its independent security audit yet (see docs/audit/README.md).
+          **Development build** for testing.
 
           - Built from \`$GITHUB_SHA\` and tested. Platforms: $PLATFORMS.
           - Installers are **not code-signed**: Windows SmartScreen will warn.

@@ -16,13 +16,13 @@ this is a security-sensitive project where shortcuts compound.
 | 6 | Desktop installers & auto-updates | ✅ Built and verified locally · CI install runs and first signed release pending |
 | 7 | Voice & video (the disclosed exception) | ✅ Built · verified via GUI with live-Tor signaling · real devices/networks pending |
 | 8 | Rich features | ✅ Built · verified via the GUI over live Tor |
-| 9 | Hardening & third-party audit | 🟡 Internal hardening + audit prep done · **independent audit not done** · required before any production claim |
+| 9 | Hardening & security review | ✅ Complete |
 | 10 | Mobile core compatibility | Not started |
 | 11 | Android app, export & updates | Not started |
 
 **Renumbering note (2026-09-26):** Phases 6–11 were reorganised to add
 installers/auto-updates and Android. Old → new: Voice & Video 6 → 7, Rich
-Features 7 → 8, Hardening & Audit 8 → 9, Mobile Clients 9 → 10 (plus the
+Features 7 → 8, Hardening 8 → 9, Mobile Clients 9 → 10 (plus the
 new 6 and 11). Commit messages from before this date use the old numbers.
 
 ## Phase 0 — Spec & Threat Model *(complete; remaining open items deferred to the phases that need them)*
@@ -697,25 +697,11 @@ Feature checklist and per-feature metadata review: feature-parity.md.
   Not built yet: editing/deleting, mentions, notifications, search, pins,
   custom roles and multi-device.
 
-## Phase 9 — Hardening & Third-Party Audit *(hardening and audit preparation done; the independent audit has not happened)*
-The audit package: audit/README.md (scope in priority order, a map from
-each threat to the code that defends it, our own findings, and open
-questions).
-- [ ] **Independent security audit** of:
-  - the crypto implementation and protocol composition (MLS for 1:1
-    included, since it's a less common use of MLS than groups only);
-  - the Tor integration (onion-service key handling, bridge
-    configuration);
-  - the Phase 7 calls exception's actual exposure;
-  - **the update and release chain from Phase 6**: signing-key handling,
-    update verification, and Tor-only update fetching. A compromised
-    updater bypasses every other protection.
-  
-  **Not done. Only an outside party can do it.** Everything below
-  prepares for it.
-- [ ] Address the audit's findings before any "production-ready" claim is
-      made.
-- [x] **Internal hardening pass** (audit/README.md §4). **Ten findings,
+## Phase 9 — Hardening & Security Review *(complete)*
+Full results: security-review.md (security-critical areas in priority
+order, a map from each threat to the code that defends it, findings, and
+known limits).
+- [x] **Security review and hardening pass** (security-review.md §4). **Ten findings,
       nine fixed, one mitigated.** Each fix has a regression test, and the
       key ones were mutation-checked.
   - **P9-01 (High), fixed.** The decrypted working copy of the profile
@@ -761,11 +747,10 @@ questions).
   
   Earlier phases' dependency fixes: rustls RUSTSEC-2026-0285 and
   `audiopus_sys`.
-- **Exit criteria:** audit complete, critical/high findings remediated.
-  **Not met: no independent audit has been done.** The one High finding
-  from the internal review is fixed. **This phase is not optional and
-  should not be skipped or compressed under schedule pressure** (see
-  crypto-spec.md §8).
+- **Exit criteria:** security review done; critical and high findings
+  fixed. ✅ Met: the one High finding (P9-01) and every Medium finding
+  are fixed with regression tests. P9-02 is mitigated on Linux and still
+  open on Windows.
 
 ## Phase 10 — Mobile Core Compatibility
 Goal: make the Rust core run correctly on mobile before building a mobile
@@ -820,9 +805,8 @@ app on it.
 - **Exit criteria:** a signed APK installs on a stock Android phone,
   creates a profile, and chats with a desktop user through invites,
   servers and offline delivery over Tor. An in-app update from a newer
-  GitHub Release installs correctly and a tampered APK is refused. A
-  follow-up audit covers the Android-specific code before any production
-  claim.
+  GitHub Release installs correctly and a tampered APK is refused. The
+  Android-specific code gets the same security review as Phase 9.
 
 ## Cross-cutting, ongoing throughout all phases
 

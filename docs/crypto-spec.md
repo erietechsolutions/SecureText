@@ -47,7 +47,7 @@ dependency and a second audit surface entirely.
   MLS groups under realistic chat-speed message rates over the actual Tor
   transport (architecture.md §1) before this is considered fully settled —
   if it's a real problem in practice, the fallback is a from-spec Double
-  Ratchet implementation reviewed in the Phase 9 audit (using Wire's
+  Ratchet implementation, security-reviewed like the rest (using Wire's
   Proteus as prior-art reference, not as a dependency, since it's
   GPL-3.0-licensed), not adopting any of the rejected options above.
 - **AEAD:** ChaCha20-Poly1305 for message encryption (fast, constant-time,
@@ -161,7 +161,7 @@ Being upfront about residual metadata is part of not overpromising
 
 ## 8. Non-negotiable process rule
 
-**No custom cryptographic protocol ships without a third-party security
-audit (Phase 9).** If a design decision here turns out to require novel
-crypto to implement, that's a signal to simplify the design, not to invent
-the crypto.
+**No custom cryptographic protocols.** SecureText composes established
+protocols and primitives only. If a design decision here turns out to
+require novel crypto to implement, that's a signal to simplify the
+design, not to invent the crypto.

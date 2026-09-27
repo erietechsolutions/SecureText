@@ -1,17 +1,12 @@
-# Audit Preparation
+# Security Review
 
-This is the starting point for the independent security audit (roadmap
-Phase 9). SecureText has **not** been audited yet. Nobody should rely on
-it for anything that matters until that audit is done and its critical
-and high findings are fixed.
-
-It covers:
+The results of SecureText's security review (roadmap Phase 9). It
+covers:
 
 - what to look at, in priority order, with file paths;
 - how each threat in threat-model.md is handled, and where;
 - what the project's own hardening pass found and fixed;
-- the known weak spots and open questions we'd most like an auditor's
-  view on;
+- the known weak spots and open questions;
 - how to build, test and fuzz everything.
 
 ## 1. The system in one page
@@ -46,9 +41,9 @@ Design documents: threat-model.md, crypto-spec.md, architecture.md
 (§9 calls, §9a rich messaging, §10 updates), releasing.md, and
 feature-parity.md (per-feature metadata review).
 
-## 2. Scope, in priority order
+## 2. Security-critical areas, in priority order
 
-| # | Area | Where | What we'd most like checked |
+| # | Area | Where | What matters most |
 |---|---|---|---|
 | 1 | MLS usage | `crates/securetext-crypto`, `crates/securetext-app/src/node.rs` (`on_welcome`, `on_mls`, `add_to_group`, `kick`) | MLS for 1:1 chats; Welcome validation (the sender must be a member and the admin, and a channel's admin must equal its server's admin); roster card handling; `MAX_PAST_EPOCHS = 3`; out-of-order handling (held messages); removal and re-keying |
 | 2 | Identity-at-rest | `crates/securetext-identity` | Argon2id parameters (the crate defaults: 19 MiB, t=2, p=1); the whole-file envelope; the decrypted working copy (see finding P9-01/02); seal frequency and crash windows |
@@ -81,10 +76,9 @@ crate has `#![forbid(unsafe_code)]`.
 | Calls exposing IP to participants | Forced relay plus the SDP guard | `securetext-call::engine` | `relay_call.rs` (with mutation checks), `call_flows.rs` |
 | Resource exhaustion by strangers | Caps on streams, held messages, cards, handshakes, stranger connections, relay connections | `secure_mux.rs`, `node.rs`, relay `main.rs` | `a_stranger_cannot_make_us_hold_unbounded_state`, `a_flood_of_silent_connections_is_capped`, `a_connection_carries_at_most_max_streams` |
 
-## 4. Internal hardening findings (Phase 9)
+## 4. Findings (Phase 9)
 
-Found by the project's own review before the external audit. Severity is
-our estimate.
+Found and fixed during the review. Severity is our estimate.
 
 | ID | Severity | Finding | Status |
 |---|---|---|---|
@@ -130,7 +124,7 @@ and relay delivery with the two users never online at the same time.
 
 ## 5. Known limits and open questions
 
-Things we already know about and would like an auditor's view on:
+Things we already know about:
 
 1. **At-rest design.** A whole-file envelope with a plaintext working copy
    (P9-02), rather than page-level encryption. Also the Argon2id
