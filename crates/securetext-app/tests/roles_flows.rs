@@ -156,3 +156,88 @@ async fn roles_delegate_server_management_and_everyone_agrees() {
     })
     .await;
 }
+
+async fn removed_is(node: &NodeHandle, conversation: &str, removed: bool) {
+    let what = format!("#{conversation} removed={removed}");
+    eventually(&what, || {
+        let node = node.clone();
+        let conversation = conversation.to_string();
+        async move { node.conversations().await.ok()?.into_iter().find(|c| c.id == conversation && c.removed == removed).map(|_| ()) }
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_rules_control_who_sees_and_does_what() {
+    use securetext_app::Overwrite;
+    let dir = tempfile::tempdir().unwrap();
+    let net = MemoryNetwork::new();
+    let alice = start(dir.path(), "alice", &net).await; // owner
+    let bob = start(dir.path(), "bob", &net).await; // mod
+    let carol = start(dir.path(), "carol", &net).await; // member
+    befriend(&alice, &bob).await;
+    befriend(&alice, &carol).await;
+    let (bob_key, carol_key) = (my_key(&bob).await, my_key(&carol).await);
+    let server = alice.create_server("Club".into()).await.unwrap();
+    alice.invite_to_server(server.clone(), bob_key.clone()).await.unwrap();
+    alice.invite_to_server(server.clone(), carol_key.clone()).await.unwrap();
+    let staff = alice.create_channel(server.clone(), "staff".into(), false, vec![]).await.unwrap();
+    channel_named(&carol, &server, "staff").await;
+    let general = channel_named(&alice, &server, "general").await;
+    channel_named(&carol, &server, "general").await;
+    alice
+        .edit_server(server.clone(), vec![set("role/mod", role("mod", "Mod", 10, 0)), set(&format!("member/{bob_key}"), vec!["mod"])])
+        .await
+        .unwrap();
+
+    // #staff: hidden from @everyone, visible to mods. Carol is taken out
+    // of it; Bob stays.
+    let rule = |target: &str, allow: u32, deny: u32| Overwrite { target: target.into(), allow, deny };
+    alice
+        .edit_server(
+            server.clone(),
+            vec![set(
+                &format!("rules/channel/{staff}"),
+                vec![rule("everyone", 0, perms::VIEW_CHANNEL), rule("role:mod", perms::VIEW_CHANNEL, 0)],
+            )],
+        )
+        .await
+        .unwrap();
+    removed_is(&carol, &staff, true).await;
+    alice.post(staff.clone(), "mods only".into(), None).await.unwrap();
+    wait_for_message(&bob, &staff, "mods only").await;
+    assert!(!has_message(&carol, &staff, "mods only").await);
+
+    // #general: @everyone can't post, mods can. Carol's client refuses.
+    alice
+        .edit_server(
+            server.clone(),
+            vec![set(
+                &format!("rules/channel/{general}"),
+                vec![rule("everyone", 0, perms::SEND_MESSAGES), rule("role:mod", perms::SEND_MESSAGES, 0)],
+            )],
+        )
+        .await
+        .unwrap();
+    eventually("carol to learn she can't post", || {
+        let carol = carol.clone();
+        let general = general.clone();
+        async move {
+            let c = carol.conversations().await.ok()?.into_iter().find(|c| c.id == general)?;
+            (c.permissions & perms::SEND_MESSAGES == 0).then_some(())
+        }
+    })
+    .await;
+    let err = carol.post(general.clone(), "hello?".into(), None).await.unwrap_err().to_string();
+    assert!(err.contains("permission"), "{err}");
+    // Reacting is still allowed.
+    let note = bob.post(general.clone(), "announcement".into(), None).await.unwrap();
+    wait_for_message(&carol, &general, "announcement").await;
+    carol.react(general.clone(), note.id.clone(), "👍".into(), true).await.unwrap();
+
+    // Access back: Carol rejoins #staff and gets new messages there.
+    alice.edit_server(server.clone(), vec![set(&format!("rules/channel/{staff}"), Vec::<Overwrite>::new())]).await.unwrap();
+    removed_is(&carol, &staff, false).await;
+    bob.post(staff.clone(), "welcome back".into(), None).await.unwrap();
+    wait_for_message(&carol, &staff, "welcome back").await;
+}

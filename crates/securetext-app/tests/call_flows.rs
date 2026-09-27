@@ -66,6 +66,16 @@ fn share_at(audio: &ToneBackend, freq: f32) -> f32 {
     }
 }
 
+/// Wait until the last second `audio` played is mostly `freq` (slow CI
+/// runners take a while for audio to settle).
+async fn wait_hears(audio: &ToneBackend, freq: f32, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while share_at(audio, freq) <= 0.5 {
+        assert!(std::time::Instant::now() < deadline, "{what}: {}", share_at(audio, freq));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn wait_state(node: &NodeHandle, state: &str) -> securetext_app::CallView {
     let state = state.to_string();
     eventually(&format!("call state {state}"), || {
@@ -125,11 +135,9 @@ async fn a_dm_call_rings_connects_through_the_relay_and_hangs_up() {
     wait_state(&alice.node, "active").await;
     wait_media(&alice.node, 1).await;
     wait_media(&bob.node, 1).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
     // Each hears the other, not themselves.
-    assert!(share_at(&bob.audio, 440.0) > 0.5, "Bob hears Alice: {}", share_at(&bob.audio, 440.0));
-    assert!(share_at(&alice.audio, 660.0) > 0.5, "Alice hears Bob: {}", share_at(&alice.audio, 660.0));
+    wait_hears(&bob.audio, 440.0, "Bob hears Alice").await;
+    wait_hears(&alice.audio, 660.0, "Alice hears Bob").await;
     assert!(share_at(&alice.audio, 440.0) < 0.05, "no echo of herself");
 
     // Relayed on both ends, per WebRTC's own stats.

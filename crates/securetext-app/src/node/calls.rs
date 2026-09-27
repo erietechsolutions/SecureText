@@ -211,6 +211,7 @@ impl NodeState {
         let gid = wire::from_hex(conversation_id)?;
         let conversation = self.active_conversation(&gid)?;
         anyhow::ensure!(conversation.kind != ConversationKind::Server, "start a call in one of the server's channels");
+        self.require_here(&gid, super::perms::CONNECT, "start calls")?;
         let turn = self.my_turn_servers();
         anyhow::ensure!(
             !turn.is_empty(),
@@ -258,6 +259,8 @@ impl NodeState {
 
     pub(crate) fn accept_call(&mut self) -> anyhow::Result<CallView> {
         let own = self.my_turn_servers();
+        let gid = self.call.as_ref().map(|c| c.gid.clone()).ok_or_else(|| anyhow::anyhow!("nobody is calling"))?;
+        self.require_here(&gid, super::perms::CONNECT, "join calls")?;
         let c = self.call.as_mut().ok_or_else(|| anyhow::anyhow!("nobody is calling"))?;
         anyhow::ensure!(c.phase == Phase::Incoming, "nobody is calling");
         c.phase = Phase::Active;
@@ -511,7 +514,8 @@ impl NodeState {
                     return; // busy, already over here, stale, or malformed
                 }
                 let removed = self.store.conversation(gid).ok().flatten().is_none_or(|c| c.removed);
-                if removed {
+                // Rings from someone not allowed to call here are ignored.
+                if removed || self.permissions_here(gid, sender) & super::perms::CONNECT == 0 {
                     return;
                 }
                 self.call = Some(CallState {

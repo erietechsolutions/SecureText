@@ -39,7 +39,7 @@ use securetext_identity::IdentityStore;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-pub use node::{fingerprint, perms, AttachmentData, Category, ChannelMeta, Role, ServerSettings, AttachmentView, CallParticipantView, CallView, ReactionView, MAX_MESSAGE_CHARS};
+pub use node::{fingerprint, perms, AttachmentData, Category, ChannelMeta, Overwrite, Role, ServerSettings, AttachmentView, CallParticipantView, CallView, ReactionView, MAX_MESSAGE_CHARS};
 use node::{CallSetup, Job, NetEvent, NodeState, Opened, Timing};
 pub use securetext_call as call;
 pub use transport::{MemoryNetwork, TorTransport, Transport};
@@ -158,7 +158,7 @@ pub struct ConversationView {
     pub removed: bool,
     /// Disappearing-message timer, in seconds, if on.
     pub disappear_secs: Option<i64>,
-    /// Our permissions in the server this belongs to (0 for DMs; see
+    /// Our permissions here: in a channel, after its access rules (0 for DMs; see
     /// [`perms`]).
     pub permissions: u32,
     /// Channels: topic, category and position in the server's layout.

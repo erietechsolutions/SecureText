@@ -260,6 +260,19 @@ impl<P: OpenMlsProvider> Member<P> {
 
     /// Join a group from Welcome bytes received via an invite (architecture.md §2).
     pub fn join_from_welcome(&self, welcome_bytes: &[u8]) -> Result<MlsGroup, CryptoError> {
+        self.rejoin_from_welcome(welcome_bytes, |_| false)
+    }
+
+    /// Join from a Welcome, replacing any state we still hold for that
+    /// group if `may_replace(group_id)` says so (a group we were removed
+    /// from and are being let back into). Without that, a Welcome for a
+    /// group we already have is refused, so nobody can wipe a live group
+    /// by sending one.
+    pub fn rejoin_from_welcome(
+        &self,
+        welcome_bytes: &[u8],
+        may_replace: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<MlsGroup, CryptoError> {
         let mls_message = MlsMessageIn::tls_deserialize_exact(welcome_bytes)
             .map_err(|e| CryptoError::TlsCodec(format!("{e:?}")))?;
         let welcome = match mls_message.extract() {
@@ -271,8 +284,14 @@ impl<P: OpenMlsProvider> Member<P> {
             .use_ratchet_tree_extension(true)
             .max_past_epochs(MAX_PAST_EPOCHS)
             .build();
-        let staged_join = StagedWelcome::new_from_welcome(&self.provider, &join_config, welcome, None)
+        let mut builder = StagedWelcome::build_from_welcome(&self.provider, &join_config, welcome)
             .map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
+        let group_id = builder.processed_welcome().unverified_group_info().group_id().clone();
+        let exists = self.load_group(&group_id)?.is_some();
+        if exists && may_replace(group_id.as_slice()) {
+            builder = builder.replace_old_group();
+        }
+        let staged_join = builder.build().map_err(|e| CryptoError::Mls(format!("{e:?}")))?;
         staged_join
             .into_group(&self.provider)
             .map_err(|e| CryptoError::Mls(format!("{e:?}")))
@@ -413,6 +432,30 @@ mod tests {
             .expect("alice decrypts")
             .expect("application message");
         assert_eq!(reply_plaintext, b"Hi, Alice!");
+    }
+
+    /// Someone removed from a group and later let back in joins over their
+    /// old state only when the caller allows it; otherwise a Welcome for a
+    /// group they already hold is refused (it could wipe a live group).
+    #[test]
+    fn rejoining_a_group_replaces_old_state_only_when_allowed() {
+        let alice = fresh_member("alice");
+        let bob = fresh_member("bob");
+        let mut alice_group = alice.create_group().expect("alice creates group");
+        let (_, welcome) = alice.add_member(&mut alice_group, &bob.key_package_bytes().unwrap()).unwrap();
+        bob.join_from_welcome(&welcome).expect("bob joins");
+        alice.remove_member(&mut alice_group, bob.public_key()).expect("alice removes bob");
+        let (_, welcome) = alice.add_member(&mut alice_group, &bob.key_package_bytes().unwrap()).unwrap();
+        assert!(bob.join_from_welcome(&welcome).is_err(), "refused without permission to replace");
+        // (The refused Welcome used up that key package; try again.)
+        alice.remove_member(&mut alice_group, bob.public_key()).expect("alice removes bob again");
+        let (_, welcome) = alice.add_member(&mut alice_group, &bob.key_package_bytes().unwrap()).unwrap();
+        let group_id = alice_group.group_id().as_slice().to_vec();
+        let mut bob_group = bob
+            .rejoin_from_welcome(&welcome, |id| id == group_id.as_slice())
+            .expect("bob rejoins over his old state");
+        let ciphertext = alice.encrypt(&mut alice_group, b"welcome back").unwrap();
+        assert_eq!(bob.decrypt(&mut bob_group, &ciphertext).unwrap().unwrap(), b"welcome back");
     }
 
     /// Rough latency signal for the Phase 1 open item (tech-stack.md):

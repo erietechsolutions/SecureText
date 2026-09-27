@@ -697,8 +697,9 @@ Feature checklist and per-feature metadata review: feature-parity.md.
 - **Exit criteria:** feature parity checklist against the "Discord-like"
   goal, each new feature re-checked against threat-model.md for new
   metadata leakage before shipping. ✅ Met: feature-parity.md holds both.
-  Not built yet: editing/deleting, mentions, notifications, search, pins,
-  custom roles and multi-device.
+  Not built yet: editing/deleting, mentions, notifications, search, pins
+  and multi-device. Custom roles and per-channel/category permission rules
+  came later (feature-parity.md).
 
 ## Phase 9 — Hardening & Security Review *(complete)*
 Full results: security-review.md (security-critical areas in priority

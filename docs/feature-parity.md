@@ -14,7 +14,8 @@ Legend: ✅ built and verified · 🟡 partly there · ⬜ not built
 | Group DMs | 🟡 | Not a separate kind; a private channel in a small server does the job |
 | Servers with channels | ✅ | Phase 3 |
 | Private channels | ✅ | Their own MLS group, so non-members can't decrypt them |
-| Roles & permissions | 🟡 | One role, the admin (the creator). No custom roles or moderators |
+| Roles & permissions | ✅ | Custom roles with server permissions and a Discord-style hierarchy; the owner is the creator |
+| Channel & category permissions | ✅ | Per-channel and per-category rules allow or deny View, Send, Attach, React, Calls and Manage channel for @everyone, a role or a member. Losing View takes the member out of the channel's MLS group, so they can't decrypt it |
 | Invites | ✅ | Single-use invite links for contacts; admins invite contacts to servers |
 | Kick / remove | ✅ | Re-keys everything the member was in |
 | Offline delivery | ✅ | Relays (Phase 5) |

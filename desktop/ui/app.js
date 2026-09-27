@@ -107,7 +107,21 @@
   };
 
   // Server permissions (securetext-app's `perms`).
-  const P = { ADMIN: 1, SERVER: 2, ROLES: 4, CHANNELS: 8, KICK: 16, INVITE: 32 };
+  const P = {
+    ADMIN: 1, SERVER: 2, ROLES: 4, CHANNELS: 8, KICK: 16, INVITE: 32,
+    // Channel permissions: allowed unless a channel or category rule
+    // takes them away.
+    VIEW: 64, SEND: 128, ATTACH: 256, REACT: 512, CONNECT: 1024,
+  };
+  // What a channel or category rule can allow or deny.
+  const RULE_INFO = [
+    [P.VIEW, 'View channel', 'See the channel and read its messages (without it they are taken out of the channel)'],
+    [P.SEND, 'Send messages', 'Post messages and thread replies'],
+    [P.ATTACH, 'Attach files', 'Share files and images'],
+    [P.REACT, 'Add reactions', 'React to messages'],
+    [P.CONNECT, 'Start and join calls', 'Voice and video calls in the channel'],
+    [P.CHANNELS, 'Manage channel', 'Rename, move and set timers for this channel'],
+  ];
   const PERM_INFO = [
     [P.ADMIN, 'Administrator', 'Every permission'],
     [P.SERVER, 'Manage server', 'Rename the server and change its icon'],
@@ -117,6 +131,8 @@
     [P.INVITE, 'Invite members', 'Invite their contacts into the server'],
   ];
   const can = (c, bit) => !!c && !c.removed && (c.permissions & bit) !== 0;
+  // Whether we may do `bit` in a conversation: DMs have no rules.
+  const allowed = (c, bit) => !!c && !c.removed && (c.kind === 'dm' || (c.permissions & bit) !== 0);
   // Countries with plenty of Tor exit relays, for the update-download
   // region picker.
   const UPDATE_REGIONS = ['US', 'DE', 'NL', 'FR', 'SE', 'CH', 'FI', 'AT', 'RO', 'CA', 'GB', 'NO', 'LU', 'PL', 'CZ'];
@@ -495,11 +511,13 @@
         ${server ? `<span class="sub">· ${esc(server.name)}</span>` : ''}`;
     }
     const removed = c.removed || (c.server_id && conv(c.server_id) && conv(c.server_id).removed);
-    $('#composer').hidden = !!removed;
-    $('#composer-note').hidden = !removed;
+    const mute = !removed && !allowed(c, P.SEND);
+    $('#composer').hidden = !!removed || mute;
+    $('#composer-note').hidden = !removed && !mute;
     $('#composer-note').textContent = removed
       ? 'You’re no longer a member here, so you can’t send or receive new messages. Earlier history stays on this device.'
-      : '';
+      : mute ? 'You don’t have permission to send messages in this channel.' : '';
+    $('#composer .attach').hidden = !allowed(c, P.ATTACH);
     $('#composer-input').placeholder = c.kind === 'dm' ? `Message @${c.name}` : `Message #${c.name}`;
     renderMessages(true);
     renderThread();
@@ -564,7 +582,9 @@
 
   function reactionsHtml(m) {
     if (!m.reactions || !m.reactions.length) return '';
-    return `<div class="reactions">${m.reactions.map((r) => `<button class="reaction ${r.mine ? 'mine' : ''}" data-react="${esc(r.emoji)}" data-msg="${esc(m.id)}" data-on="${r.mine ? '0' : '1'}" title="${esc(r.by.join(', '))}">${esc(r.emoji)} ${r.count}</button>`).join('')}</div>`;
+    const c = conv(state.view.convId);
+    const off = allowed(c, P.REACT) ? '' : 'disabled';
+    return `<div class="reactions">${m.reactions.map((r) => `<button class="reaction ${r.mine ? 'mine' : ''}" ${off} data-react="${esc(r.emoji)}" data-msg="${esc(m.id)}" data-on="${r.mine ? '0' : '1'}" title="${esc(r.by.join(', '))}">${esc(r.emoji)} ${r.count}</button>`).join('')}</div>`;
   }
 
   // Thread sizes come from the messages we hold, so a reply counts once
@@ -592,8 +612,8 @@
           ${relayed ? `<div class="status relayed">✓ Left at ${c.kind === 'dm' ? esc(c.name) + '’s' : 'an offline member’s'} relay — delivered when they’re next online</div>` : ''}
         </div>
         <div class="msg-actions">
-          <button class="icon-btn" data-react-menu="${esc(m.id)}" title="Add a reaction" aria-label="Add a reaction">☺︎</button>
-          ${inThread ? '' : `<button class="icon-btn" data-thread="${esc(m.id)}" title="Reply in thread" aria-label="Reply in thread">↩︎</button>`}
+          ${allowed(c, P.REACT) ? `<button class="icon-btn" data-react-menu="${esc(m.id)}" title="Add a reaction" aria-label="Add a reaction">☺︎</button>` : ''}
+          ${inThread || !allowed(c, P.SEND) ? '' : `<button class="icon-btn" data-thread="${esc(m.id)}" title="Reply in thread" aria-label="Reply in thread">↩︎</button>`}
         </div></div>`;
   }
 
@@ -629,6 +649,7 @@
     panel.hidden = false;
     $('#app').classList.add('thread-open');
     $('#members-panel').hidden = true;
+    $('#thread-composer').hidden = !allowed(c, P.SEND);
     const replies = (state.msgs[c.id] || []).filter((m) => m.reply_to === root.id);
     $('#thread-body').innerHTML = messageHtml(c, root, true, true)
       + `<div class="day-sep">${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}</div>`
@@ -843,7 +864,7 @@
 
   function renderHeadActions(c) {
     const box = $('#head-actions');
-    const callable = c && c.kind !== 'server' && !c.removed && !state.call;
+    const callable = c && c.kind !== 'server' && !c.removed && !state.call && allowed(c, P.CONNECT);
     const timerAllowed = c && !c.removed && (c.kind === 'dm' || can(c, P.CHANNELS));
     const timer = c && c.kind !== 'server' && !c.removed
       ? `<button class="icon-btn ${c.disappear_secs ? 'on' : ''}" data-action="timer" ${timerAllowed ? '' : 'disabled'}
@@ -1099,7 +1120,8 @@
       <label>Topic<input id="m-topic" maxlength="256" placeholder="What's this channel about?" value="${esc(c.topic)}"></label>
       <label>Category<select id="m-cat"><option value="">No category</option>
         ${st.categories.map((x) => `<option value="${esc(x.id)}" ${x.id === category ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
-      <div class="row"><button class="btn small" id="m-up">Move up</button><button class="btn small" id="m-down">Move down</button></div>
+      <div class="row"><button class="btn small" id="m-up">Move up</button><button class="btn small" id="m-down">Move down</button>
+        ${can(c, P.ROLES) && can(c, P.CHANNELS) ? '<button class="btn small" id="m-perms">Permissions…</button>' : ''}</div>
       <p class="form-error" id="m-err"></p>
       <div class="actions"><button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="m-go">Save</button></div>`,
     (root, close) => {
@@ -1108,6 +1130,8 @@
         const i = list.findIndex((x) => x.id === c.id);
         await moveChannel(sid, c.id, category || null, Math.max(0, i + delta));
       };
+      const permsBtn = $('#m-perms', root);
+      if (permsBtn) permsBtn.addEventListener('click', () => { close(); editRules(sid, 'channel', c.id, '#' + c.name); });
       $('#m-up', root).addEventListener('click', () => shift(-1));
       $('#m-down', root).addEventListener('click', () => shift(1));
       $('#m-go', root).addEventListener('click', async (e) => {
@@ -1175,6 +1199,7 @@
           ${i > 0 ? `<button class="btn small ghost" data-cat-up="${esc(c.id)}" aria-label="Move up">↑</button>` : ''}
           ${i < st.categories.length - 1 ? `<button class="btn small ghost" data-cat-down="${esc(c.id)}" aria-label="Move down">↓</button>` : ''}
           <button class="btn small ghost" data-cat-save="${esc(c.id)}">Rename</button>
+          ${mine & P.ROLES ? `<button class="btn small ghost" data-cat-perms="${esc(c.id)}">Permissions…</button>` : ''}
           <button class="btn small danger" data-cat-delete="${esc(c.id)}">Delete</button></div>`).join('') || '<div class="empty-note">No categories yet.</div>'}</div>
         <div class="row"><input id="s-cat-new" maxlength="64" placeholder="New category name"><button class="btn primary" id="s-cat-add">Add category</button></div>`;
     }
@@ -1240,6 +1265,10 @@
           const c = cat(b.dataset.catSave);
           run([setEdit('category/' + c.id, { ...c, name: root.querySelector(`[data-cat-name="${CSS.escape(c.id)}"]`).value.trim() })], 'categories');
         }));
+        root.querySelectorAll('[data-cat-perms]').forEach((b) => b.addEventListener('click', () => {
+          close();
+          editRules(server.id, 'category', b.dataset.catPerms, cat(b.dataset.catPerms).name);
+        }));
         root.querySelectorAll('[data-cat-delete]').forEach((b) => b.addEventListener('click', () => {
           // Its channels fall back to "no category".
           run([setEdit('category/' + b.dataset.catDelete, null)], 'categories');
@@ -1255,6 +1284,116 @@
         root.querySelectorAll('[data-cat-down]').forEach((b) => b.addEventListener('click', () => move(b.dataset.catDown, 1)));
       }
     });
+  }
+
+  // Who can do what in one channel or category (Discord's permission
+  // overwrites). For each target (@everyone, a role or a member) every
+  // channel permission is Allow, Deny or left to the server's roles.
+  // Category rules apply first, then the channel's; within each,
+  // @everyone, then roles, then members. The owner and Administrators
+  // aren't limited by rules.
+  async function editRules(serverId, scope, id, title) {
+    let st;
+    let members;
+    try {
+      st = state.settings[serverId] = await call('server_settings', { serverId });
+      members = await call('members', { conversationId: serverId });
+    } catch (e) {
+      return toast(errText(e), 'error');
+    }
+    const stored = (scope === 'channel' ? st.channel_rules : st.category_rules)[id];
+    const channel = scope === 'channel' ? conv(id) : null;
+    let rules = (stored || []).map((o) => ({ ...o }));
+    // A private channel without rules is limited to the people in it;
+    // show that as rules so saving keeps it that way.
+    if (!stored && channel && channel.private) {
+      const inside = await call('members', { conversationId: id }).catch(() => []);
+      rules = [{ target: 'everyone', allow: 0, deny: P.VIEW }, ...inside.map((m) => ({ target: 'member:' + m.key, allow: P.VIEW, deny: 0 }))];
+    }
+    const owner = members.find((m) => m.is_admin);
+    const me = members.find((m) => m.is_me);
+    const iAmOwner = !!(owner && me && owner.key === me.key);
+    const roleOf = (rid) => st.roles.find((r) => r.id === rid);
+    const rankOf = (key) => (owner && key === owner.key ? Infinity : Math.max(0, ...(st.member_roles[key] || []).map((rid) => (roleOf(rid) || { position: 0 }).position)));
+    const manageable = (target) => {
+      if (iAmOwner || target === 'everyone') return true;
+      if (target.startsWith('role:')) return (roleOf(target.slice(5)) || { position: Infinity }).position < st.my_rank;
+      const key = target.slice(7);
+      return !(me && key === me.key) && !(owner && key === owner.key) && rankOf(key) < st.my_rank;
+    };
+    const label = (target) => {
+      if (target === 'everyone') return '@everyone';
+      if (target.startsWith('role:')) return (roleOf(target.slice(5)) || { name: 'deleted role' }).name;
+      const m = members.find((x) => x.key === target.slice(7));
+      return '@' + (m ? m.label : target.slice(7, 15));
+    };
+    const mine = st.my_permissions;
+    let selected = rules.length ? rules[0].target : 'everyone';
+    const draw = () => {
+      const rule = rules.find((o) => o.target === selected) || { target: selected, allow: 0, deny: 0 };
+      const editable = manageable(selected);
+      const addable = [
+        ...['everyone', ...st.roles.filter((r) => r.id !== 'everyone').map((r) => 'role:' + r.id)],
+        ...members.map((m) => 'member:' + m.key),
+      ].filter((t) => !rules.some((o) => o.target === t) && manageable(t));
+      return `<h3>Permissions · ${esc(title)}</h3>
+        <p class="lead">${scope === 'category' ? 'Rules here apply to every channel in this category; a channel’s own rules come after them.' : 'Rules here come after its category’s.'}
+          Anything left at <em>/</em> follows the server’s roles. Owners and Administrators are never limited.</p>
+        <div class="rules">
+          <div class="rule-targets">${rules.map((o) => `<button class="btn small ${o.target === selected ? 'primary' : 'ghost'}" data-rule-target="${esc(o.target)}">${esc(label(o.target))}</button>`).join('') || '<span class="sub">No rules yet.</span>'}
+            ${addable.length ? `<select id="rule-add" aria-label="Add a rule for"><option value="">+ Add role or member…</option>${addable.map((t) => `<option value="${esc(t)}">${esc(label(t))}</option>`).join('')}</select>` : ''}</div>
+          ${rules.some((o) => o.target === selected) ? `<div class="pick-list">${RULE_INFO.map(([bit, name, help]) => {
+            const v = rule.allow & bit ? 'allow' : rule.deny & bit ? 'deny' : '';
+            // Allowing needs the permission yourself (channel ones everyone has).
+            const cantAllow = !iAmOwner && bit === P.CHANNELS && !(mine & P.CHANNELS);
+            return `<div class="rule-row"><span class="grow"><strong>${name}</strong><br><span class="sub">${help}</span></span>
+              <span class="tri" role="radiogroup" aria-label="${name}">
+                ${[['deny', '✕'], ['', '/'], ['allow', '✓']].map(([val, sym]) => `<label class="tri-opt ${val || 'inherit'}"><input type="radio" name="b${bit}" value="${val}" data-bit="${bit}" ${v === val ? 'checked' : ''} ${!editable || (cantAllow && val === 'allow') ? 'disabled' : ''}><span>${sym}</span></label>`).join('')}
+              </span></div>`;
+          }).join('')}</div>
+          ${editable ? '<button class="btn small danger" id="rule-remove">Remove this rule</button>' : '<p class="sub">This rule is for a role or member ranked at or above you, so you can’t change it.</p>'}` : ''}
+        </div>
+        <p class="form-error" id="m-err"></p>
+        <div class="actions"><button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="rule-save">Save</button></div>`;
+    };
+    const wire = (root, close) => {
+      const redraw = () => { root.innerHTML = draw(); wire(root, close); };
+      root.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', close));
+      root.querySelectorAll('[data-rule-target]').forEach((b) => b.addEventListener('click', () => { selected = b.dataset.ruleTarget; redraw(); }));
+      const add = $('#rule-add', root);
+      if (add) add.addEventListener('change', () => {
+        if (!add.value) return;
+        rules.push({ target: add.value, allow: 0, deny: 0 });
+        selected = add.value;
+        redraw();
+      });
+      root.querySelectorAll('input[data-bit]').forEach((box) => box.addEventListener('change', () => {
+        const rule = rules.find((o) => o.target === selected);
+        const bit = Number(box.dataset.bit);
+        rule.allow &= ~bit;
+        rule.deny &= ~bit;
+        if (box.value === 'allow') rule.allow |= bit;
+        if (box.value === 'deny') rule.deny |= bit;
+      }));
+      const remove = $('#rule-remove', root);
+      if (remove) remove.addEventListener('click', () => {
+        rules = rules.filter((o) => o.target !== selected);
+        selected = rules.length ? rules[0].target : 'everyone';
+        redraw();
+      });
+      $('#rule-save', root).addEventListener('click', async (e) => {
+        busy(e.target, true);
+        try {
+          await editServer(serverId, [setEdit(`rules/${scope}/${id}`, rules)]);
+          toast('Permissions saved. Anyone who can no longer see a channel is taken out of it; anyone newly allowed is added.');
+          close();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+          busy(e.target, false);
+        }
+      });
+    };
+    modal(draw(), wire);
   }
 
   function editRole(serverId, st, role, isNew) {

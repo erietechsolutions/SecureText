@@ -33,7 +33,7 @@ use crate::transport::{BoxedStream, Listening, Transport};
 pub use calls::{stats as call_stats, CallParticipantView, CallView};
 pub(crate) use calls::CallSetup;
 pub use rich::{AttachmentData, AttachmentView, ReactionView};
-pub use server::{perms, Category, ChannelMeta, Role, ServerSettings};
+pub use server::{perms, Category, ChannelMeta, Overwrite, Role, ServerSettings};
 use crate::updates::{ExitFactory, UpdateConfig, UpdateEvent, UpdateStatus, Updater};
 use crate::wire::{
     self, to_hex, ContactCard, ConversationInfo, ConversationKind, Payload, SignedCard, WireMessage,
@@ -199,6 +199,9 @@ pub(crate) struct NodeState {
     /// resent on the newer one can overtake the older one, so ordering
     /// across frames isn't guaranteed.
     pending_welcomes: Vec<PendingWelcome>,
+    /// Servers whose channel access sync is waiting on someone's key
+    /// packages: peer key -> server group ids. Retried when they arrive.
+    pub(crate) access_sync_waiting: HashMap<Vec<u8>, HashSet<Vec<u8>>>,
     /// Outbox entries sent on a live connection and not yet acknowledged:
     /// id -> (peer, when sent).
     awaiting_ack: HashMap<i64, (Vec<u8>, Instant)>,
@@ -285,6 +288,7 @@ impl NodeState {
             backoff: HashMap::new(),
             pending: HashMap::new(),
             pending_welcomes: Vec::new(),
+            access_sync_waiting: HashMap::new(),
             awaiting_ack: HashMap::new(),
             last_presence: None,
             relaying: HashSet::new(),
@@ -1037,6 +1041,10 @@ impl NodeState {
                     self.store.add_peer_key_package(from, &kp)?;
                 }
                 self.dirty = true;
+                // Channels they were waiting to be added to.
+                for server in self.access_sync_waiting.remove(from).unwrap_or_default() {
+                    self.sync_channel_access(&server);
+                }
                 Ok(())
             }
             WireMessage::Tracked { id, message } => {
@@ -1108,9 +1116,23 @@ impl NodeState {
                 return Ok(());
             }
         }
-        let group = self.member.join_from_welcome(welcome)?;
+        // Only a channel or server we were removed from may be rejoined
+        // over our old state for it.
+        let store = &self.store;
+        let group = self.member.rejoin_from_welcome(welcome, |id| {
+            store.conversation(id).ok().flatten().is_some_and(|c| c.removed && c.kind != ConversationKind::Dm)
+        })?;
         let gid = group.group_id().as_slice().to_vec();
-        if self.store.conversation(&gid)?.is_some() {
+        if let Some(existing) = self.store.conversation(&gid)? {
+            // Let back into a channel we were removed from (its rules
+            // changed): same conversation, new group state.
+            if existing.removed && group.members().any(|m| m.signature_key == from) && existing.kind != ConversationKind::Dm {
+                self.store.unmark_removed(&gid)?;
+                self.groups.insert(gid.clone(), group);
+                self.dirty = true;
+                self.retry_pending(&gid);
+                self.emit(Event::ConversationsChanged);
+            }
             return Ok(());
         }
 
@@ -1499,7 +1521,10 @@ impl NodeState {
                     private: c.private,
                     removed: c.removed,
                     disappear_secs: self.store.disappear_secs(&c.group_id).ok().flatten(),
-                    permissions: server.map(|s| s.my_permissions).unwrap_or(0),
+                    permissions: match c.kind {
+                        ConversationKind::Channel => self.permissions_here(&c.group_id, self.my_key()),
+                        _ => server.map(|s| s.my_permissions).unwrap_or(0),
+                    },
                     topic: meta.topic,
                     category: meta.category,
                     position: meta.position,
@@ -1652,11 +1677,13 @@ impl NodeState {
                 peer.label
             )
         })?;
+        // Every channel the newcomer's permissions let them see (and that
+        // we're in, so we can add them).
         let public_channels: Vec<ConversationRow> = self
             .store
             .channels_of(&server.group_id)?
             .into_iter()
-            .filter(|c| !c.private && !c.removed)
+            .filter(|c| !c.removed && self.permissions_here(&c.group_id, &peer_key) & perms::VIEW_CHANNEL != 0)
             .collect();
         self.require_key_packages(std::slice::from_ref(&peer_key), 1 + public_channels.len() as u32)?;
 
@@ -1742,6 +1769,18 @@ impl NodeState {
             self.send_frame(&peer_key, frame, None)?;
             self.emit(Event::MembersChanged { conversation_id: to_hex(&gid) });
         }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Take one member out of one group (a channel whose rules no longer
+    /// let them see it).
+    pub(crate) fn remove_from_group(&mut self, gid: &[u8], peer_key: &[u8]) -> anyhow::Result<()> {
+        let group = self.groups.get_mut(gid).ok_or_else(|| anyhow::anyhow!("group state missing"))?;
+        let commit = self.member.remove_member(group, peer_key)?;
+        self.fan_out(gid, &commit, &[], None)?;
+        self.send_frame(peer_key, WireMessage::Mls { group_id: gid.to_vec(), message: commit }, None)?;
+        self.emit(Event::MembersChanged { conversation_id: to_hex(gid) });
         self.dirty = true;
         Ok(())
     }
@@ -2230,6 +2269,34 @@ mod tests {
         assert_eq!(s.name, "Club");
         assert!(s.roles.iter().all(|r| r.id != "boss"));
         assert_eq!(alice.permissions_in(&gid, bob.my_key()), 0);
+    }
+
+    #[tokio::test]
+    async fn receivers_drop_what_channel_rules_forbid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut alice, mut bob, _dm) = befriended(dir.path());
+        let server = alice.create_server("Club").unwrap();
+        let sgid = wire::from_hex(&server).unwrap();
+        alice.invite_to_server(&server, &to_hex(bob.my_key())).unwrap();
+        let frames = take_frames(&mut alice, &bob);
+        deliver(&alice, &mut bob, frames);
+        let general = alice.store.channels_of(&sgid).unwrap()[0].group_id.clone();
+        let bob_key = bob.my_key().to_vec();
+        let chat = |id: &str| {
+            Payload::Chat { id: id.into(), body: "hi".into(), sent_at: 1, reply_to: None, expires_in: None, attachment: None }
+                .to_bytes()
+        };
+        alice.on_payload(&general, &bob_key, &chat("m1")).unwrap();
+        assert!(alice.store.message(&general, "m1").unwrap().is_some());
+        // @everyone may no longer post or react in #general. A modified
+        // client sending anyway is ignored.
+        let rules = serde_json::json!([{ "target": "everyone", "deny": perms::SEND_MESSAGES | perms::ADD_REACTIONS }]);
+        alice.edit_server(&server, vec![wire::Edit { key: format!("rules/channel/{}", to_hex(&general)), value: Some(rules) }]).unwrap();
+        let _ = alice.on_payload(&general, &bob_key, &chat("m2"));
+        assert!(alice.store.message(&general, "m2").unwrap().is_none());
+        let react = Payload::Reaction { target: "m1".into(), emoji: "👍".into(), on: true }.to_bytes();
+        let _ = alice.on_payload(&general, &bob_key, &react);
+        assert!(alice.store.reactions(&general).unwrap().is_empty());
     }
 
     #[tokio::test]

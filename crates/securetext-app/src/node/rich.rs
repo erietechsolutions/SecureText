@@ -279,6 +279,10 @@ impl NodeState {
         let gid = wire::from_hex(conversation_id)?;
         let conversation = self.active_conversation(&gid)?;
         anyhow::ensure!(conversation.kind != ConversationKind::Server, "post in one of the server's channels");
+        self.require_here(&gid, super::perms::SEND_MESSAGES, "send messages")?;
+        if attachment.is_some() {
+            self.require_here(&gid, super::perms::ATTACH_FILES, "attach files")?;
+        }
         if let Some(root) = &reply_to {
             let root_row = self.store.message(&gid, root)?.ok_or_else(|| anyhow::anyhow!("that message is gone"))?;
             anyhow::ensure!(root_row.reply_to.is_none(), "threads don't nest; reply in the original thread");
@@ -384,6 +388,7 @@ impl NodeState {
         anyhow::ensure!(valid_emoji(emoji), "that isn't a reaction");
         let gid = wire::from_hex(conversation_id)?;
         let conversation = self.active_conversation(&gid)?;
+        self.require_here(&gid, super::perms::ADD_REACTIONS, "add reactions")?;
         anyhow::ensure!(conversation.kind != ConversationKind::Server, "no messages here");
         let row = self.store.message(&gid, message_id)?.ok_or_else(|| anyhow::anyhow!("that message is gone"))?;
         let payload = Payload::Reaction { target: message_id.to_string(), emoji: emoji.to_string(), on };
@@ -458,6 +463,15 @@ impl NodeState {
         attachment: Option<AttachmentRef>,
     ) -> anyhow::Result<()> {
         let id = clamp_chars(&id, 64);
+        // The sender must be allowed to post here (channel rules), and to
+        // attach files if there's one. A modified client could send
+        // anyway; honest receivers drop it.
+        let p = self.permissions_here(gid, sender);
+        anyhow::ensure!(p & super::perms::SEND_MESSAGES != 0, "message from someone not allowed to post here");
+        anyhow::ensure!(
+            attachment.is_none() || p & super::perms::ATTACH_FILES != 0,
+            "attachment from someone not allowed to attach files here"
+        );
         // A timer from either the message or the conversation, whichever
         // is shorter: deleting early is the safe side of a disagreement.
         let local = self.store.disappear_secs(gid)?;
@@ -514,6 +528,10 @@ impl NodeState {
 
     pub(crate) fn on_reaction(&mut self, gid: &[u8], sender: &[u8], target: String, emoji: String, on: bool) -> anyhow::Result<()> {
         anyhow::ensure!(valid_emoji(&emoji), "invalid reaction");
+        anyhow::ensure!(
+            self.permissions_here(gid, sender) & super::perms::ADD_REACTIONS != 0,
+            "reaction from someone not allowed to react here"
+        );
         anyhow::ensure!(self.store.message(gid, &target)?.is_some(), "reaction to an unknown message");
         self.store.set_reaction(gid, &target, sender, &emoji, on)?;
         self.emit_message_updated(gid, &target);

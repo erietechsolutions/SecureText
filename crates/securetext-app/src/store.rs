@@ -346,6 +346,12 @@ impl Store {
             .collect())
     }
 
+    pub fn unmark_removed(&self, group_id: &[u8]) -> anyhow::Result<()> {
+        self.conn
+            .execute("UPDATE app_conversations SET removed = 0 WHERE group_id = ?1", params![group_id])?;
+        Ok(())
+    }
+
     pub fn mark_removed(&self, group_id: &[u8]) -> anyhow::Result<()> {
         self.conn
             .execute("UPDATE app_conversations SET removed = 1 WHERE group_id = ?1", params![group_id])?;

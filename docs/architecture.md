@@ -187,7 +187,26 @@ message/group layer, orthogonal to the transport:
   server member excluded from a channel provably cannot decrypt its
   messages) with far less correctness risk. Revisit if a concrete need for
   the parent-epoch binding specifically comes up.
-- **Roles & permissions** = signed capability tokens (`securetext-crypto`'s
+- **Roles & permissions (as built):** server settings are last-writer-wins
+  registers (`role/<id>`, `member/<key>`, `channel/<id>`, `category/<id>`,
+  `rules/channel/<id>`, `rules/category/<id>`), sent as MLS application
+  messages. Every receiver checks each edit against its author's
+  permissions and rank, and drops edits that fail. **Channel and category
+  rules** (Discord's permission overwrites) allow or deny the channel
+  permissions (View, Send messages, Attach files, Add reactions,
+  Connect to calls, Manage channel) for @everyone, a role or a member.
+  They resolve in this order: server permissions, then category rules,
+  then the channel's rules. Within each layer the order is @everyone,
+  then roles combined, then the member. The owner and Administrators
+  bypass rules. **View is cryptographic:** whoever changes a rule, role or
+  membership brings each channel's MLS group into line, removing members
+  who can no longer view it and adding those who now can. Someone without
+  View therefore can't decrypt the channel. Send, Attach, React and
+  Connect are checked by the sender's client and again by every receiver,
+  which drops messages, reactions and call rings from people not allowed
+  to send them. A private channel with no stored rules behaves as
+  "@everyone: no View; its members: View".
+- **Original design, not what shipped:** signed capability tokens (`securetext-crypto`'s
   `Capability`/`Permission`) issued by admin key(s) (crypto-spec.md §3) —
   checked locally by every client using the group's own signature
   verification, no central authority contacted. A capability's `group_id`

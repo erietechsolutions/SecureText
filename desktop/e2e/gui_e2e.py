@@ -423,6 +423,39 @@ def roles_stage(alice, bob):
     alice.shot("26-customized-server")
 
 
+def channel_rules_stage(alice, bob):
+    """Per-channel access rules through the UI: Alice stops @everyone
+    posting in #general. Bob's composer is replaced by a note; when she
+    removes the rule, he can post again."""
+    select_channel(alice, "general")
+    alice.js("document.querySelector('.item.active').parentElement.querySelector('[data-channel-settings]').click();")
+    alice.wait("channel settings", "return !!document.querySelector('#m-perms');")
+    alice.click("#m-perms")
+    alice.wait("rules editor", "return !!document.querySelector('#rule-add');")
+    alice.js("const s = document.querySelector('#rule-add'); s.value = 'everyone'; s.dispatchEvent(new Event('change'));")
+    alice.wait("everyone rule", "return !!document.querySelector('input[name=b128][value=deny]');")
+    alice.click("input[name=b128][value=deny] + span")  # Send messages: deny
+    alice.shot("27-channel-rules")
+    alice.click("#rule-save")
+    alice.wait("rules saved", "return !document.querySelector('#rule-save');")
+
+    select_channel(bob, "general")
+    bob.wait("Bob can't post in #general", "const n = document.querySelector('#composer-note');"
+             " return document.querySelector('#composer').hidden && !n.hidden && n.textContent.includes('permission');", timeout=180)
+    log("a channel rule stops Bob posting in #general")
+    bob.shot("28-channel-rules-muted")
+
+    alice.js("document.querySelector('.item.active').parentElement.querySelector('[data-channel-settings]').click();")
+    alice.wait("channel settings", "return !!document.querySelector('#m-perms');")
+    alice.click("#m-perms")
+    alice.wait("rules editor", "return !!document.querySelector('#rule-remove');")
+    alice.click("#rule-remove")
+    alice.click("#rule-save")
+    alice.wait("rules saved", "return !document.querySelector('#rule-save');")
+    bob.wait("Bob can post again", "return !document.querySelector('#composer').hidden;", timeout=180)
+    log("removing the rule lets Bob post again")
+
+
 def screen_share_check(alice, bob):
     alice.click("[data-action=call-screen]")
     alice.wait("sharing screen", has_text("#call-panel", "Stop sharing"), timeout=30)
@@ -551,6 +584,7 @@ def main():
         alice.shot("09-server-general")
         bob.shot("09-server-general")
         roles_stage(alice, bob)
+        channel_rules_stage(alice, bob)
 
         # A private channel, then removing Bob.
         alice.click("[data-action=new-channel]")

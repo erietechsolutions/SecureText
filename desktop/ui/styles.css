@@ -203,7 +203,7 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
   padding: 7px 8px; border-radius: 7px;
   color: var(--text-2); cursor: pointer;
 }
-.item:hover { background: var(--bg-hover); color: var(--text); }
+.item:hover { background: var(--bg-active); color: var(--text); }
 .item.active { background: var(--bg-active); color: var(--text); }
 .item.unread { color: var(--text); font-weight: 600; }
 .item .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -543,3 +543,18 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
 .hop-role { color: var(--text-3); font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
 .hop-where { color: var(--text); }
 .mono { font-family: var(--mono); font-size: 11.5px; }
+
+/* Channel / category permission rules */
+.rule-targets { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 10px; }
+.rule-targets select { width: auto; }
+.rule-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 8px; background: var(--bg-raised); }
+.rule-row .grow { flex: 1; min-width: 0; }
+.tri { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; flex: none; }
+.tri-opt { position: relative; cursor: pointer; }
+.tri-opt input { position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none; }
+.tri-opt span { display: block; min-width: 30px; padding: 4px 8px; text-align: center; color: var(--text-3); }
+.tri-opt input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tri-opt.deny input:checked + span { background: var(--bad); color: #fff; }
+.tri-opt.inherit input:checked + span { background: var(--bg-active); color: var(--text); }
+.tri-opt.allow input:checked + span { background: var(--ok); color: #fff; }
+.tri-opt input:disabled + span { opacity: .5; cursor: not-allowed; }
