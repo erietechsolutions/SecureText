@@ -172,12 +172,14 @@ See [docs/platform-support.md](docs/platform-support.md) for details.
 - [docs/security-review.md](docs/security-review.md) — security review: critical areas, threat-to-code map, findings, known limits
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and verification status
 
+
 ## License
 
+Apache License
 
-                                 Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
+Version 2.0, January 2004
+
+http://www.apache.org/licenses/
 
    TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 
