@@ -17,9 +17,19 @@
 | Debian Server | 13 or newer |
 | Fedora Desktop | 44 or newer |
 
-**Current verification (2026-09-26):** everything through Phase 5 has been
-built and verified on Fedora 44 only. Ubuntu and Windows are supported
-targets but not yet tested (roadmap.md tracks this per phase).
+### How each target is met
+
+| Target | How |
+|---|---|
+| Ubuntu 22.04+ | `.deb` and `.AppImage` built on Ubuntu 22.04 (the oldest supported glibc and WebKitGTK 4.1), so they run on every newer release. The `.deb` depends on `libasound2t64 \| libasound2` to cover both library names. Every release installs and starts on Ubuntu 22.04 and 24.04. |
+| Fedora 44+ | `.rpm` built in a Fedora 44 container, and installed and started on Fedora 44 for every release. |
+| Windows 10 21H2+ / 11 | NSIS `.exe` and `.msi`. Both installers refuse to install below build 19044 (Windows 10 21H2): `desktop/windows/hooks.nsh` and `desktop/windows/version-check.wxs`. WebView2 is fetched by the installer's bootstrapper if missing. |
+| Android 12+ | Planned: `minSdkVersion 31` (Android 12) for the Phase 11 app. |
+| Relay hosts (all four) | One **fully static** musl binary, with OpenSSL, SQLite and zstd built in, so the relay has no glibc or OpenSSL version to match (Ubuntu 20.04 ships OpenSSL 1.1, and newer releases ship OpenSSL 3). The same binary is packaged as a `.deb` for Ubuntu and Debian and an `.rpm` for Fedora by `scripts/build-relay-static.sh`. Every release installs, starts and uninstalls it in clean Ubuntu 20.04, 22.04 and 24.04, Debian 13 and Fedora 44 containers (`packaging/ci/relay-install-test.sh`), which also checks the systemd unit against each host's systemd. Ubuntu 20.04's systemd 245 ignores `ProtectProc=`, which is a warning and not an error; every other hardening option applies. |
+
+**Current verification (2026-09-27):**
+- **Desktop app:** development testing has been on Fedora 44. The release pipeline installs and starts every installer on Ubuntu 22.04 and 24.04, Fedora 44 and Windows (hosted runner).
+- **Relay packages:** tested on all five host images above.
 
 **macOS is not an official v1 target** (nor is iOS). Tauri's cross-platform nature means
 it will likely build and largely work on macOS, but it is untested and

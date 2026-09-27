@@ -7,7 +7,8 @@ app handling key material), and a Rust core compiles cleanly to a shared
 library that mobile clients (Phase 10) can call into via UniFFI — avoiding a
 second implementation of the crypto/networking layer for mobile.
 
-**Target platforms:** Ubuntu, Fedora, and Windows 10/11 (see
+**Target platforms:** Ubuntu 22.04+, Fedora 44+, Windows 10 (21H2+)/11,
+Android 12+ later; relays on Ubuntu Server 20.04+, Debian 13+ and Fedora 44+ (see
 [platform-support.md](platform-support.md) for the full matrix and
 per-platform implementation notes — OS keyring, firewall defaults,
 packaging). Every choice below was made with cross-platform Rust crates

@@ -22,6 +22,15 @@ sha2.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 
+# Released relay packages are one fully static (musl) binary, so the same
+# package runs on every supported host (Ubuntu Server 20.04 through Fedora
+# 44) whatever its glibc and OpenSSL versions: `--features static` builds
+# OpenSSL in instead of linking the system's. See scripts/build-relay-static.sh.
+openssl = { version = "0.10", optional = true, features = ["vendored"] }
+
+[features]
+static = ["dep:openssl"]
+
 [dev-dependencies]
 tempfile.workspace = true
 

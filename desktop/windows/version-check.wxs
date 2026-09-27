@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MSI launch condition (tauri.conf.json bundle.windows.wix): SecureText
+     supports Windows 10 version 21H2 (build 19044) and newer, including
+     Windows 11 (docs/platform-support.md). -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <Property Id="SECURETEXT_WINDOWS_BUILD">
+      <RegistrySearch Id="SecureTextWindowsBuild" Root="HKLM"
+        Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        Name="CurrentBuildNumber" Type="raw" />
+    </Property>
+    <Condition Message="SecureText needs Windows 10 version 21H2 or newer, or Windows 11.">
+      <![CDATA[Installed OR (SECURETEXT_WINDOWS_BUILD AND SECURETEXT_WINDOWS_BUILD >= 19044)]]>
+    </Condition>
+    <!-- Referenced from the product's feature so this fragment is linked. -->
+    <ComponentGroup Id="SecureTextWindowsVersionCheck" />
+  </Fragment>
+</Wix>

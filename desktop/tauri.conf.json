@@ -61,7 +61,16 @@
       },
       "nsis": {
         "installMode": "currentUser",
-        "displayLanguageSelector": false
+        "displayLanguageSelector": false,
+        "installerHooks": "./windows/hooks.nsh"
+      },
+      "wix": {
+        "fragmentPaths": [
+          "./windows/version-check.wxs"
+        ],
+        "componentGroupRefs": [
+          "SecureTextWindowsVersionCheck"
+        ]
       }
     }
   }

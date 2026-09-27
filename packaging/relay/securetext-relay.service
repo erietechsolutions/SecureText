@@ -32,6 +32,7 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+# (systemd 247+; older systemd, e.g. Ubuntu 20.04's 245, ignores it.)
 ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes

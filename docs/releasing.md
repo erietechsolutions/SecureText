@@ -54,10 +54,13 @@ cargo run -p securetext-update --bin securetext-release -- \
    - the test suite on Linux and Windows,
    - installers built natively: `.deb` + `.AppImage` on Ubuntu 22.04,
      `.rpm` in a Fedora 44 container, NSIS `.exe` + `.msi` on Windows,
-     plus the relay's `.deb`/`.rpm`,
+     plus the relay's `.deb`/`.rpm` (one static musl binary, from
+     `scripts/build-relay-static.sh`),
    - each installer installed on a fresh runner (Ubuntu 22.04 and 24.04,
      Fedora 44, Windows), started, and checked that it stays up; the
      Windows NSIS and Linux packages are uninstalled again,
+   - the relay packages installed, started and removed on every supported
+     relay host (Ubuntu 20.04, 22.04 and 24.04, Debian 13, Fedora 44),
    - a **draft** release holding everything plus `SHA256SUMS`.
 4. Write the release notes users will see in the app (plain text), then:
 
@@ -110,7 +113,9 @@ Uninstalling never deletes the encrypted profile silently:
 ## Relay packages
 
 `securetext-relay_<v>_amd64.deb` / `securetext-relay-<v>-1.x86_64.rpm`
-install the relay with a sandboxed systemd unit (`DynamicUser`,
+are one static binary, so the same packages work on every supported relay
+host (Ubuntu Server 20.04+, Ubuntu Desktop 22.04+, Debian 13+, Fedora 44+).
+They install the relay with a sandboxed systemd unit (`DynamicUser`,
 `ProtectSystem=strict`, no capabilities) and start it. Its address is in
 `/var/lib/securetext-relay/address` once Tor is up. Removing the package
 keeps the relay's keys, so a reinstall keeps its address; `apt purge`

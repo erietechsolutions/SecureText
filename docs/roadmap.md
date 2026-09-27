@@ -413,6 +413,8 @@ possible. Full procedure: releasing.md. Design: architecture.md §10.
   - **installs each one on a fresh runner** (Ubuntu 22.04 and 24.04,
     Fedora 44, Windows NSIS and MSI) and checks the app starts and stays
     up, then uninstalls;
+  - builds the relay as one static musl binary and installs it on every
+    supported relay host (Ubuntu 20.04/22.04/24.04, Debian 13, Fedora 44);
   - publishes everything plus `SHA256SUMS` as a **draft** GitHub Release.
   
   The two-window GUI test over live Tor is an opt-in job. `ci.yml` runs
@@ -458,7 +460,8 @@ possible. Full procedure: releasing.md. Design: architecture.md §10.
       will warn. The workflow marks the step. There's no GPG signature over
       `SHA256SUMS` for manual installs yet.
 - [x] Relay packaging:
-  - `securetext-relay` as `.deb` (cargo-deb) and `.rpm`
+  - `securetext-relay` as one static musl binary (OpenSSL vendored) in a
+    `.deb` (cargo-deb) and an `.rpm`
     (cargo-generate-rpm) with a sandboxed systemd unit (`DynamicUser`,
     `ProtectSystem=strict`, no capabilities, syscall filter), enabled on
     install;
@@ -760,6 +763,8 @@ app on it.
       layer; the lowest-effort path now that the desktop app is Tauri), or
       the original plan of React Native/Flutter calling the core through
       UniFFI (tech-stack.md). Record the decision and why in tech-stack.md.
+- [ ] Target **Android 12 and newer** (`minSdkVersion 31`), per
+      platform-support.md.
 - [ ] Build the core crates for Android targets (`aarch64-linux-android`,
       `armv7-linux-androideabi`, `x86_64-linux-android` for emulators), and
       keep them building in CI.
@@ -802,7 +807,8 @@ app on it.
 - [ ] Invite links shareable via Android's share sheet and QR codes
       (camera scan to add a contact), since phones are where people
       exchange them in person.
-- **Exit criteria:** a signed APK installs on a stock Android phone,
+- **Exit criteria:** a signed APK installs on stock Android 12 and on the
+  newest Android release,
   creates a profile, and chats with a desktop user through invites,
   servers and offline delivery over Tor. An in-app update from a newer
   GitHub Release installs correctly and a tampered APK is refused. The

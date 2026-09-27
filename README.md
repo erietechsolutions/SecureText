@@ -144,11 +144,15 @@ running it headlessly.
 
 | Platform | Status |
 |---|---|
-| Fedora 44 | Supported · **tested** (all verification so far ran here) |
-| Ubuntu 22.04+ | Supported · not yet tested |
-| Windows 10 (21H2+) / 11 | Supported · not yet tested |
-| Android | Planned (Phases 10–11) |
+| Ubuntu 22.04 LTS and newer | Supported (`.deb`, `.AppImage`) |
+| Fedora 44 and newer | Supported (`.rpm`) · primary development platform |
+| Windows 10 (21H2+) and Windows 11 | Supported (NSIS `.exe`, `.msi`); older Windows is refused by the installer |
+| Android 12 and newer | Planned (Phases 10–11) |
 | macOS, iOS | Not supported |
+
+The offline-delivery relay can be hosted on Ubuntu Desktop 22.04+, Ubuntu
+Server 20.04+, Debian 13+ and Fedora 44+. It ships as one static binary in
+a `.deb` and an `.rpm`, so it has no glibc or OpenSSL version to match.
 
 See [docs/platform-support.md](docs/platform-support.md) for details.
 

@@ -85,7 +85,7 @@ jobs:
       - run: cargo test --workspace --locked
 
   build-linux:
-    name: build .deb / .AppImage / relay .deb
+    name: build .deb / .AppImage
     if: ${{ !inputs.fedora_only }}
     needs: [version, test]
     # The oldest supported Ubuntu, so the packages' glibc and library
@@ -118,17 +118,14 @@ jobs:
             extra=(--config "{\"version\":\"$SECURETEXT_BUILD_VERSION\"}")
           fi
           cargo tauri build --bundles deb,appimage "${extra[@]}"
-      - name: Relay package and TURN server
-        run: |
-          cargo deb -p securetext-relay
-          cargo build --release --locked -p securetext-call --bin securetext-turn
+      - name: TURN server
+        run: cargo build --release --locked -p securetext-call --bin securetext-turn
       - name: Collect
         run: |
           mkdir -p out
           cp target/release/securetext-turn out/securetext-turn-linux-x86_64
           cp desktop/target/release/bundle/deb/*.deb out/
           cp desktop/target/release/bundle/appimage/*.AppImage out/
-          cp target/debian/*.deb out/
           ls -la out
       - uses: actions/upload-artifact@v4
         with:
@@ -137,7 +134,7 @@ jobs:
           if-no-files-found: error
 
   build-fedora:
-    name: build .rpm / relay .rpm
+    name: build .rpm
     needs: test
     runs-on: ubuntu-22.04
     container: registry.fedoraproject.org/fedora:44
@@ -168,17 +165,47 @@ jobs:
             extra=(--config "{\"bundle\":{\"linux\":{\"rpm\":{\"release\":\"0.dev.$DEV_N\"}}}}")
           fi
           cargo tauri build --bundles rpm "${extra[@]}"
-      - name: Relay package
-        run: cargo build --release --locked -p securetext-relay && cargo generate-rpm -p crates/securetext-relay
       - name: Collect
         run: |
           mkdir -p out
           cp desktop/target/release/bundle/rpm/*.rpm out/
-          cp target/generate-rpm/*.rpm out/
           ls -la out
       - uses: actions/upload-artifact@v4
         with:
           name: linux-fedora
+          path: out/*
+          if-no-files-found: error
+
+  # One static (musl) relay binary, packaged as .deb and .rpm: no glibc or
+  # OpenSSL dependency, so the same packages run on every supported relay
+  # host (platform-support.md): Ubuntu Server 20.04+, Ubuntu Desktop
+  # 22.04+, Debian 13+, Fedora 44+.
+  build-relay:
+    name: build relay .deb / .rpm (static)
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo install --locked cargo-deb cargo-generate-rpm
+      - run: bash scripts/build-relay-static.sh
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p out
+          cp target/x86_64-unknown-linux-musl/generate-rpm/*.rpm out/
+          # Fedora-only builds publish only Fedora packages.
+          if [ "${{ inputs.fedora_only }}" != "true" ]; then cp target/x86_64-unknown-linux-musl/debian/*.deb out/; fi
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay
           path: out/*
           if-no-files-found: error
 
@@ -256,12 +283,8 @@ jobs:
         run: |
           chmod +x pkg/*.AppImage
           bash packaging/ci/smoke-test.sh "$(ls pkg/*.AppImage)"
-      - name: Relay package installs, and uninstalls cleanly
+      - name: Uninstalls cleanly
         run: |
-          sudo apt-get install -y ./pkg/securetext-relay_*_amd64.deb
-          securetext-relay --version
-          systemctl cat securetext-relay.service
-          sudo apt-get remove -y securetext-relay
           sudo apt-get remove -y secure-text
           test ! -e /usr/bin/securetext-desktop
 
@@ -284,11 +307,35 @@ jobs:
           ! ldd /usr/bin/securetext-desktop | grep "not found"
       - name: The installed app starts and stays up
         run: bash packaging/ci/smoke-test.sh /usr/bin/securetext-desktop
-      - name: Relay package installs
+      - name: Uninstalls cleanly
         run: |
-          dnf install -y ./pkg/securetext-relay-*.x86_64.rpm
-          securetext-relay --version
-          dnf remove -y securetext-relay secure-text
+          dnf remove -y secure-text
+          test ! -e /usr/bin/securetext-desktop
+
+  # The relay on every supported relay host: installs, is static, starts,
+  # its systemd unit is valid for that host's systemd, uninstalls.
+  install-relay:
+    name: install relay (${{ matrix.image }})
+    needs: build-relay
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(inputs.fedora_only && '["registry.fedoraproject.org/fedora:44"]' || '["ubuntu:20.04", "ubuntu:22.04", "ubuntu:24.04", "debian:trixie", "registry.fedoraproject.org/fedora:44"]') }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: relay
+          path: pkg
+      - name: Install, run, uninstall
+        shell: sh
+        run: |
+          case "${{ matrix.image }}" in
+            *fedora*) sh packaging/ci/relay-install-test.sh "$(ls "$PWD"/pkg/securetext-relay-*.x86_64.rpm)" ;;
+            *) sh packaging/ci/relay-install-test.sh "$(ls "$PWD"/pkg/securetext-relay_*_amd64.deb)" ;;
+          esac
 
   install-windows:
     name: install NSIS + MSI (windows-latest)
@@ -354,7 +401,7 @@ jobs:
 
   draft-release:
     name: draft GitHub Release
-    needs: [version, install-ubuntu, install-fedora, install-windows]
+    needs: [version, install-ubuntu, install-fedora, install-relay, install-windows]
     # Skipped platforms (fedora_only) don't block it; failures still do.
     if: ${{ !cancelled() && !failure() && (github.ref_type == 'tag' || inputs.draft_release || inputs.dev_tag != '') }}
     runs-on: ubuntu-22.04
