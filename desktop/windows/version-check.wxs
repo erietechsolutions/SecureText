@@ -7,7 +7,7 @@
     <Property Id="SECURETEXT_WINDOWS_BUILD">
       <RegistrySearch Id="SecureTextWindowsBuild" Root="HKLM"
         Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
-        Name="CurrentBuildNumber" Type="raw" />
+        Name="CurrentBuildNumber" Type="raw" Win64="yes" />
     </Property>
     <Condition Message="SecureText needs Windows 10 version 21H2 or newer, or Windows 11.">
       <![CDATA[Installed OR (SECURETEXT_WINDOWS_BUILD AND SECURETEXT_WINDOWS_BUILD >= 19044)]]>

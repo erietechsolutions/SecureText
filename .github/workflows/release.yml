@@ -366,7 +366,12 @@ jobs:
         shell: pwsh
         run: |
           $msi = Get-ChildItem pkg\*.msi | Select-Object -First 1
-          Start-Process msiexec -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart" -Wait
+          $log = "$env:RUNNER_TEMP\msi.log"
+          $proc = Start-Process msiexec -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart /l*v `"$log`"" -Wait -PassThru
+          if (-not (Test-Path "$env:ProgramFiles\SecureText\securetext-desktop.exe")) {
+            Get-Content $log | Select-String -Pattern "SECURETEXT|LaunchCondition|Return value 3|error" | Select-Object -Last 40
+            throw "MSI did not install (msiexec exit $($proc.ExitCode))"
+          }
           $app = Get-ChildItem "$env:ProgramFiles\SecureText\securetext-desktop.exe" -ErrorAction Stop
           $p = Start-Process $app.FullName -PassThru
           Start-Sleep -Seconds 15
