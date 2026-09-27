@@ -57,7 +57,7 @@ impl ConversationRow {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MessageRow {
     pub id: String,
     pub group_id: Vec<u8>,
@@ -66,6 +66,36 @@ pub struct MessageRow {
     pub sent_at: i64,
     pub outgoing: bool,
     pub status: String,
+    /// The thread this is a reply in (the root message's id).
+    pub reply_to: Option<String>,
+    /// When this message deletes itself (disappearing messages), ms.
+    pub expires_at: Option<i64>,
+    /// The attached file's id, if any.
+    pub attachment: Option<String>,
+}
+
+/// A file shared in a conversation. The ciphertext lives outside the
+/// database (`attachments/<id>.bin` in the profile), encrypted under `key`,
+/// which only lives here, inside the encrypted profile.
+#[derive(Clone, Debug)]
+pub struct AttachmentRow {
+    pub file_id: String,
+    pub group_id: Vec<u8>,
+    pub message_id: String,
+    pub sender_key: Vec<u8>,
+    pub name: String,
+    pub mime: String,
+    /// Plaintext size.
+    pub size: u64,
+    /// Ciphertext size and SHA-256 (hex): what a download must match.
+    pub cipher_size: u64,
+    pub cipher_sha256: String,
+    pub key: Vec<u8>,
+    /// "available" (known, not downloaded), "downloading", "complete",
+    /// "failed".
+    pub state: String,
+    /// Ciphertext bytes received so far (while downloading).
+    pub received: u64,
 }
 
 pub struct OutboxRow {
@@ -131,13 +161,48 @@ impl Store {
                 created_at INTEGER NOT NULL
             );",
         )?;
-        // Profiles created before Phase 5 lack the relay column.
-        let has_relay_column = conn
-            .prepare("SELECT relay_json FROM app_peers LIMIT 0")
-            .is_ok();
-        if !has_relay_column {
-            conn.execute_batch("ALTER TABLE app_peers ADD COLUMN relay_json TEXT;")?;
+        // Columns added after the table first shipped (older profiles lack
+        // them): relay cards (Phase 5); threads, disappearing messages and
+        // attachments (Phase 8).
+        for (table, column, ty) in [
+            ("app_peers", "relay_json", "TEXT"),
+            ("app_messages", "reply_to", "TEXT"),
+            ("app_messages", "expires_at", "INTEGER"),
+            ("app_messages", "attachment", "TEXT"),
+            ("app_conversations", "disappear_secs", "INTEGER"),
+        ] {
+            if conn.prepare(&format!("SELECT {column} FROM {table} LIMIT 0")).is_err() {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty};"))?;
+            }
         }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_reactions (
+                group_id BLOB NOT NULL,
+                message_id TEXT NOT NULL,
+                sender_key BLOB NOT NULL,
+                emoji TEXT NOT NULL,
+                PRIMARY KEY (group_id, message_id, sender_key, emoji)
+            );
+            CREATE TABLE IF NOT EXISTS app_attachments (
+                file_id TEXT PRIMARY KEY,
+                group_id BLOB NOT NULL,
+                message_id TEXT NOT NULL,
+                sender_key BLOB NOT NULL,
+                name TEXT NOT NULL,
+                mime TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                cipher_size INTEGER NOT NULL,
+                cipher_sha256 TEXT NOT NULL,
+                key BLOB NOT NULL,
+                state TEXT NOT NULL,
+                received INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS app_messages_expiry ON app_messages (expires_at)
+                WHERE expires_at IS NOT NULL;
+            -- Deleted rows (expired messages above all) are overwritten,
+            -- not just unlinked, before the profile is next sealed.
+            PRAGMA secure_delete = ON;",
+        )?;
         Ok(Self { conn })
     }
 
@@ -283,9 +348,21 @@ impl Store {
     /// via a relay).
     pub fn insert_message(&self, m: &MessageRow) -> anyhow::Result<bool> {
         let inserted = self.conn.execute(
-            "INSERT OR IGNORE INTO app_messages (group_id, id, sender_key, body, sent_at, outgoing, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![m.group_id, m.id, m.sender_key, m.body, m.sent_at, m.outgoing as i64, m.status],
+            "INSERT OR IGNORE INTO app_messages
+                (group_id, id, sender_key, body, sent_at, outgoing, status, reply_to, expires_at, attachment)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                m.group_id,
+                m.id,
+                m.sender_key,
+                m.body,
+                m.sent_at,
+                m.outgoing as i64,
+                m.status,
+                m.reply_to,
+                m.expires_at,
+                m.attachment
+            ],
         )?;
         Ok(inserted > 0)
     }
@@ -302,21 +379,165 @@ impl Store {
 
     pub fn messages(&self, group_id: &[u8], limit: u32) -> anyhow::Result<Vec<MessageRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, group_id, sender_key, body, sent_at, outgoing, status FROM (
+            "SELECT id, group_id, sender_key, body, sent_at, outgoing, status, reply_to, expires_at, attachment FROM (
                 SELECT * FROM app_messages WHERE group_id = ?1 ORDER BY seq DESC LIMIT ?2
              ) ORDER BY seq ASC",
         )?;
-        let rows = stmt.query_map(params![group_id, limit], |r| {
-            Ok(MessageRow {
-                id: r.get(0)?,
-                group_id: r.get(1)?,
-                sender_key: r.get(2)?,
-                body: r.get(3)?,
-                sent_at: r.get(4)?,
-                outgoing: r.get::<_, i64>(5)? != 0,
-                status: r.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![group_id, limit], message_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn message(&self, group_id: &[u8], id: &str) -> anyhow::Result<Option<MessageRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, group_id, sender_key, body, sent_at, outgoing, status, reply_to, expires_at, attachment
+                 FROM app_messages WHERE group_id = ?1 AND id = ?2",
+                params![group_id, id],
+                message_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Delete every message whose time is up, with its reactions and
+    /// attachment records. Returns (conversation, message id, attachment)
+    /// for each, so the caller can remove attachment files and tell the UI.
+    pub fn delete_expired(&self, now: i64) -> anyhow::Result<Vec<(Vec<u8>, String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id, id, attachment FROM app_messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        )?;
+        let gone: Vec<(Vec<u8>, String, Option<String>)> = stmt
+            .query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        for (gid, id, attachment) in &gone {
+            self.conn.execute("DELETE FROM app_messages WHERE group_id = ?1 AND id = ?2", params![gid, id])?;
+            self.conn
+                .execute("DELETE FROM app_reactions WHERE group_id = ?1 AND message_id = ?2", params![gid, id])?;
+            if let Some(file_id) = attachment {
+                self.conn.execute("DELETE FROM app_attachments WHERE file_id = ?1", params![file_id])?;
+            }
+        }
+        Ok(gone)
+    }
+
+    #[cfg(test)]
+    pub fn force_expired(&self, id: &str) -> anyhow::Result<()> {
+        self.conn.execute("UPDATE app_messages SET expires_at = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ---- conversation settings ----
+
+    pub fn disappear_secs(&self, group_id: &[u8]) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT disappear_secs FROM app_conversations WHERE group_id = ?1",
+                params![group_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub fn set_disappear_secs(&self, group_id: &[u8], secs: Option<i64>) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE app_conversations SET disappear_secs = ?2 WHERE group_id = ?1",
+            params![group_id, secs],
+        )?;
+        Ok(())
+    }
+
+    // ---- reactions ----
+
+    pub fn set_reaction(&self, group_id: &[u8], message_id: &str, sender: &[u8], emoji: &str, on: bool) -> anyhow::Result<()> {
+        if on {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO app_reactions (group_id, message_id, sender_key, emoji) VALUES (?1, ?2, ?3, ?4)",
+                params![group_id, message_id, sender, emoji],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM app_reactions WHERE group_id = ?1 AND message_id = ?2 AND sender_key = ?3 AND emoji = ?4",
+                params![group_id, message_id, sender, emoji],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every reaction in a conversation: (message id, sender, emoji).
+    pub fn reactions(&self, group_id: &[u8]) -> anyhow::Result<Vec<(String, Vec<u8>, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT message_id, sender_key, emoji FROM app_reactions WHERE group_id = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![group_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    // ---- attachments ----
+
+    pub fn insert_attachment(&self, a: &AttachmentRow) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO app_attachments
+                (file_id, group_id, message_id, sender_key, name, mime, size, cipher_size, cipher_sha256, key, state, received)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                a.file_id,
+                a.group_id,
+                a.message_id,
+                a.sender_key,
+                a.name,
+                a.mime,
+                a.size as i64,
+                a.cipher_size as i64,
+                a.cipher_sha256,
+                a.key,
+                a.state,
+                a.received as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn attachment(&self, file_id: &str) -> anyhow::Result<Option<AttachmentRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT file_id, group_id, message_id, sender_key, name, mime, size, cipher_size, cipher_sha256, key, state, received
+                 FROM app_attachments WHERE file_id = ?1",
+                params![file_id],
+                |r| {
+                    Ok(AttachmentRow {
+                        file_id: r.get(0)?,
+                        group_id: r.get(1)?,
+                        message_id: r.get(2)?,
+                        sender_key: r.get(3)?,
+                        name: r.get(4)?,
+                        mime: r.get(5)?,
+                        size: r.get::<_, i64>(6)? as u64,
+                        cipher_size: r.get::<_, i64>(7)? as u64,
+                        cipher_sha256: r.get(8)?,
+                        key: r.get(9)?,
+                        state: r.get(10)?,
+                        received: r.get::<_, i64>(11)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn set_attachment_progress(&self, file_id: &str, state: &str, received: u64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE app_attachments SET state = ?2, received = ?3 WHERE file_id = ?1",
+            params![file_id, state, received as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Attachments currently being downloaded.
+    pub fn downloading_attachments(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT file_id FROM app_attachments WHERE state = 'downloading'")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -432,6 +653,21 @@ fn peer_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRow> {
         relay: r
             .get::<_, Option<String>>(5)?
             .and_then(|json| serde_json::from_str(&json).ok()),
+    })
+}
+
+fn message_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        id: r.get(0)?,
+        group_id: r.get(1)?,
+        sender_key: r.get(2)?,
+        body: r.get(3)?,
+        sent_at: r.get(4)?,
+        outgoing: r.get::<_, i64>(5)? != 0,
+        status: r.get(6)?,
+        reply_to: r.get(7)?,
+        expires_at: r.get(8)?,
+        attachment: r.get(9)?,
     })
 }
 

@@ -250,6 +250,90 @@ def call_stage(alice, bob, turn, screen_share=False):
     log("hang-up ended the call on both sides")
 
 
+def attach(w, name, mime, make_blob_js):
+    """Put a file into the (hidden) file picker the way choosing one would,
+    and fire its change event. `make_blob_js` is a JS expression giving a
+    Promise of a Blob."""
+    script = f"""const done = arguments[arguments.length - 1];
+        Promise.resolve({make_blob_js}).then(blob => {{
+            const dt = new DataTransfer();
+            dt.items.add(new File([blob], {json.dumps(name)}, {{ type: {json.dumps(mime)} }}));
+            const input = document.querySelector('#file-input');
+            input.files = dt.files;
+            input.dispatchEvent(new Event('change'));
+            done(blob.size);
+        }}, e => done('error: ' + e));"""
+    return w.cmd("POST", "/execute/async", {"script": script, "args": []})
+
+
+def show_actions(w, css):
+    # Message actions appear on hover; make them clickable without one.
+    w.js("document.querySelectorAll(arguments[0]).forEach(e => e.style.display = 'flex');", css)
+
+
+def rich_stage(alice, bob):
+    """Phase 8 in the DM, through the UI: a reaction, a thread, an inline
+    image, a file downloaded on request, status, disappearing messages."""
+    show_actions(bob, "#messages .msg-actions")
+    bob.click("#messages .msg[data-id]:last-of-type [data-react-menu]")
+    bob.click(".react-menu [data-react]")
+    alice.wait("Bob's reaction", has_text("#messages .reactions", "1"), timeout=180)
+    log("alice sees bob's reaction")
+
+    show_actions(alice, "#messages .msg-actions")
+    alice.click("#messages .msg[data-id] [data-thread]")
+    alice.type("#thread-input", "Replying in a thread.")
+    alice.click("#thread-composer button[type=submit]")
+    bob.wait("thread link", has_text("#messages", "1 reply"), timeout=180)
+    time.sleep(1)
+    assert "2 replies" not in alice.js(text_of("#messages")), "a reply must be counted once"
+    alice.wait("thread panel fits the window", "const p = document.querySelector('#thread-panel');"
+               " return !p.hidden && p.getBoundingClientRect().right <= window.innerWidth + 1;")
+    alice.wait("thread reply marked delivered", "const t = document.querySelector('#thread-body');"
+               " return !!t && t.textContent.includes('Replying in a thread.') && !t.textContent.includes('Queued');", timeout=120)
+    alice.shot("21-thread-open")
+    bob.click("#messages .thread-link")
+    bob.wait("thread reply", has_text("#thread-body", "Replying in a thread."))
+    log("bob sees alice's thread reply")
+    bob.shot("21-thread")
+    bob.click("[data-action=close-thread]")
+
+    size = attach(alice, "square.png", "image/png", """new Promise(r => {
+        const c = document.createElement('canvas'); c.width = 96; c.height = 64;
+        const g = c.getContext('2d'); g.fillStyle = '#7c6cf2'; g.fillRect(0, 0, 96, 64);
+        g.fillStyle = '#fff'; g.font = '20px sans-serif'; g.fillText('hi', 36, 40);
+        c.toBlob(r, 'image/png'); })""")
+    assert isinstance(size, int) and size > 0, size
+    bob.wait("inline image", "const i = document.querySelector('#messages .attachment.image img');"
+             " return !!i && i.src.startsWith('data:image/png') && i.naturalWidth === 96;", timeout=180)
+    log(f"bob sees alice's {size}-byte image inline (downloaded over Tor, decrypted, rendered)")
+
+    attach(alice, "notes.txt", "text/plain", "new Blob(['meeting notes: bring snacks\\n'.repeat(4000)])")
+    bob.wait("file offered", "return !!document.querySelector('#messages [data-download]');", timeout=180)
+    bob.click("#messages [data-download]")
+    bob.wait("file downloaded", "return !!document.querySelector('#messages .attachment.file [data-save]');", timeout=240)
+    log("bob downloaded alice's file on request")
+    bob.shot("22-files")
+
+    alice.click("#me-status")
+    alice.click("input[name=st][value=away]")
+    alice.type("#m-text", "testing SecureText")
+    alice.click("#m-go")
+    bob.wait("alice's status", has_text("#members", "testing SecureText"), timeout=120)
+    log("bob sees alice's status")
+
+    alice.click("[data-action=timer]")
+    alice.click("input[name=timer][value='3600']")
+    alice.click("#m-go")
+    bob.wait("timer note", has_text("#messages", "disappear after 1 hour"), timeout=180)
+    send(bob, "This one will disappear.")
+    alice.wait("expiring message", "return [...document.querySelectorAll('#messages .msg')].some(m =>"
+               " m.textContent.includes('This one will disappear.') && !!m.querySelector('.expires'));", timeout=180)
+    log("disappearing timer applied on both sides")
+    alice.shot("23-rich")
+    bob.shot("23-rich")
+
+
 def screen_share_check(alice, bob):
     alice.click("[data-action=call-screen]")
     alice.wait("sharing screen", has_text("#call-panel", "Stop sharing"), timeout=30)
@@ -264,6 +348,7 @@ def relay_stage(alice, bob, args, binary):
     """Phase 5 over live Tor: Bob picks a relay and goes offline; Alice's
     message is left there; Alice goes offline; Bob comes back and gets it."""
     bob.click("#me-settings")
+    bob.click("#s-relay")
     bob.type("#m-relay", args.relay)
     bob.shot("13-relay-settings")
     bob.click("#m-go")
@@ -351,6 +436,7 @@ def main():
         bob.shot("07-dm-conversation")
         if args.turn:
             call_stage(alice, bob, args.turn, args.screen_share)
+        rich_stage(alice, bob)
 
         # Alice creates a server and invites Bob.
         alice.click("#rail-add")
@@ -388,6 +474,7 @@ def main():
 
         alice.click("#sidebar-body [data-conv]")  # back to #general
         alice.wait("#general open again", has_text("#main-title", "general"))
+        alice.wait("remove button", "return !!document.querySelector('.member .kick');")
         alice.js("document.querySelector('.member .kick').style.visibility = 'visible';")
         alice.click(".member .kick")
         alice.shot("11-remove-confirm")

@@ -27,7 +27,7 @@ exception to the anonymity guarantee — see
 | 5 | Offline delivery (relays) | ✅ Verified deterministically and over live Tor |
 | 6 | Desktop installers & auto-updates | ✅ Built and verified locally · first signed release pending |
 | 7 | Voice & video | ✅ Built · verified via the GUI · real devices/networks pending |
-| 8 | Rich features (files, reactions, threads…) | Not started |
+| 8 | Rich features (files, reactions, threads…) | ✅ Verified through the GUI over live Tor |
 | 9 | Hardening & third-party audit | Not started |
 | 10 | Mobile core compatibility | Not started |
 | 11 | Android app, export & updates | Not started |
@@ -54,6 +54,10 @@ each phase's verification did and didn't cover.
 - **Confirmed delivery.** A message counts as sent only once the
   recipient's app acknowledges it.
 
+- **Files, reactions, threads, status, disappearing messages.** Share
+  files and images up to 25 MB (encrypted, fetched over Tor from whoever in
+  the conversation has them), react, reply in threads, set a status, and
+  make messages delete themselves after a set time.
 - **Voice and video calls** in DMs and channels. This is the one feature
   that doesn't go over Tor, and the app says so before every call. Media
   always goes through a TURN relay server, so the other people on the call
@@ -158,6 +162,7 @@ See [docs/platform-support.md](docs/platform-support.md) for details.
 - [docs/tech-stack.md](docs/tech-stack.md) — libraries and tools chosen, with rationale and implementation findings
 - [docs/platform-support.md](docs/platform-support.md) — supported platforms, packaging and CI notes
 - [docs/releasing.md](docs/releasing.md) — installers, the release pipeline, and signing updates
+- [docs/feature-parity.md](docs/feature-parity.md) — the Discord-like feature checklist and what each feature reveals
 - [docs/roadmap.md](docs/roadmap.md) — phase-by-phase plan and verification status
 
 ## License

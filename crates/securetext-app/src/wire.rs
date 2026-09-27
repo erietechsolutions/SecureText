@@ -168,13 +168,62 @@ pub enum WireMessage {
     /// confirmed end to end instead.
     Tracked { id: i64, message: Box<WireMessage> },
     Ack { id: i64 },
+    /// The sender's status (Phase 8), for peers it's connected to. Only
+    /// the Noise session protects it (it isn't about any one conversation),
+    /// and it's never stored, queued or relayed.
+    Presence { status: String, text: String },
+    /// Ask for a piece of an attachment's ciphertext (Phase 8). Answered
+    /// only for members of the conversation the file was shared in.
+    FileRequest { file_id: String, offset: u64 },
+    FileChunk {
+        file_id: String,
+        offset: u64,
+        #[serde(with = "b64")]
+        data: Vec<u8>,
+    },
+    /// The asked-for file isn't available from this peer (not a member,
+    /// or not downloaded yet).
+    FileUnavailable { file_id: String },
+}
+
+/// A file shared in a message: what's needed to fetch its ciphertext from
+/// whoever has it, check it, and decrypt it. Carried inside MLS, so the
+/// key reaches only the conversation's members.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRef {
+    pub file_id: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub cipher_size: u64,
+    pub cipher_sha256: String,
+    #[serde(with = "b64")]
+    pub key: Vec<u8>,
 }
 
 /// The plaintext inside an MLS application message.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Payload {
-    Chat { id: String, body: String, sent_at: i64 },
+    Chat {
+        id: String,
+        body: String,
+        sent_at: i64,
+        /// Phase 8 fields, left out when unset so older clients still read
+        /// plain messages. The thread this replies in (root message id):
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+        /// Disappearing messages: seconds after which recipients delete it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_in: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment: Option<AttachmentRef>,
+    },
+    /// Add or remove an emoji reaction to a message.
+    Reaction { target: String, emoji: String, on: bool },
+    /// Set (or, with `None`, clear) the conversation's disappearing-message
+    /// timer. DMs: either person; channels: the admin.
+    Disappear { secs: Option<i64> },
     /// Sent by a server's admin to announce members' contact cards, so
     /// every member can reach every other member directly. MLS
     /// authenticates the admin as the sender; each card's own signature

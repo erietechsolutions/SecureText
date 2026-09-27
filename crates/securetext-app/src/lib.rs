@@ -35,7 +35,7 @@ use securetext_identity::IdentityStore;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-pub use node::{fingerprint, CallParticipantView, CallView, MAX_MESSAGE_CHARS};
+pub use node::{fingerprint, AttachmentData, AttachmentView, CallParticipantView, CallView, ReactionView, MAX_MESSAGE_CHARS};
 use node::{CallSetup, Job, NetEvent, NodeState, Opened, Timing};
 pub use securetext_call as call;
 pub use transport::{MemoryNetwork, TorTransport, Transport};
@@ -139,6 +139,8 @@ pub struct ConversationView {
     pub private: bool,
     /// We were removed; history stays readable, nothing new arrives.
     pub removed: bool,
+    /// Disappearing-message timer, in seconds, if on.
+    pub disappear_secs: Option<i64>,
     /// For DMs: the other person's key.
     pub peer_key: Option<String>,
 }
@@ -153,8 +155,17 @@ pub struct MessageView {
     pub outgoing: bool,
     /// "pending" (queued for at least one recipient), "sent" (written to
     /// every recipient's connection), "relayed" (the last undelivered copy
-    /// was left at a recipient's relay mailbox), or "received".
+    /// was left at a recipient's relay mailbox), "received", or "system"
+    /// (a local note, e.g. a timer change).
     pub status: String,
+    /// The thread this replies in (root message id).
+    pub reply_to: Option<String>,
+    /// Replies in this message's thread.
+    pub reply_count: u32,
+    pub reactions: Vec<ReactionView>,
+    pub attachment: Option<AttachmentView>,
+    /// When it disappears (ms since the epoch), if a timer applies.
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -165,6 +176,9 @@ pub struct MemberView {
     pub is_admin: bool,
     pub is_me: bool,
     pub online: bool,
+    /// "online", "away", "dnd", or "offline".
+    pub status: String,
+    pub status_text: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -176,6 +190,8 @@ pub struct ContactView {
     /// We hold their signed contact card, which inviting them to a server
     /// requires (they have to have connected to us at least once).
     pub has_card: bool,
+    pub status: String,
+    pub status_text: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -187,6 +203,11 @@ pub enum Event {
     Message { conversation_id: String, message: MessageView },
     MessageStatus { conversation_id: String, id: String, status: String },
     Peer { key: String, online: bool },
+    /// A message's reactions, thread count or attachment state changed.
+    MessageUpdated { conversation_id: String, message: MessageView },
+    /// Disappearing messages whose time ran out.
+    MessagesDeleted { conversation_id: String, ids: Vec<String> },
+    Presence { key: String, status: String, text: String },
     Update { status: UpdateStatus },
     /// The call changed (or ended: `call` is `None` and `ended` says why).
     Call { call: Option<CallView>, ended: Option<String> },
@@ -232,6 +253,7 @@ impl NodeHandle {
             relay_poll_interval: config.relay_poll_interval,
         };
         let mut state = NodeState::new(opened, events.clone(), net_tx.clone(), timing)?;
+        state.set_profile_dir(&config.profile_dir);
         if let Some(update) = config.update {
             state.enable_updates(update);
         }
@@ -335,6 +357,54 @@ impl NodeHandle {
 
     pub async fn send_message(&self, conversation_id: String, body: String) -> anyhow::Result<MessageView> {
         self.call(move |s| s.send_message(&conversation_id, &body)).await
+    }
+
+    // ---- rich messaging (Phase 8) ----
+
+    /// Post, optionally as a reply in the thread rooted at `reply_to`.
+    pub async fn post(&self, conversation_id: String, body: String, reply_to: Option<String>) -> anyhow::Result<MessageView> {
+        self.call(move |s| s.post(&conversation_id, &body, reply_to, None)).await
+    }
+
+    /// Share a file (up to 25 MB), with an optional caption.
+    pub async fn send_file(
+        &self,
+        conversation_id: String,
+        name: String,
+        mime: String,
+        data: Vec<u8>,
+        caption: String,
+        reply_to: Option<String>,
+    ) -> anyhow::Result<MessageView> {
+        self.call(move |s| s.send_file(&conversation_id, &name, &mime, &data, &caption, reply_to)).await
+    }
+
+    pub async fn react(&self, conversation_id: String, message_id: String, emoji: String, on: bool) -> anyhow::Result<MessageView> {
+        self.call(move |s| s.react(&conversation_id, &message_id, &emoji, on)).await
+    }
+
+    /// Turn on (`Some(seconds)`) or off (`None`) disappearing messages.
+    pub async fn set_disappearing(&self, conversation_id: String, secs: Option<i64>) -> anyhow::Result<()> {
+        self.call(move |s| s.set_disappearing(&conversation_id, secs)).await
+    }
+
+    /// Set our status ("online", "away", "dnd") and an optional short text.
+    pub async fn set_presence(&self, status: String, text: String) -> anyhow::Result<(String, String)> {
+        self.call(move |s| s.set_presence(&status, &text)).await
+    }
+
+    pub async fn download_attachment(&self, file_id: String) -> anyhow::Result<()> {
+        self.call(move |s| s.start_download(&file_id)).await
+    }
+
+    /// A downloaded image, for inline display.
+    pub async fn attachment_data(&self, file_id: String) -> anyhow::Result<AttachmentData> {
+        self.call(move |s| s.attachment_data(&file_id)).await
+    }
+
+    /// Decrypt a downloaded file into `dir` (default: the downloads folder).
+    pub async fn save_attachment(&self, file_id: String, dir: Option<PathBuf>) -> anyhow::Result<String> {
+        self.call(move |s| s.save_attachment(&file_id, dir)).await
     }
 
     /// Create a server (with a "general" channel). Returns its id.

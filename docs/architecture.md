@@ -264,6 +264,21 @@ As built (`crates/securetext-call`, `securetext-app/src/node/calls.rs`):
     key until it ends.
   - The TURN operator can see traffic volume and timing.
 
+## 9a. Rich messaging (Phase 8)
+
+Threads, reactions and disappearing-message timers are MLS application
+messages in the conversation's group. Their privacy properties are chat's.
+
+- **Presence** is a peer-level frame: it goes to connected peers over
+  Noise, and is never stored or relayed.
+- **Files** are encrypted once under a random key carried inside the MLS
+  message. Their ciphertext is pulled in 256 KiB chunks, over existing
+  peer connections (Tor onion services), from anyone in the conversation
+  who has it. Chunks are served only to members of the conversation, and
+  each download is checked against the SHA-256 in the MLS message.
+
+The per-feature metadata review is in feature-parity.md.
+
 ## 10. Updates (Phase 6)
 
 The app updates itself from GitHub Releases without weakening the

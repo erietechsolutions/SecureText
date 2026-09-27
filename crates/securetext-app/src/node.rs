@@ -8,6 +8,7 @@
 //! that only ever hand frames to and from this one.
 
 mod calls;
+mod rich;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -26,10 +27,11 @@ use securetext_relay::{client as relay_client, RelayAddress, Request as RelayReq
 use tokio::task::JoinSet;
 
 use crate::relay::{self, MyRelay};
-use crate::store::{ConversationRow, MessageRow, PeerRow, Store};
+use crate::store::{ConversationRow, PeerRow, Store};
 use crate::transport::{BoxedStream, Listening, Transport};
 pub use calls::{stats as call_stats, CallParticipantView, CallView};
 pub(crate) use calls::CallSetup;
+pub use rich::{AttachmentData, AttachmentView, ReactionView};
 use crate::updates::{ExitFactory, UpdateConfig, UpdateEvent, UpdateStatus, Updater};
 use crate::wire::{
     self, to_hex, ContactCard, ConversationInfo, ConversationKind, Payload, SignedCard, WireMessage,
@@ -194,6 +196,7 @@ pub(crate) struct NodeState {
     /// if the connection comes up within `LIVE_HOLD`, otherwise dropped.
     /// Never persisted and never left at a relay.
     live_pending: HashMap<Vec<u8>, Vec<(Instant, WireMessage)>>,
+    rich: rich::RichState,
     dirty: bool,
     pub(crate) stopping: bool,
 }
@@ -225,6 +228,7 @@ impl NodeState {
         let store = Store::open(identity.db_path())?;
         let my_relay = MyRelay::load(&store)?;
 
+        let attachments_dir = identity.db_path().with_file_name("attachments");
         let mut groups = HashMap::new();
         for conversation in store.conversations()? {
             if let Some(group) = member.load_group(&GroupId::from_slice(&conversation.group_id))? {
@@ -267,6 +271,7 @@ impl NodeState {
             call: None,
             call_setup: None,
             live_pending: HashMap::new(),
+            rich: rich::RichState::new(attachments_dir),
             dirty: false,
             stopping: false,
         })
@@ -352,6 +357,7 @@ impl NodeState {
             NetEvent::Disconnected { peer_key, conn_id } => {
                 if self.connections.get(&peer_key).is_some_and(|c| c.id == conn_id) {
                     self.connections.remove(&peer_key);
+                    self.rich.presence.remove(&peer_key);
                     self.emit(Event::Peer { key: to_hex(&peer_key), online: false });
                 }
             }
@@ -408,6 +414,8 @@ impl NodeState {
             self.maybe_collect();
         }
         self.call_tick();
+        self.expire_messages();
+        self.download_tick();
         self.live_pending.retain(|_, held| {
             held.retain(|(queued, _)| queued.elapsed() < LIVE_HOLD);
             !held.is_empty()
@@ -425,6 +433,14 @@ impl NodeState {
     // =====================================================================
     // Updates (Phase 6)
     // =====================================================================
+
+    /// Where attachment ciphertext is kept (inside the profile directory),
+    /// and pick up anything left over from the last run.
+    pub(crate) fn set_profile_dir(&mut self, profile_dir: &std::path::Path) {
+        self.rich.attachments_dir = profile_dir.join("attachments");
+        self.load_presence();
+        self.resume_downloads();
+    }
 
     pub(crate) fn enable_calls(&mut self, setup: CallSetup) {
         self.call_setup = Some(setup);
@@ -864,8 +880,10 @@ impl NodeState {
                 }
             }
         }
+        let _ = tx.send(Outgoing { outbox_id: None, message: self.my_presence_frame() });
         self.connections.insert(peer_key.clone(), Conn { id: conn_id, tx });
         self.emit(Event::Peer { key: to_hex(&peer_key), online: true });
+        self.downloads_on_connect();
     }
 
     fn on_frame(&mut self, from: &[u8], message: WireMessage) -> anyhow::Result<()> {
@@ -919,6 +937,19 @@ impl NodeState {
             WireMessage::NeedKeyPackages { count } => {
                 anyhow::ensure!(self.store.peer(from)?.is_some(), "key package request from an unknown peer");
                 self.send_key_packages(from, (count as usize).min(INITIAL_KEY_PACKAGES))
+            }
+            WireMessage::Presence { status, text } => {
+                self.on_presence(from, status, text);
+                Ok(())
+            }
+            WireMessage::FileRequest { file_id, offset } => {
+                self.on_file_request(from, file_id, offset);
+                Ok(())
+            }
+            WireMessage::FileChunk { file_id, offset, data } => self.on_file_chunk(from, file_id, offset, data),
+            WireMessage::FileUnavailable { file_id } => {
+                self.on_file_unavailable(from, file_id);
+                Ok(())
             }
         }
     }
@@ -1103,21 +1134,11 @@ impl NodeState {
             .conversation(gid)?
             .ok_or_else(|| anyhow::anyhow!("message for an unknown conversation"))?;
         match Payload::from_bytes(plaintext)? {
-            Payload::Chat { id, body, sent_at } => {
-                let row = MessageRow {
-                    id: clamp_chars(&id, 64),
-                    group_id: gid.to_vec(),
-                    sender_key: sender.to_vec(),
-                    body: clamp_chars(&body, MAX_MESSAGE_CHARS),
-                    sent_at,
-                    outgoing: false,
-                    status: "received".into(),
-                };
-                if self.store.insert_message(&row)? {
-                    let view = self.message_view(&row);
-                    self.emit(Event::Message { conversation_id: to_hex(gid), message: view });
-                }
+            Payload::Chat { id, body, sent_at, reply_to, expires_in, attachment } => {
+                self.on_chat(gid, sender, id, body, sent_at, reply_to, expires_in, attachment)?;
             }
+            Payload::Reaction { target, emoji, on } => self.on_reaction(gid, sender, target, emoji, on)?,
+            Payload::Disappear { secs } => self.on_disappear(gid, sender, secs)?,
             Payload::Call { call_id, signal } => {
                 if !conversation.removed {
                     self.on_call_signal(gid, sender, call_id, signal);
@@ -1303,6 +1324,7 @@ impl NodeState {
                 is_admin: c.admin_key == self.public.public_key,
                 private: c.private,
                 removed: c.removed,
+                disappear_secs: self.store.disappear_secs(&c.group_id).ok().flatten(),
                 peer_key: if c.kind == ConversationKind::Dm {
                     self.groups.get(&c.group_id).and_then(|g| {
                         g.members()
@@ -1317,28 +1339,6 @@ impl NodeState {
             .collect())
     }
 
-    pub(crate) fn messages(&self, conversation_id: &str, limit: u32) -> anyhow::Result<Vec<MessageView>> {
-        let gid = wire::from_hex(conversation_id)?;
-        Ok(self
-            .store
-            .messages(&gid, limit.clamp(1, 1000))?
-            .iter()
-            .map(|m| self.message_view(m))
-            .collect())
-    }
-
-    fn message_view(&self, m: &MessageRow) -> MessageView {
-        MessageView {
-            id: m.id.clone(),
-            sender_key: to_hex(&m.sender_key),
-            sender_label: self.label_for(&m.sender_key),
-            body: m.body.clone(),
-            sent_at: m.sent_at,
-            outgoing: m.outgoing,
-            status: m.status.clone(),
-        }
-    }
-
     fn label_for(&self, key: &[u8]) -> String {
         if key == self.my_key() {
             return self.public.label.clone();
@@ -1350,42 +1350,7 @@ impl NodeState {
     }
 
     pub(crate) fn send_message(&mut self, conversation_id: &str, body: &str) -> anyhow::Result<MessageView> {
-        let body = body.trim();
-        anyhow::ensure!(!body.is_empty(), "message is empty");
-        anyhow::ensure!(
-            body.chars().count() <= MAX_MESSAGE_CHARS,
-            "message is longer than {MAX_MESSAGE_CHARS} characters"
-        );
-        let gid = wire::from_hex(conversation_id)?;
-        let conversation = self.active_conversation(&gid)?;
-        anyhow::ensure!(conversation.kind != ConversationKind::Server, "post in one of the server's channels");
-
-        let id = random_id();
-        let sent_at = now_ms();
-        let payload = Payload::Chat { id: id.clone(), body: body.to_string(), sent_at };
-        let group = self.groups.get_mut(&gid).ok_or_else(|| anyhow::anyhow!("group state missing"))?;
-        let ciphertext = self.member.encrypt(group, &payload.to_bytes())?;
-
-        let row = MessageRow {
-            id: id.clone(),
-            group_id: gid.clone(),
-            sender_key: self.public.public_key.clone(),
-            body: body.to_string(),
-            sent_at,
-            outgoing: true,
-            status: "pending".into(),
-        };
-        self.store.insert_message(&row)?;
-        let recipients = self.fan_out(&gid, &ciphertext, &[], Some(&id))?;
-        if recipients == 0 {
-            self.store.set_message_status(&id, "sent")?;
-        }
-        self.dirty = true;
-        let row = MessageRow {
-            status: if recipients == 0 { "sent".into() } else { row.status },
-            ..row
-        };
-        Ok(self.message_view(&row))
+        self.post(conversation_id, body, None, None)
     }
 
     fn active_conversation(&self, gid: &[u8]) -> anyhow::Result<ConversationRow> {
@@ -1606,6 +1571,8 @@ impl NodeState {
                 is_admin: key == conversation.admin_key,
                 is_me: key == self.public.public_key,
                 online: key == self.public.public_key || self.connections.contains_key(&key),
+                status: self.presence_of(&key).0,
+                status_text: self.presence_of(&key).1,
             })
             .collect();
         members.sort_by(|a, b| b.is_admin.cmp(&a.is_admin).then(a.label.to_lowercase().cmp(&b.label.to_lowercase())));
@@ -1624,6 +1591,8 @@ impl NodeState {
                 fingerprint: fingerprint(&p.mls_key),
                 online: self.connections.contains_key(&p.mls_key),
                 has_card: self.store.peer_card(&p.mls_key).ok().flatten().is_some(),
+                status: self.presence_of(&p.mls_key).0,
+                status_text: self.presence_of(&p.mls_key).1,
             })
             .collect())
     }
@@ -1843,5 +1812,87 @@ mod tests {
         assert!(kinds.contains(&ConversationKind::Server));
         assert!(kinds.contains(&ConversationKind::Channel), "the early channel Welcome was lost: {kinds:?}");
         assert!(bob.pending_welcomes.is_empty());
+    }
+
+    /// Alice and Bob as contacts with a DM, frames carried by hand.
+    fn befriended(dir: &std::path::Path) -> (NodeState, NodeState, String) {
+        let mut alice = offline_node(dir, "alice");
+        let mut bob = offline_node(dir, "bob");
+        let invite = alice.create_invite().unwrap();
+        let dm = bob.add_contact(&invite).unwrap();
+        let frames = take_frames(&mut bob, &alice);
+        deliver(&bob, &mut alice, frames);
+        let frames = take_frames(&mut alice, &bob);
+        deliver(&alice, &mut bob, frames);
+        (alice, bob, dm)
+    }
+
+    /// A fake live connection to `peer` on `node`, returning what the node
+    /// sends down it.
+    fn fake_connection(node: &mut NodeState, peer: &[u8]) -> mpsc::UnboundedReceiver<Outgoing> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        node.connections.insert(peer.to_vec(), Conn { id: 999, tx });
+        rx
+    }
+
+    #[tokio::test]
+    async fn an_expired_message_is_erased_from_the_database_file_not_just_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut alice, _bob, dm) = befriended(dir.path());
+        let secret = "the eagle lands at midnight by the old mill";
+        let posted = alice.post(&dm, secret, None, None).unwrap();
+        let db = alice.identity.db_path().to_path_buf();
+        let contains = |path: &std::path::Path| {
+            let bytes = std::fs::read(path).unwrap();
+            bytes.windows(secret.len()).any(|w| w == secret.as_bytes())
+        };
+        // The check is only meaningful if the text is in the file to begin with.
+        assert!(contains(&db), "the message should be on disk before it expires");
+
+        alice.store.force_expired(&posted.id).unwrap();
+        alice.expire_messages();
+        assert!(alice.messages(&dm, 100).unwrap().iter().all(|m| m.id != posted.id));
+        assert!(!contains(&db), "secure_delete must overwrite the expired message's bytes");
+    }
+
+    #[tokio::test]
+    async fn files_are_served_only_to_members_of_their_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut alice, bob, dm) = befriended(dir.path());
+        let sent = alice.send_file(&dm, "notes.txt", "text/plain", b"members only", "", None).unwrap();
+        let file_id = sent.attachment.unwrap().file_id;
+
+        let outsider = vec![9u8; 32];
+        let mut rx = fake_connection(&mut alice, &outsider);
+        alice.on_file_request(&outsider, file_id.clone(), 0);
+        assert!(matches!(rx.try_recv().unwrap().message, WireMessage::FileUnavailable { .. }), "an outsider gets nothing");
+
+        let bob_key = bob.my_key().to_vec();
+        let mut rx = fake_connection(&mut alice, &bob_key);
+        alice.on_file_request(&bob_key, file_id, 0);
+        assert!(matches!(rx.try_recv().unwrap().message, WireMessage::FileChunk { .. }), "a member gets the file");
+    }
+
+    #[tokio::test]
+    async fn a_download_that_does_not_match_its_hash_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut alice, mut bob, dm) = befriended(dir.path());
+        let sent = alice.send_file(&dm, "data.bin", "", &[1u8; 5000], "", None).unwrap();
+        let file_id = sent.attachment.unwrap().file_id;
+        let frames = take_frames(&mut alice, &bob);
+        deliver(&alice, &mut bob, frames);
+
+        let alice_key = alice.my_key().to_vec();
+        let mut rx = fake_connection(&mut bob, &alice_key);
+        bob.start_download(&file_id).unwrap();
+        let WireMessage::FileRequest { offset: 0, .. } = rx.try_recv().unwrap().message else { panic!("expected a request") };
+        // Alice (or someone impersonating her connection) sends bytes of
+        // the right length but the wrong content.
+        let size = bob.store.attachment(&file_id).unwrap().unwrap().cipher_size as usize;
+        let result = bob.on_file_chunk(&alice_key, file_id.clone(), 0, vec![0u8; size]);
+        assert!(result.is_err());
+        assert_eq!(bob.store.attachment(&file_id).unwrap().unwrap().state, "failed");
+        assert!(!bob.attachment_path(&file_id, false).exists());
+        assert!(!bob.attachment_path(&file_id, true).exists());
     }
 }

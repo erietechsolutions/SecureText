@@ -63,10 +63,10 @@
       <div class="sidebar-body" id="sidebar-body"></div>
       <footer class="me">
         <div class="avatar" id="me-avatar"></div>
-        <div class="me-text">
+        <button class="me-text" id="me-status" type="button" title="Set your status">
           <div class="me-name" id="me-name"></div>
-          <div class="me-fp" id="me-fp" title="Your identity key fingerprint"></div>
-        </div>
+          <div class="me-fp" id="me-fp"></div>
+        </button>
         <button class="icon-btn" id="me-settings" type="button" title="Settings" aria-label="Settings">⚙</button>
       </footer>
     </aside>
@@ -82,6 +82,8 @@
       <section id="call-panel" class="call-panel" hidden aria-label="Call"></section>
       <div class="messages" id="messages" aria-live="polite"></div>
       <form class="composer" id="composer" hidden>
+        <button class="icon-btn attach" type="button" data-action="attach" title="Share a file (up to 25 MB)" aria-label="Share a file">📎︎</button>
+        <input type="file" id="file-input" hidden>
         <textarea id="composer-input" rows="1" maxlength="4000" placeholder="Message" aria-label="Message"></textarea>
         <button class="btn primary" type="submit">Send</button>
       </form>
@@ -91,6 +93,16 @@
     <aside class="members" id="members-panel" aria-label="Members">
       <h2 class="panel-title" id="members-title">Members</h2>
       <div id="members"></div>
+    </aside>
+
+    <aside class="thread" id="thread-panel" aria-label="Thread" hidden>
+      <header class="thread-head"><h2 class="panel-title">Thread</h2>
+        <button class="icon-btn" data-action="close-thread" title="Close thread" aria-label="Close thread">✕</button></header>
+      <div class="thread-body" id="thread-body"></div>
+      <form class="composer thread-composer" id="thread-composer">
+        <textarea id="thread-input" rows="1" maxlength="4000" placeholder="Reply in thread" aria-label="Reply in thread"></textarea>
+        <button class="btn primary" type="submit">Reply</button>
+      </form>
     </aside>
   </div>
 

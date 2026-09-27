@@ -15,7 +15,7 @@ this is a security-sensitive project where shortcuts compound.
 | 5 | Offline delivery (relays) | ✅ Verified deterministically and over live Tor |
 | 6 | Desktop installers & auto-updates | ✅ Built and verified locally · CI install runs and first signed release pending |
 | 7 | Voice & video (the disclosed exception) | ✅ Built · verified via GUI with live-Tor signaling · real devices/networks pending |
-| 8 | Rich features | Not started |
+| 8 | Rich features | ✅ Built · verified via the GUI over live Tor |
 | 9 | Hardening & third-party audit | Not started · required before any production claim |
 | 10 | Mobile core compatibility | Not started |
 | 11 | Android app, export & updates | Not started |
@@ -623,12 +623,79 @@ Design as built: architecture.md §9.
   - "usable quality" with real devices on real networks, and an independent
     review of the disclosure text, are still to do.
 
-## Phase 8 — Rich Features
-- Encrypted file/image sharing, reactions, threads, presence/status,
-  disappearing messages — all over the Tor transport from Phase 1
+## Phase 8 — Rich Features *(built; verified deterministically and through the GUI over live Tor)*
+Feature checklist and per-feature metadata review: feature-parity.md.
+- [x] **Encrypted file and image sharing**, up to 25 MB:
+  - encrypted once under a random per-file key, which exists only inside
+    the MLS message;
+  - the ciphertext moves peer to peer over Tor in chunks the downloader
+    pulls, from the sender or any other member who has it (so a file
+    outlives its sender being offline);
+  - chunks are served only to members of the conversation;
+  - the download is checked against the SHA-256 in the MLS-authenticated
+    message before decrypting;
+  - files are stored encrypted at rest;
+  - images are shown inline only if the bytes are really PNG, JPEG, GIF or
+    WebP (never SVG); other files download on request and save to the
+    downloads folder under a sanitised, never-overwriting name.
+- [x] **Reactions:** any short emoji; add and remove; who reacted is shown.
+- [x] **Threads:** reply in a thread from any message; a side panel; reply
+      counts in the timeline. One level (threads don't nest).
+- [x] **Presence and status:** online / away / do not disturb, plus a short
+      message. Sent only to connected peers over Noise; never stored,
+      queued or relayed; shown as offline once the connection drops.
+- [x] **Disappearing messages:** a per-conversation timer (either person in
+      a DM, the admin in a channel), shown as a note. Each message carries
+      its timer, and expiry counts from arrival. Expired rows are
+      overwritten, not just unlinked (SQLite `secure_delete`), and their
+      attachment files are deleted too.
+- **Verification:**
+  - ✅ `securetext-app/tests/rich_flows.rs` (5 tests):
+    - threads and reactions both ways (add, remove, "mine", who; threads
+      don't nest; bad emoji and unknown targets refused);
+    - timers agreed on both sides with a note, messages expiring about an
+      hour out, and switching off works;
+    - presence shared, and "offline" once disconnected;
+    - **a 700 KB file across three chunks fetched from Bob after Alice (the
+      sender) went offline**, byte-identical, with path components
+      stripped from its name, never overwritten on save, and not readable
+      at rest;
+    - small real images download by themselves and render, while a fake
+      "image" (SVG) is neither labelled nor rendered as one.
+  - ✅ Node-level tests:
+    - **an expired message's text is gone from the database file itself**
+      (a build without `secure_delete` was confirmed to fail this);
+    - **files are served only to members** (a build without the
+      membership check was confirmed to fail);
+    - a download that doesn't match its hash is discarded, leaving nothing
+      behind;
+    - plus unit tests for file encryption, name sanitising, image
+      sniffing, emoji validation and timer wording.
+  - ✅ **GUI over live Tor** (`gui_e2e.py`, in the same run as the other
+    phases):
+    - Bob reacts and Alice sees it;
+    - Alice replies in a thread; Bob sees the reply count and opens the
+      thread; the reply is counted once and marked delivered on Alice's
+      side;
+    - a PNG drawn on a canvas is attached, downloaded over Tor, decrypted
+      and **rendered inline** for Bob;
+    - a 109 KB text file downloads on request;
+    - Alice sets "away · testing SecureText" and Bob's member list shows
+      it;
+    - a 1-hour timer shows its note on both sides, and Bob's next message
+      carries the timer on Alice's side.
+  - Three UI bugs found in these runs and fixed:
+    - a reply counted twice;
+    - the thread panel overflowing the window;
+    - a thread reply stuck showing "Queued".
+    
+    A test step that raced the member list re-rendering was also made to
+    wait.
 - **Exit criteria:** feature parity checklist against the "Discord-like"
-  goal from the original vision, each new feature re-checked against
-  threat-model.md for new metadata leakage before shipping.
+  goal, each new feature re-checked against threat-model.md for new
+  metadata leakage before shipping. ✅ Met: feature-parity.md holds both.
+  Not built yet: editing/deleting, mentions, notifications, search, pins,
+  custom roles and multi-device.
 
 ## Phase 9 — Hardening & Third-Party Audit
 - Independent security audit covering: the crypto implementation and

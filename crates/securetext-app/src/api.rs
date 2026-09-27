@@ -42,6 +42,8 @@ pub async fn dispatch(node: &NodeHandle, cmd: &str, args: Value) -> Result<Value
     struct Send {
         conversation_id: String,
         body: String,
+        #[serde(default)]
+        reply_to: Option<String>,
     }
     #[derive(Deserialize)]
     struct Link {
@@ -82,7 +84,7 @@ pub async fn dispatch(node: &NodeHandle, cmd: &str, args: Value) -> Result<Value
         }
         "send_message" => {
             let a: Send = parse(args)?;
-            to_value(node.send_message(a.conversation_id, a.body).await.map_err(err)?)
+            to_value(node.post(a.conversation_id, a.body, a.reply_to).await.map_err(err)?)
         }
         "create_server" => {
             let a: Name = parse(args)?;
@@ -113,6 +115,72 @@ pub async fn dispatch(node: &NodeHandle, cmd: &str, args: Value) -> Result<Value
             }
             let a: Relay = parse(args)?;
             to_value(node.set_relay(a.address).await.map_err(err)?)
+        }
+        "send_file" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct File {
+                conversation_id: String,
+                name: String,
+                #[serde(default)]
+                mime: String,
+                /// Base64.
+                data: String,
+                #[serde(default)]
+                caption: String,
+                #[serde(default)]
+                reply_to: Option<String>,
+            }
+            let a: File = parse(args)?;
+            let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, a.data)
+                .map_err(|e| format!("bad file data: {e}"))?;
+            to_value(node.send_file(a.conversation_id, a.name, a.mime, data, a.caption, a.reply_to).await.map_err(err)?)
+        }
+        "react" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct React {
+                conversation_id: String,
+                message_id: String,
+                emoji: String,
+                on: bool,
+            }
+            let a: React = parse(args)?;
+            to_value(node.react(a.conversation_id, a.message_id, a.emoji, a.on).await.map_err(err)?)
+        }
+        "set_disappearing" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Timer {
+                conversation_id: String,
+                #[serde(default)]
+                secs: Option<i64>,
+            }
+            let a: Timer = parse(args)?;
+            to_value(node.set_disappearing(a.conversation_id, a.secs).await.map_err(err)?)
+        }
+        "set_presence" => {
+            #[derive(Deserialize)]
+            struct Presence {
+                status: String,
+                #[serde(default)]
+                text: String,
+            }
+            let a: Presence = parse(args)?;
+            to_value(node.set_presence(a.status, a.text).await.map_err(err)?)
+        }
+        "download_attachment" | "attachment_data" | "save_attachment" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct FileId {
+                file_id: String,
+            }
+            let a: FileId = parse(args)?;
+            match cmd {
+                "download_attachment" => to_value(node.download_attachment(a.file_id).await.map_err(err)?),
+                "attachment_data" => to_value(node.attachment_data(a.file_id).await.map_err(err)?),
+                _ => to_value(node.save_attachment(a.file_id, None).await.map_err(err)?),
+            }
         }
         "start_call" => {
             #[derive(Deserialize)]

@@ -63,8 +63,11 @@
     const letters = parts.length > 1 ? parts[0][0] + parts[1][0] : (parts[0] || '?')[0];
     return letters.toUpperCase();
   }
+  const STATUS_LABEL = { online: 'Online', away: 'Away', dnd: 'Do not disturb', offline: 'Not connected' };
   function avatar(name, key, online, small) {
-    const dot = online === undefined ? '' : `<span class="dot ${online ? 'on' : ''}" title="${online ? 'Connected' : 'Not connected'}"></span>`;
+    // `online` may be a boolean or a status string.
+    const status = typeof online === 'string' ? online : online ? 'online' : 'offline';
+    const dot = online === undefined ? '' : `<span class="dot ${status === 'offline' ? '' : 'on'} st-${esc(status)}" title="${esc(STATUS_LABEL[status] || status)}"></span>`;
     return `<div class="avatar ${small ? 'small' : ''} ${hue(key)}" aria-hidden="true">${esc(initials(name))}${dot}</div>`;
   }
   const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -95,6 +98,10 @@
     update: null,
     call: null,
     turn: [],
+    thread: null,        // root message id of the open thread
+    presence: {},        // key -> { status, text }
+    myPresence: { status: 'online', text: '' },
+    images: {},          // file id -> data: URL (downloaded images)
   };
 
   const conv = (id) => state.convs.find((c) => c.id === id);
@@ -201,7 +208,11 @@
 
   async function refreshContacts() {
     state.contacts = await call('contacts');
-    state.contacts.forEach((c) => (c.online ? state.online.add(c.key) : state.online.delete(c.key)));
+    state.contacts.forEach((c) => {
+      if (c.online) state.online.add(c.key);
+      else state.online.delete(c.key);
+      state.presence[c.key] = { status: c.status, text: c.status_text };
+    });
   }
 
   async function refreshMembers() {
@@ -227,6 +238,7 @@
     }
     const serverId = c.kind === 'channel' ? c.server_id : c.kind === 'server' ? c.id : null;
     state.view = { mode: serverId ? 'server' : 'home', serverId, convId: c.id };
+    state.thread = null;
     if (serverId) state.lastChannel[serverId] = c.id;
     state.unread[c.id] = 0;
     render();
@@ -240,6 +252,7 @@
 
   function goHome() {
     state.view = { mode: 'home', serverId: null, convId: null };
+    state.thread = null;
     render();
     refreshMembers();
   }
@@ -262,6 +275,7 @@
       case 'message': {
         const list = state.msgs[ev.conversation_id];
         if (list && !list.some((m) => m.id === ev.message.id)) list.push(ev.message);
+        if (ev.conversation_id === state.view.convId) renderThread();
         if (ev.conversation_id === state.view.convId && document.hasFocus()) {
           renderMessages(false);
         } else {
@@ -272,11 +286,34 @@
         }
         break;
       }
+      case 'message_updated': {
+        const list = state.msgs[ev.conversation_id];
+        if (list) {
+          const i = list.findIndex((m) => m.id === ev.message.id);
+          if (i >= 0) list[i] = ev.message;
+          if (ev.conversation_id === state.view.convId) { renderMessages(false); renderThread(); }
+        }
+        break;
+      }
+      case 'messages_deleted': {
+        const list = state.msgs[ev.conversation_id];
+        if (list) {
+          state.msgs[ev.conversation_id] = list.filter((m) => !ev.ids.includes(m.id));
+          if (state.thread && ev.ids.includes(state.thread)) state.thread = null;
+          if (ev.conversation_id === state.view.convId) { renderMessages(false); renderThread(); }
+        }
+        break;
+      }
+      case 'presence':
+        state.presence[ev.key] = { status: ev.status, text: ev.text };
+        renderSidebar();
+        refreshMembers();
+        break;
       case 'message_status': {
         const m = (state.msgs[ev.conversation_id] || []).find((x) => x.id === ev.id);
         if (m) {
           m.status = ev.status;
-          if (ev.conversation_id === state.view.convId) renderMessages(false);
+          if (ev.conversation_id === state.view.convId) { renderMessages(false); renderThread(); }
         }
         break;
       }
@@ -340,8 +377,9 @@
         const online = state.online.has(c.peer_key);
         const unread = state.unread[c.id] || 0;
         const active = state.view.convId === c.id;
+        const pres = online ? ((state.presence[c.peer_key] || {}).status || 'online') : 'offline';
         return `<button class="item ${active ? 'active' : ''} ${unread ? 'unread' : ''}" data-conv="${esc(c.id)}">
-          ${avatar(c.name, c.peer_key, online, true)}
+          ${avatar(c.name, c.peer_key, pres, true)}
           <span class="grow">${esc(c.name)}</span>
           ${unread ? `<span class="count">${unread}</span>` : ''}</button>`;
       }).join('');
@@ -379,6 +417,8 @@
     const title = $('#main-title');
     renderHeadActions(c);
     if (!c) {
+      $('#thread-panel').hidden = true;
+      $('#app').classList.remove('thread-open');
       title.innerHTML = '<span>Home</span>';
       $('#messages').innerHTML = welcomeHtml();
       $('#composer').hidden = true;
@@ -403,6 +443,7 @@
       : '';
     $('#composer-input').placeholder = c.kind === 'dm' ? `Message @${c.name}` : `Message #${c.name}`;
     renderMessages(true);
+    renderThread();
   }
 
   function welcomeHtml() {
@@ -424,31 +465,218 @@
     </div>`;
   }
 
+  const QUICK_REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🎉'];
+
+  function fmtSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
+  }
+
+  function attachmentHtml(a) {
+    if (!a) return '';
+    if (a.image && a.state === 'complete') {
+      const src = state.images[a.file_id];
+      if (!src) loadImage(a.file_id);
+      return `<div class="attachment image">${src ? `<img src="${esc(src)}" alt="${esc(a.name)}">` : '<span class="sub">Loading image…</span>'}
+        <button class="btn small ghost" data-save="${esc(a.file_id)}">Save</button></div>`;
+    }
+    let action = '';
+    if (a.state === 'available') action = `<button class="btn small" data-download="${esc(a.file_id)}">Download</button>`;
+    else if (a.state === 'downloading') action = `<span class="sub">Downloading over Tor… ${a.total ? Math.floor((100 * a.received) / a.total) : 0}%</span>`;
+    else if (a.state === 'complete') action = `<button class="btn small" data-save="${esc(a.file_id)}">Save to Downloads</button>`;
+    else action = `<span class="sub">Download failed</span> <button class="btn small ghost" data-download="${esc(a.file_id)}">Retry</button>`;
+    return `<div class="attachment file"><span class="file-icon" aria-hidden="true">📄︎</span>
+      <div class="grow"><div class="name">${esc(a.name)}</div><div class="sub">${esc(fmtSize(a.size))}</div></div>${action}</div>`;
+  }
+
+  async function loadImage(fileId) {
+    if (state.images[fileId] !== undefined) return;
+    state.images[fileId] = '';
+    try {
+      const d = await call('attachment_data', { fileId });
+      state.images[fileId] = `data:${d.mime};base64,${d.data}`;
+      renderMessages(false);
+      renderThread();
+    } catch (_) {
+      delete state.images[fileId];
+    }
+  }
+
+  function reactionsHtml(m) {
+    if (!m.reactions || !m.reactions.length) return '';
+    return `<div class="reactions">${m.reactions.map((r) => `<button class="reaction ${r.mine ? 'mine' : ''}" data-react="${esc(r.emoji)}" data-msg="${esc(m.id)}" data-on="${r.mine ? '0' : '1'}" title="${esc(r.by.join(', '))}">${esc(r.emoji)} ${r.count}</button>`).join('')}</div>`;
+  }
+
+  // Thread sizes come from the messages we hold, so a reply counts once
+  // however its news arrives (our own send, or the node's update event).
+  function replyCount(c, m) {
+    return (state.msgs[c.id] || []).filter((x) => x.reply_to === m.id).length || m.reply_count || 0;
+  }
+
+  function messageHtml(c, m, first, inThread) {
+    if (m.status === 'system') {
+      return `<div class="msg system"><div class="gutter"></div><div class="body note">⏱︎ ${esc(m.sender_label)} ${esc(m.body)}</div></div>`;
+    }
+    const pending = m.outgoing && m.status === 'pending';
+    const relayed = m.outgoing && m.status === 'relayed';
+    const timer = m.expires_at ? `<span class="expires" title="Disappears ${esc(new Date(m.expires_at).toLocaleString())}">⏱︎</span>` : '';
+    return `<div class="msg ${first ? 'first' : ''} ${pending ? 'pending' : ''}" data-id="${esc(m.id)}">
+        <div class="gutter">${first ? avatar(m.sender_label, m.sender_key, undefined) : `<span class="time-hover">${esc(fmtTime(m.sent_at))}</span>`}</div>
+        <div>
+          ${first ? `<div class="head"><span class="who">${esc(m.sender_label)}</span><span class="when">${esc(fmtTime(m.sent_at))}</span>${timer}</div>` : ''}
+          ${m.body ? `<div class="body">${esc(m.body)}</div>` : ''}
+          ${attachmentHtml(m.attachment)}
+          ${reactionsHtml(m)}
+          ${!inThread && replyCount(c, m) ? `<button class="thread-link" data-thread="${esc(m.id)}">${replyCount(c, m)} ${replyCount(c, m) === 1 ? 'reply' : 'replies'} →</button>` : ''}
+          ${pending ? `<div class="status pending">◷ Queued on this device — sends automatically when ${c.kind === 'dm' ? esc(c.name) + ' is' : 'members are'} reachable over Tor</div>` : ''}
+          ${relayed ? `<div class="status relayed">✓ Left at ${c.kind === 'dm' ? esc(c.name) + '’s' : 'an offline member’s'} relay — delivered when they’re next online</div>` : ''}
+        </div>
+        <div class="msg-actions">
+          <button class="icon-btn" data-react-menu="${esc(m.id)}" title="Add a reaction" aria-label="Add a reaction">☺︎</button>
+          ${inThread ? '' : `<button class="icon-btn" data-thread="${esc(m.id)}" title="Reply in thread" aria-label="Reply in thread">↩︎</button>`}
+        </div></div>`;
+  }
+
   function renderMessages(forceBottom) {
     const c = conv(state.view.convId);
     const box = $('#messages');
     if (!c || c.kind === 'server') return;
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    const list = state.msgs[c.id] || [];
+    // Thread replies live in the thread panel, not the main timeline.
+    const list = (state.msgs[c.id] || []).filter((m) => !m.reply_to);
     let html = introHtml(c);
     let prev = null;
     for (const m of list) {
       if (!prev || !sameDay(prev.sent_at, m.sent_at)) html += `<div class="day-sep">${esc(fmtDay(m.sent_at))}</div>`;
-      const first = !prev || prev.sender_key !== m.sender_key || m.sent_at - prev.sent_at > 5 * 60 * 1000 || !sameDay(prev.sent_at, m.sent_at);
-      const pending = m.outgoing && m.status === 'pending';
-      const relayed = m.outgoing && m.status === 'relayed';
-      html += `<div class="msg ${first ? 'first' : ''} ${pending ? 'pending' : ''}">
-        <div class="gutter">${first ? avatar(m.sender_label, m.sender_key, undefined) : `<span class="time-hover">${esc(fmtTime(m.sent_at))}</span>`}</div>
-        <div>
-          ${first ? `<div class="head"><span class="who">${esc(m.sender_label)}</span><span class="when">${esc(fmtTime(m.sent_at))}</span></div>` : ''}
-          <div class="body">${esc(m.body)}</div>
-          ${pending ? `<div class="status pending">◷ Queued on this device — sends automatically when ${c.kind === 'dm' ? esc(c.name) + ' is' : 'members are'} reachable over Tor</div>` : ''}
-          ${relayed ? `<div class="status relayed">✓ Left at ${c.kind === 'dm' ? esc(c.name) + '’s' : 'an offline member’s'} relay — delivered when they’re next online</div>` : ''}
-        </div></div>`;
+      const first = !prev || prev.status === 'system' || prev.sender_key !== m.sender_key || m.sent_at - prev.sent_at > 5 * 60 * 1000 || !sameDay(prev.sent_at, m.sent_at);
+      html += messageHtml(c, m, first, false);
       prev = m;
     }
     box.innerHTML = html;
     if (forceBottom || nearBottom) box.scrollTop = box.scrollHeight;
+  }
+
+  function renderThread() {
+    const panel = $('#thread-panel');
+    const c = conv(state.view.convId);
+    const root = c && state.thread && (state.msgs[c.id] || []).find((m) => m.id === state.thread);
+    if (!root) {
+      panel.hidden = true;
+      $('#app').classList.remove('thread-open');
+      $('#members-panel').hidden = !c;
+      return;
+    }
+    panel.hidden = false;
+    $('#app').classList.add('thread-open');
+    $('#members-panel').hidden = true;
+    const replies = (state.msgs[c.id] || []).filter((m) => m.reply_to === root.id);
+    $('#thread-body').innerHTML = messageHtml(c, root, true, true)
+      + `<div class="day-sep">${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}</div>`
+      + replies.map((m) => messageHtml(c, m, true, true)).join('');
+    const body = $('#thread-body');
+    body.scrollTop = body.scrollHeight;
+  }
+
+  function openThread(id) {
+    state.thread = id;
+    renderThread();
+    $('#thread-input').focus();
+  }
+
+  function showReactionMenu(button, messageId) {
+    document.querySelectorAll('.react-menu').forEach((e) => e.remove());
+    const menu = document.createElement('div');
+    menu.className = 'react-menu';
+    menu.innerHTML = QUICK_REACTIONS.map((e) => `<button data-react="${e}" data-msg="${esc(messageId)}" data-on="1">${e}</button>`).join('');
+    button.parentElement.appendChild(menu);
+    setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 0);
+  }
+
+  async function react(messageId, emoji, on) {
+    try {
+      const updated = await call('react', { conversationId: state.view.convId, messageId, emoji, on });
+      const list = state.msgs[state.view.convId] || [];
+      const i = list.findIndex((m) => m.id === updated.id);
+      if (i >= 0) list[i] = updated;
+      renderMessages(false);
+      renderThread();
+    } catch (e) {
+      toast(errText(e), 'error');
+    }
+  }
+
+  async function sendFile(file) {
+    const id = state.view.convId;
+    if (!id || !file) return;
+    if (file.size > 25 * 1024 * 1024) return toast('Files are limited to 25 MB.', 'error');
+    const data = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result).slice(String(r.result).indexOf(',') + 1));
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+    try {
+      const m = await call('send_file', { conversationId: id, name: file.name, mime: file.type, data, caption: '', replyTo: null });
+      const list = state.msgs[id] || (state.msgs[id] = []);
+      if (!list.some((x) => x.id === m.id)) list.push(m);
+      renderMessages(true);
+    } catch (e) {
+      toast(errText(e), 'error');
+    }
+  }
+
+  const TIMER_CHOICES = [[null, 'Off'], [3600, '1 hour'], [86400, '1 day'], [604800, '1 week']];
+  function showTimerSettings() {
+    const c = conv(state.view.convId);
+    if (!c) return;
+    modal(`<h3>Disappearing messages</h3>
+      <p class="lead">New messages in ${c.kind === 'dm' ? 'this conversation' : '#' + esc(c.name)} delete themselves from everyone’s device after the time you pick, counted from when each one arrives.</p>
+      <div class="pick-list">${TIMER_CHOICES.map(([secs, label]) => `<label class="check pick"><input type="radio" name="timer" value="${secs ?? ''}" ${(c.disappear_secs ?? null) === secs ? 'checked' : ''}> ${label}</label>`).join('')}</div>
+      <p class="fineprint">It’s enforced by everyone’s SecureText app, so a modified app, a screenshot or a copy can still keep a message. Earlier messages keep their own timer.</p>
+      <p class="form-error" id="m-err"></p>
+      <div class="actions"><button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="m-go">Save</button></div>`,
+    (root, close) => {
+      $('#m-go', root).addEventListener('click', async (e) => {
+        const v = root.querySelector('input[name=timer]:checked');
+        const secs = v && v.value ? Number(v.value) : null;
+        busy(e.target, true);
+        try {
+          await call('set_disappearing', { conversationId: c.id, secs });
+          close();
+          await refreshConvs();
+          renderMain();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+          busy(e.target, false);
+        }
+      });
+    });
+  }
+
+  function showStatusPicker() {
+    const p = state.myPresence;
+    modal(`<h3>Your status</h3>
+      <p class="lead">Shown to the contacts and server members you’re connected to right now. It’s never stored on their devices or left at a relay.</p>
+      <div class="pick-list">${['online', 'away', 'dnd'].map((st) => `<label class="check pick"><input type="radio" name="st" value="${st}" ${p.status === st ? 'checked' : ''}> <span class="dot on st-${st}"></span> ${STATUS_LABEL[st]}</label>`).join('')}</div>
+      <label>Status message<input id="m-text" maxlength="80" placeholder="What are you up to?" value="${esc(p.text)}"></label>
+      <p class="form-error" id="m-err"></p>
+      <div class="actions"><button class="btn ghost" data-close>Cancel</button><button class="btn primary" id="m-go">Save</button></div>`,
+    (root, close) => {
+      $('#m-go', root).addEventListener('click', async (e) => {
+        const status = root.querySelector('input[name=st]:checked').value;
+        busy(e.target, true);
+        try {
+          const [st, text] = await call('set_presence', { status, text: $('#m-text', root).value });
+          state.myPresence = { status: st, text };
+          close();
+          renderMe();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+          busy(e.target, false);
+        }
+      });
+    });
   }
 
   function introHtml(c) {
@@ -484,9 +712,10 @@
     $('#members-title').textContent = `Members — ${online}/${state.members.length} connected`;
     panel.innerHTML = state.members.map((m) => `
       <div class="member ${m.online ? '' : 'offline'}">
-        ${avatar(m.label, m.key, m.online, true)}
+        ${avatar(m.label, m.key, m.status || (m.online ? 'online' : 'offline'), true)}
         <div class="grow">
           <div class="name">${esc(m.label)}${m.is_me ? ' <span class="sub">(you)</span>' : ''} ${showAdmin && m.is_admin ? '<span class="crown" title="Server admin">♛</span>' : ''}</div>
+          ${m.status_text ? `<div class="sub status-text">${esc(m.status_text)}</div>` : ''}
           <div class="sub" title="Identity key fingerprint">${esc(m.fingerprint)}</div>
         </div>
         ${canKick && !m.is_me ? `<button class="btn small ghost kick" data-kick="${esc(m.key)}" data-name="${esc(m.label)}" title="Remove from server">Remove</button>` : ''}
@@ -497,9 +726,11 @@
     const s = state.status;
     if (!s) return;
     $('#me-name').textContent = s.label;
-    $('#me-fp').textContent = s.fingerprint;
+    const p = state.myPresence;
+    $('#me-fp').textContent = p.text || STATUS_LABEL[p.status] || s.fingerprint;
+    $('#me-status').title = `Set your status (identity key ${s.fingerprint})`;
     $('#me-avatar').className = 'avatar ' + hue(s.public_key);
-    $('#me-avatar').textContent = initials(s.label);
+    $('#me-avatar').innerHTML = `${esc(initials(s.label))}<span class="dot on st-${esc(p.status)}"></span>`;
   }
 
   function renderNet() {
@@ -546,10 +777,16 @@
   function renderHeadActions(c) {
     const box = $('#head-actions');
     const can = c && c.kind !== 'server' && !c.removed && !state.call;
-    box.innerHTML = can
+    const timerAllowed = c && !c.removed && (c.kind === 'dm' || (c.kind === 'channel' && c.is_admin));
+    const timer = c && c.kind !== 'server' && !c.removed
+      ? `<button class="icon-btn ${c.disappear_secs ? 'on' : ''}" data-action="timer" ${timerAllowed ? '' : 'disabled'}
+          title="${c.disappear_secs ? 'Messages disappear after ' + esc(TIMER_CHOICES.find(([s]) => s === c.disappear_secs)?.[1] || c.disappear_secs + ' s') : 'Disappearing messages: off'}${timerAllowed ? '' : ' (only the admin can change this)'}"
+          aria-label="Disappearing messages">⏱︎</button>`
+      : '';
+    box.innerHTML = timer + (can
       ? `<button class="icon-btn" data-action="call-voice" title="Start a voice call" aria-label="Start a voice call">📞︎</button>
          <button class="icon-btn" data-action="call-video" title="Start a video call" aria-label="Start a video call">🎥︎</button>`
-      : '';
+      : '');
   }
 
   function disclosureHtml(turnWho) {
@@ -1133,8 +1370,19 @@
   // Interaction
   // ------------------------------------------------------------------
   document.addEventListener('click', (e) => {
-    const t = e.target.closest('[data-action], [data-conv], [data-server], [data-kick]');
+    const t = e.target.closest('[data-action], [data-conv], [data-server], [data-kick], [data-react], [data-react-menu], [data-thread], [data-download], [data-save]');
     if (!t) return;
+    if (t.dataset.react) return react(t.dataset.msg, t.dataset.react, t.dataset.on === '1');
+    if (t.dataset.reactMenu) { e.stopPropagation(); return showReactionMenu(t, t.dataset.reactMenu); }
+    if (t.dataset.thread) return openThread(t.dataset.thread);
+    if (t.dataset.download) {
+      return call('download_attachment', { fileId: t.dataset.download }).catch((err) => toast(errText(err), 'error'));
+    }
+    if (t.dataset.save) {
+      return call('save_attachment', { fileId: t.dataset.save })
+        .then((path) => toast('Saved to ' + path))
+        .catch((err) => toast(errText(err), 'error'));
+    }
     if (t.dataset.conv) return select(conv(t.dataset.conv));
     if (t.dataset.server) return select(conv(t.dataset.server));
     if (t.dataset.kick) return confirmKick(t.dataset.kick, t.dataset.name);
@@ -1145,6 +1393,9 @@
       case 'new-channel': return showNewChannel();
       case 'invite-server': return showInviteToServer();
       case 'settings': return showSettings();
+      case 'attach': return $('#file-input').click();
+      case 'timer': return showTimerSettings();
+      case 'close-thread': state.thread = null; return renderThread();
       case 'call-voice': case 'call-video': case 'call-mute': case 'call-camera': case 'call-screen': case 'call-hangup':
         return callAction(t.dataset.action);
       case 'update-notes': return showUpdateNotes();
@@ -1155,6 +1406,35 @@
   $('#rail-add').addEventListener('click', showNewServer);
   $('#net-pill').addEventListener('click', showNetworkModal);
   $('#me-settings').addEventListener('click', showSettings);
+  $('#me-status').addEventListener('click', showStatusPicker);
+  $('#file-input').addEventListener('change', (e) => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    sendFile(f);
+  });
+  $('#thread-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      $('#thread-composer').requestSubmit();
+    }
+  });
+  $('#thread-composer').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const id = state.view.convId;
+    const body = $('#thread-input').value.trim();
+    if (!id || !body || !state.thread) return;
+    $('#thread-input').value = '';
+    try {
+      const m = await call('send_message', { conversationId: id, body, replyTo: state.thread });
+      const list = state.msgs[id] || (state.msgs[id] = []);
+      if (!list.some((x) => x.id === m.id)) list.push(m);
+      renderMessages(false);
+      renderThread();
+    } catch (err) {
+      $('#thread-input').value = body;
+      toast(errText(err), 'error');
+    }
+  });
 
   const input = $('#composer-input');
   function autosize() {

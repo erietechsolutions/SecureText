@@ -6127,6 +6127,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "chacha20poly1305",
+ "directories",
  "futures",
  "openmls",
  "openmls_basic_credential",
@@ -6143,6 +6144,7 @@ dependencies = [
  "securetext-update",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
 ]
