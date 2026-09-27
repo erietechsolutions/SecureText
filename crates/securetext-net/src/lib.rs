@@ -259,6 +259,59 @@ pub fn is_v3_onion(address: &str) -> bool {
 
 pub use arti_client::IsolationToken;
 
+/// One relay in a circuit we built (the hop viewer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hop {
+    /// The relay's RSA identity fingerprint (hex), as Tor tools show it.
+    pub fingerprint: Option<String>,
+    /// The relay's public address.
+    pub address: Option<String>,
+    /// Two-letter country code, from Tor's own GeoIP database (no lookup
+    /// leaves the machine).
+    pub country: Option<String>,
+    /// A hop we can't see into: the other side's half of an onion-service
+    /// connection.
+    pub hidden: bool,
+}
+
+/// The relays on our side of `stream`'s circuit, in order (guard first),
+/// or `None` if it isn't a stream we opened (connections others open to
+/// our onion service use circuits arti doesn't expose to us).
+pub fn circuit_hops(stream: &DataStream) -> Option<Vec<Hop>> {
+    use tor_linkspec::{HasAddrs, HasRelayIds};
+    use tor_proto::client::stream::ClientStreamCtrl;
+    let tunnel = stream.client_stream_ctrl()?.tunnel()?;
+    let path = tunnel.all_paths().into_iter().next()?;
+    let geoip = geoip();
+    Some(
+        path.hops()
+            .iter()
+            .map(|entry| match entry.as_chan_target() {
+                Some(target) => {
+                    let addr = target.addrs().next();
+                    Hop {
+                        fingerprint: target.rsa_identity().map(|id| id.as_bytes().iter().map(|b| format!("{b:02X}")).collect()),
+                        address: addr.map(|a| a.to_string()),
+                        country: addr.and_then(|a| geoip.lookup_country_code(a.ip())).map(|c| c.to_string()),
+                        hidden: false,
+                    }
+                }
+                None => Hop { fingerprint: None, address: None, country: None, hidden: true },
+            })
+            .collect(),
+    )
+}
+
+fn geoip() -> std::sync::Arc<tor_geoip::GeoipDb> {
+    static DB: std::sync::OnceLock<std::sync::Arc<tor_geoip::GeoipDb>> = std::sync::OnceLock::new();
+    DB.get_or_init(tor_geoip::GeoipDb::new_embedded).clone()
+}
+
+/// A two-letter country code arti accepts for exit selection, or an error.
+pub fn parse_country(code: &str) -> Result<arti_client::CountryCode, NetError> {
+    code.parse().map_err(|_| NetError::Config(format!("not a country code: {code:.8}")))
+}
+
 /// A stream to an ordinary (non-onion) host, through a Tor exit relay.
 ///
 /// Messaging never uses this: peers and relays are onion services only.
@@ -271,9 +324,15 @@ pub async fn connect_exit(
     host: &str,
     port: u16,
     isolation: IsolationToken,
+    exit_country: Option<&str>,
 ) -> Result<DataStream, NetError> {
     let mut prefs = arti_client::StreamPrefs::new();
     prefs.set_isolation(isolation);
+    // Updates only: the user may pick which country the exit relay (the
+    // one that talks to GitHub) is in. Messaging never uses exits.
+    if let Some(code) = exit_country {
+        prefs.exit_country(parse_country(code)?);
+    }
     let stream = client.connect_with_prefs((host, port), &prefs).await?;
     Ok(stream)
 }
@@ -412,5 +471,52 @@ mod tests {
         assert_eq!(received_by_listener, b"hello over tor");
         assert_eq!(&echo_buf[..n], b"hello over tor");
         eprintln!("round trip over onion services succeeded, both directions verified");
+    }
+
+    /// The hop viewer against the live network: dial an onion service and
+    /// read back our side of the circuit, with countries.
+    ///   cargo test -p securetext-net -- --ignored hops_live --nocapture
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn hops_live() {
+        let service = TorClient::create_bootstrapped(scratch_config()).await.unwrap();
+        let mut listener = Listener::launch(&service, "securetext-hops").unwrap();
+        let address = listener.onion_address().unwrap();
+        tokio::spawn(async move { while let Ok(Some(_s)) = listener.accept_next().await {} });
+        let client = TorClient::create_bootstrapped(scratch_config()).await.unwrap();
+        let mut stream = None;
+        for _ in 0..6 {
+            match dial(&client, &address, 1).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("dial not ready yet: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            }
+        }
+        let hops = circuit_hops(&stream.expect("dialed the onion service")).expect("a client stream has a path");
+        for (i, h) in hops.iter().enumerate() {
+            eprintln!("hop {}: {:?} {:?} {:?} hidden={}", i + 1, h.country, h.address, h.fingerprint, h.hidden);
+        }
+        let visible: Vec<&Hop> = hops.iter().filter(|h| !h.hidden).collect();
+        assert!(visible.len() >= 3, "our side of an onion circuit has at least 3 relays: {hops:?}");
+        assert!(visible.iter().all(|h| h.fingerprint.is_some() && h.address.is_some()));
+        assert!(visible.iter().filter(|h| h.country.is_some()).count() >= 2, "countries come from Tor's GeoIP db");
+    }
+
+    /// Exit-country selection (update downloads only) against the live
+    /// network: pin the exit to Germany and check the circuit's last relay.
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn exit_country_live() {
+        let client = TorClient::create_bootstrapped(scratch_config()).await.unwrap();
+        let stream = connect_exit(&client, "github.com", 443, IsolationToken::new(), Some("DE")).await.expect("exit via DE");
+        let hops = circuit_hops(&stream).unwrap();
+        eprintln!("exit circuit: {:?}", hops.iter().map(|h| h.country.clone()).collect::<Vec<_>>());
+        assert_eq!(hops.last().unwrap().country.as_deref(), Some("DE"));
+        assert!(connect_exit(&client, "github.com", 443, IsolationToken::new(), Some("not a country")).await.is_err());
     }
 }

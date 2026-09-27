@@ -26,6 +26,15 @@ pub type BoxedStream = Box<dyn RawStream>;
 
 pub trait Transport: Send + Sync + 'static {
     fn dial<'a>(&'a self, onion_address: &'a str) -> BoxFuture<'a, anyhow::Result<BoxedStream>>;
+
+    /// Like [`Self::dial`], also reporting the relays on our side of the
+    /// circuit (the hop viewer). Transports without circuits report none.
+    fn dial_with_hops<'a>(
+        &'a self,
+        onion_address: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<(BoxedStream, Option<Vec<securetext_net::Hop>>)>> {
+        Box::pin(async move { Ok((self.dial(onion_address).await?, None)) })
+    }
 }
 
 /// A bound listener: our own address plus the stream of incoming
@@ -85,6 +94,17 @@ impl Transport for TorTransport {
         Box::pin(async move {
             let stream = securetext_net::dial(&self.client, onion_address, PEER_PORT).await?;
             Ok(Box::new(stream) as BoxedStream)
+        })
+    }
+
+    fn dial_with_hops<'a>(
+        &'a self,
+        onion_address: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<(BoxedStream, Option<Vec<securetext_net::Hop>>)>> {
+        Box::pin(async move {
+            let stream = securetext_net::dial(&self.client, onion_address, PEER_PORT).await?;
+            let hops = securetext_net::circuit_hops(&stream);
+            Ok((Box::new(stream) as BoxedStream, hops))
         })
     }
 }

@@ -213,6 +213,30 @@ pub struct MemberView {
     pub group: Option<String>,
 }
 
+/// One relay on our side of a connection's Tor circuit.
+#[derive(Clone, Debug, Serialize)]
+pub struct HopView {
+    pub fingerprint: Option<String>,
+    pub address: Option<String>,
+    /// Two-letter country code (Tor's built-in GeoIP database).
+    pub country: Option<String>,
+    /// A hop we can't see into (the other side's half).
+    pub hidden: bool,
+}
+
+/// A live connection and the relays it goes through (the hop viewer).
+#[derive(Clone, Debug, Serialize)]
+pub struct CircuitView {
+    pub peer_key: String,
+    pub label: String,
+    /// We opened it, so we built (and can show) our side of the circuit.
+    /// Connections the other person opened use circuits arti doesn't
+    /// expose to us.
+    pub we_dialed: bool,
+    /// Our side, guard first. Empty when unknown.
+    pub hops: Vec<HopView>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ContactView {
     pub key: String,
@@ -496,6 +520,11 @@ impl NodeHandle {
         self.call(move |s| s.members(&conversation_id)).await
     }
 
+    /// Every live connection and the Tor relays on our side of it.
+    pub async fn tor_circuits(&self) -> anyhow::Result<Vec<CircuitView>> {
+        self.call(|s| Ok(s.tor_circuits())).await
+    }
+
     pub async fn contacts(&self) -> anyhow::Result<Vec<ContactView>> {
         self.call(|s| s.contacts()).await
     }
@@ -579,6 +608,11 @@ impl NodeHandle {
     /// Download the available update (automatic when auto-updates are on).
     pub async fn download_update(&self) -> anyhow::Result<Option<UpdateStatus>> {
         self.call(|s| s.download_update()).await
+    }
+
+    /// Pin the Tor exit used for update downloads to a country (`None`: any).
+    pub async fn set_update_region(&self, country: Option<String>) -> anyhow::Result<Option<UpdateStatus>> {
+        self.call(move |s| s.set_update_region(country)).await
     }
 
     pub async fn set_auto_update(&self, enabled: bool) -> anyhow::Result<Option<UpdateStatus>> {

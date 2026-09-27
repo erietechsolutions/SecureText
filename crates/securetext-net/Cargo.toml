@@ -10,6 +10,10 @@ arti-client.workspace = true
 tor-hsservice.workspace = true
 tor-rtcompat.workspace = true
 tor-cell = "0.46"
+# Circuit paths of our own streams (the hop viewer) and relay countries.
+tor-proto = { version = "0.46", features = ["stream-ctrl"] }
+tor-linkspec = "0.46"
+tor-geoip = { version = "0.46", features = ["embedded-db"] }
 safelog = "0.9"
 snow.workspace = true
 yamux.workspace = true

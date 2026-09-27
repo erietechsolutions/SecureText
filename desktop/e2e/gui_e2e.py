@@ -345,6 +345,24 @@ def select_channel(w, name):
     w.wait(f"#{name} open", has_text("#main-title", name))
 
 
+def hops_stage(alice, bob):
+    """The Tor hop viewer: whoever opened the live connection sees the
+    relays on their side of it (guard, middle, meeting point, with
+    countries), and the other person's half is shown as hidden."""
+    found = []
+    for w in (alice, bob):
+        w.click("#net-pill")
+        w.wait("network details", "return !!document.querySelector('.modal h4');")
+        n = w.js("return Math.max(0, ...[...document.querySelectorAll('.circuit .hops')].map(o => o.querySelectorAll('li:not(.end):not(.hidden-hops)').length));")
+        found.append(n)
+        if n:
+            w.shot("27-tor-hops")
+            hops = w.js("return [...document.querySelectorAll('.circuit .hops li:not(.end)')].map(li => li.textContent.replace(/\\s+/g, ' ').trim());")
+            log(f"[{w.name}] tor hops: {hops}")
+        w.click(".modal [data-close]")
+    assert max(found) >= 3, f"expected at least 3 visible relays on one side, got {found}"
+
+
 def roles_stage(alice, bob):
     """Discord-style server customization through the UI: Alice renames the
     server, colors its icon, creates a hoisted Mod role with Manage
@@ -505,6 +523,7 @@ def main():
         log("bob received alice's reply")
         alice.shot("07-dm-conversation")
         bob.shot("07-dm-conversation")
+        hops_stage(alice, bob)
         if args.turn:
             call_stage(alice, bob, args.turn, args.screen_share)
         rich_stage(alice, bob)

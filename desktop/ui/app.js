@@ -117,6 +117,9 @@
     [P.INVITE, 'Invite members', 'Invite their contacts into the server'],
   ];
   const can = (c, bit) => !!c && !c.removed && (c.permissions & bit) !== 0;
+  // Countries with plenty of Tor exit relays, for the update-download
+  // region picker.
+  const UPDATE_REGIONS = ['US', 'DE', 'NL', 'FR', 'SE', 'CH', 'FI', 'AT', 'RO', 'CA', 'GB', 'NO', 'LU', 'PL', 'CZ'];
   const SWATCHES = ['#7c6cf2', '#e91e63', '#e67e22', '#f1c40f', '#2ecc71', '#1abc9c', '#3498db', '#99aab5'];
 
   const conv = (id) => state.convs.find((c) => c.id === id);
@@ -1393,9 +1396,36 @@
     }
   }
 
-  function showNetworkModal() {
+  // Country names for two-letter codes, in the user's language.
+  const countryNames = (() => {
+    try { return new Intl.DisplayNames([], { type: 'region' }); } catch (_) { return null; }
+  })();
+  const countryName = (cc) => (cc && countryNames ? countryNames.of(cc) || cc : cc || 'unknown location');
+
+  function circuitHtml(c) {
+    const who = esc(c.label);
+    if (!c.hops.length) {
+      return `<div class="circuit"><div class="circuit-head"><strong>${who}</strong><span class="sub">${c.we_dialed ? 'route not available' : `${who} opened this connection`}</span></div>
+        <p class="sub">${c.we_dialed ? '' : `They built the route to your onion address, so its relays aren’t visible to you. Your onion service’s own relays are chosen and kept by Tor internally.`}</p></div>`;
+    }
+    const visible = c.hops.filter((h) => !h.hidden);
+    const roles = ['Guard', 'Middle', 'Middle', 'Middle', 'Middle', 'Middle', 'Middle'];
+    const steps = visible.map((h, i) => {
+      const role = i === visible.length - 1 ? 'Meeting point' : roles[i];
+      return `<li><span class="hop-role">${role}</span><span class="hop-where">${esc(countryName(h.country))}${h.country ? ` <span class="sub">${esc(h.country)}</span>` : ''}</span>
+        <span class="sub mono" title="Relay fingerprint ${esc(h.fingerprint || '')}">${esc(h.address || '')}</span></li>`;
+    }).join('');
+    return `<div class="circuit"><div class="circuit-head"><strong>${who}</strong><span class="sub">you opened this connection · ${visible.length} relays on your side</span></div>
+      <ol class="hops"><li class="end">You</li>${steps}
+        <li class="hidden-hops"><span class="hop-role">${who}’s side</span><span class="sub">relays ${who} chose; hidden from you by design</span></li>
+        <li class="end">${who}</li></ol></div>`;
+  }
+
+  async function showNetworkModal() {
     const s = state.status || {};
     const net = s.network || {};
+    let circuits = [];
+    try { circuits = await call('tor_circuits'); } catch (_) { /* not connected yet */ }
     modal(`<h3>How your messages travel</h3>
       <div class="explain">
         <p><strong>Encrypted end to end.</strong> Every message is encrypted on this device with keys only the people in the conversation hold (MLS). Nobody in between can read it.</p>
@@ -1409,6 +1439,9 @@
           <dt>Offline relay</dt><dd>${esc(s.relay || 'none — messages to you wait until you’re both online')}</dd>
           <dt>Your key</dt><dd>${esc(s.public_key || '')}</dd>
         </dl>
+        <h4>Your Tor connections</h4>
+        ${circuits.length ? circuits.map(circuitHtml).join('') : '<p class="sub">No live connections right now.</p>'}
+        <p class="fineprint"><strong>How many hops?</strong> Every connection goes through at least 3 Tor relays on your side, then meets the other person’s own 3-relay route at a meeting point, so about 6 relays in total and nobody sees both ends. The count isn’t adjustable: Tor fixes it for every user, and a different path length would make SecureText users stand out from everyone else on Tor. For the same reason your relays aren’t limited to one region. The one exception is update downloads, whose exit country you can choose in Settings → Updates.</p>
       </div>
       <div class="actions"><button class="btn primary" data-close>Got it</button></div>`);
   }
@@ -1439,6 +1472,9 @@
         <p class="sub" id="s-update-line">${esc(updateLine(u))}</p>
         ${u ? `<p class="sub">This is version ${esc(u.current_version)}.</p>
         <label class="check"><input type="checkbox" id="s-auto" ${u.auto ? 'checked' : ''}> Check for updates automatically</label>
+        <label>Download region <select id="s-region"><option value="">Any country (recommended)</option>
+          ${UPDATE_REGIONS.map((cc) => `<option value="${cc}" ${u.region === cc ? 'selected' : ''}>${esc(countryName(cc))}</option>`).join('')}</select></label>
+        <p class="fineprint">The country of the Tor exit relay that fetches updates from GitHub. It affects update downloads only; messages never use exits.</p>
         <p class="fineprint">Checks go to GitHub Releases through Tor, at random times, so they don’t reveal your IP address or form a pattern. An update is installed only if it’s signed by the SecureText release key, and only when you choose to restart.</p>
         <div class="row">
           <button class="btn small" id="s-check">Check now</button>
@@ -1470,6 +1506,15 @@
           state.update = await call('set_auto_update', { enabled: auto.checked });
           $('#s-update-line', root).textContent = updateLine(state.update);
           renderUpdate();
+        } catch (err) {
+          $('#m-err', root).textContent = errText(err);
+        }
+      });
+      const region = $('#s-region', root);
+      if (region) region.addEventListener('change', async () => {
+        try {
+          state.update = await call('set_update_region', { country: region.value || null });
+          toast(region.value ? `Updates will download through an exit in ${countryName(region.value)}.` : 'Updates will download through any exit.');
         } catch (err) {
           $('#m-err', root).textContent = errText(err);
         }

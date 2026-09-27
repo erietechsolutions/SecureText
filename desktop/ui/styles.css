@@ -530,3 +530,16 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(-
 .member-roles { padding: 6px 0; border-bottom: 1px solid var(--line); display: grid; gap: 4px; }
 .chip { font-size: 13px; }
 .perm .sub { font-weight: 400; }
+
+/* ---- Tor hop viewer ---- */
+.explain h4 { margin: 8px 0 0; color: var(--text); }
+.circuit { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; background: var(--bg-raised); }
+.circuit-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.hops { list-style: none; margin: 8px 0 0; padding: 0 0 0 14px; border-left: 2px solid var(--onion); display: grid; gap: 6px; }
+.hops li { display: grid; grid-template-columns: 110px 1fr auto; gap: 8px; align-items: baseline; font-size: 13px; position: relative; }
+.hops li::before { content: ""; position: absolute; left: -20px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--onion); }
+.hops li.end { display: block; font-weight: 600; color: var(--text); }
+.hops li.hidden-hops::before { background: var(--text-3); }
+.hop-role { color: var(--text-3); font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
+.hop-where { color: var(--text); }
+.mono { font-family: var(--mono); font-size: 11.5px; }

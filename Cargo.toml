@@ -48,7 +48,7 @@ base64 = "0.23"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Networking (Tor)
-arti-client = { version = "0.46", features = ["onion-service-service", "onion-service-client", "pt-client", "tokio", "rustls"] }
+arti-client = { version = "0.46", features = ["onion-service-service", "onion-service-client", "pt-client", "tokio", "rustls", "geoip"] }
 tor-hsservice = "0.46"
 tor-rtcompat = { version = "0.46", features = ["tokio", "rustls"] }
 futures = "0.3"

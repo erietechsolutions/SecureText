@@ -60,6 +60,8 @@ pub struct UpdateStatus {
     pub current_version: String,
     /// Automatic checks are on.
     pub auto: bool,
+    /// Exit country for update downloads (`None`: any).
+    pub region: Option<String>,
     /// This install can apply updates itself (not a source build).
     pub can_install: bool,
     #[serde(flatten)]
@@ -91,6 +93,8 @@ pub(crate) struct Updater {
     config: UpdateConfig,
     exit_factory: Option<ExitFactory>,
     pub(crate) auto: bool,
+    /// Country the exit relay for update downloads must be in, if chosen.
+    pub(crate) exit_country: Option<String>,
     state: UpdateState,
     offer: Option<Offer>,
     staged: Option<PathBuf>,
@@ -103,12 +107,14 @@ pub(crate) struct Updater {
 struct TorExit {
     client: securetext_net::Client,
     isolation: securetext_net::IsolationToken,
+    /// The user's chosen exit country for update downloads, if any.
+    country: Option<String>,
 }
 
 impl Connector for TorExit {
     fn connect<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, std::io::Result<Box<dyn Io>>> {
         Box::pin(async move {
-            let stream = securetext_net::connect_exit(&self.client, host, port, self.isolation)
+            let stream = securetext_net::connect_exit(&self.client, host, port, self.isolation, self.country.as_deref())
                 .await
                 .map_err(std::io::Error::other)?;
             Ok(Box::new(stream) as Box<dyn Io>)
@@ -117,20 +123,22 @@ impl Connector for TorExit {
 }
 
 pub(crate) fn tor_exit(client: securetext_net::Client) -> ExitFactory {
-    Arc::new(move || {
-        Arc::new(TorExit { client: client.clone(), isolation: securetext_net::IsolationToken::new() }) as Arc<dyn Connector>
+    Arc::new(move |country: Option<String>| {
+        Arc::new(TorExit { client: client.clone(), isolation: securetext_net::IsolationToken::new(), country })
+            as Arc<dyn Connector>
     })
 }
 
 /// The HTTPS client the updater uses in real life: GitHub hosts only, over
 /// Tor exits from `client`. Public for the live test.
 pub fn tor_https_client(client: securetext_net::Client) -> HttpsClient {
-    HttpsClient::new(tor_exit(client)(), securetext_update::https::github_hosts(), REQUEST_TIMEOUT)
+    HttpsClient::new(tor_exit(client)(None), securetext_update::https::github_hosts(), REQUEST_TIMEOUT)
 }
 
 /// Makes a fresh connector (and so a fresh circuit isolation group) per
 /// check.
-pub(crate) type ExitFactory = Arc<dyn Fn() -> Arc<dyn Connector> + Send + Sync>;
+/// The argument is the exit country for update downloads (`None`: any).
+pub(crate) type ExitFactory = Arc<dyn Fn(Option<String>) -> Arc<dyn Connector> + Send + Sync>;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
@@ -140,6 +148,7 @@ impl Updater {
             config,
             exit_factory: None,
             auto,
+            exit_country: None,
             state: UpdateState::Idle,
             offer: None,
             staged: None,
@@ -152,6 +161,7 @@ impl Updater {
         UpdateStatus {
             current_version: self.config.current_version.clone(),
             auto: self.auto,
+            region: self.exit_country.clone(),
             can_install: self.config.install.platform_key().is_some(),
             state: self.state.clone(),
         }
@@ -176,7 +186,7 @@ impl Updater {
         if let Some(client) = &self.config.client_override {
             return Some(client.clone());
         }
-        let connector = self.exit_factory.as_ref().map(|make| make())?;
+        let connector = self.exit_factory.as_ref().map(|make| make(self.exit_country.clone()))?;
         // Tor only: there is no fallback to a direct connection.
         Some(HttpsClient::new(connector, securetext_update::https::github_hosts(), REQUEST_TIMEOUT))
     }

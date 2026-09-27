@@ -39,7 +39,7 @@ use crate::wire::{
     self, to_hex, ContactCard, ConversationInfo, ConversationKind, Payload, SignedCard, WireMessage,
 };
 use crate::{
-    ContactView, ConversationView, Event, MemberView, MessageView, NetworkState, StatusView,
+    CircuitView, ContactView, ConversationView, HopView, Event, MemberView, MessageView, NetworkState, StatusView,
 };
 
 /// Key packages handed to a contact when the relationship starts, so they
@@ -89,6 +89,7 @@ pub(crate) enum NetEvent {
         card: Option<SignedCard>,
         conn_id: u64,
         tx: mpsc::UnboundedSender<Outgoing>,
+        hops: Option<Vec<securetext_net::Hop>>,
     },
     Frame {
         peer_key: Vec<u8>,
@@ -130,6 +131,8 @@ struct Conn {
     tx: mpsc::UnboundedSender<Outgoing>,
     /// We dialed it (rather than accepted it).
     outgoing: bool,
+    /// Our side of its Tor circuit, if we dialed it over Tor.
+    hops: Option<Vec<securetext_net::Hop>>,
 }
 
 /// A connection that's been superseded keeps reading this long before it
@@ -372,8 +375,8 @@ impl NodeState {
                 self.emit_update();
             }
             NetEvent::Incoming(stream) => self.spawn_accept(stream),
-            NetEvent::Connected { peer_key, card, conn_id, tx } => {
-                self.on_connected(peer_key, card, conn_id, tx)
+            NetEvent::Connected { peer_key, card, conn_id, tx, hops } => {
+                self.on_connected(peer_key, card, conn_id, tx, hops)
             }
             NetEvent::Frame { peer_key, message } => {
                 if let Err(e) = self.on_frame(&peer_key, message) {
@@ -510,7 +513,9 @@ impl NodeState {
     pub(crate) fn enable_updates(&mut self, config: UpdateConfig) {
         // On unless the user turned them off.
         let auto = self.store.get_setting("auto_update").ok().flatten().as_deref() != Some("0");
-        self.updater = Some(Updater::new(config, auto));
+        let mut updater = Updater::new(config, auto);
+        updater.exit_country = self.store.get_setting("update_exit_country").ok().flatten();
+        self.updater = Some(updater);
     }
 
     fn emit_update(&self) {
@@ -541,6 +546,26 @@ impl NodeState {
         let updater = self.updater.as_mut().ok_or_else(|| anyhow::anyhow!("updates are not available in this build"))?;
         updater.set_auto(enabled);
         self.store.set_setting("auto_update", if enabled { "1" } else { "0" })?;
+        self.dirty = true;
+        self.emit_update();
+        Ok(self.update_status())
+    }
+
+    /// Choose the country of the Tor exit relay used for update downloads
+    /// (`None`: any). Only update checks use exits; messaging is
+    /// onion-service only and unaffected.
+    pub(crate) fn set_update_region(&mut self, country: Option<String>) -> anyhow::Result<Option<UpdateStatus>> {
+        let country = country.map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty());
+        if let Some(c) = &country {
+            anyhow::ensure!(c.len() == 2, "use a two-letter country code");
+            securetext_net::parse_country(c)?;
+        }
+        let updater = self.updater.as_mut().ok_or_else(|| anyhow::anyhow!("updates are not available in this build"))?;
+        updater.exit_country = country.clone();
+        match &country {
+            Some(c) => self.store.set_setting("update_exit_country", c)?,
+            None => self.store.delete_setting("update_exit_country")?,
+        }
         self.dirty = true;
         self.emit_update();
         Ok(self.update_status())
@@ -848,7 +873,7 @@ impl NodeState {
         let peer_key = peer_key.to_vec();
         self.tasks.spawn(async move {
             let attempt = tokio::time::timeout(timeout, async {
-                let mut stream = transport.dial(&peer.onion_address).await?;
+                let (mut stream, hops) = transport.dial_with_hops(&peer.onion_address).await?;
                 let (noise, remote_static) =
                     securetext_net::handshake_initiator(&mut stream, &noise_private).await?;
                 // The whole point of the Noise layer: an onion service
@@ -860,12 +885,12 @@ impl NodeState {
                 let mux = SecureMux::new(stream, noise, MuxMode::Client);
                 let mut mux_stream = mux.open().await?;
                 wire::write_frame(&mut mux_stream, &WireMessage::Hello { card: my_card }).await?;
-                Ok::<_, anyhow::Error>((mux, mux_stream))
+                Ok::<_, anyhow::Error>((mux, mux_stream, hops))
             })
             .await;
             match attempt {
-                Ok(Ok((mux, stream))) => {
-                    run_connection(mux, stream, peer_key, None, conn_id, net_tx).await;
+                Ok(Ok((mux, stream, hops))) => {
+                    run_connection(mux, stream, peer_key, None, conn_id, net_tx, hops).await;
                 }
                 Ok(Err(e)) => {
                     let _ = net_tx.send(NetEvent::DialFailed { peer_key, error: format!("{e:#}") });
@@ -912,7 +937,7 @@ impl NodeState {
             drop(permit);
             if let Ok(Ok((mux, stream, card))) = accepted {
                 let peer_key = card.card.mls_public_key.clone();
-                run_connection(mux, stream, peer_key, Some(card), conn_id, net_tx).await;
+                run_connection(mux, stream, peer_key, Some(card), conn_id, net_tx, None).await;
             }
         });
     }
@@ -928,6 +953,7 @@ impl NodeState {
         card: Option<SignedCard>,
         conn_id: u64,
         tx: mpsc::UnboundedSender<Outgoing>,
+        hops: Option<Vec<securetext_net::Hop>>,
     ) {
         if peer_key == self.public.public_key {
             return; // someone replaying our own card; the Noise check makes this us, pointless
@@ -980,7 +1006,7 @@ impl NodeState {
             }
         }
         let _ = tx.send(Outgoing { outbox_id: None, message: self.my_presence_frame() });
-        self.connections.insert(peer_key.clone(), Conn { id: conn_id, tx, outgoing });
+        self.connections.insert(peer_key.clone(), Conn { id: conn_id, tx, outgoing, hops });
         self.emit(Event::Peer { key: to_hex(&peer_key), online: true });
         self.downloads_on_connect();
     }
@@ -1765,6 +1791,35 @@ impl NodeState {
         Ok(members.into_iter().map(|(_, m)| m).collect())
     }
 
+    /// Every live connection and our side of its Tor circuit.
+    pub(crate) fn tor_circuits(&self) -> Vec<CircuitView> {
+        let mut out: Vec<CircuitView> = self
+            .connections
+            .iter()
+            .map(|(key, c)| CircuitView {
+                peer_key: to_hex(key),
+                label: self.label_for(key),
+                we_dialed: c.outgoing,
+                hops: c
+                    .hops
+                    .as_ref()
+                    .map(|h| {
+                        h.iter()
+                            .map(|h| HopView {
+                                fingerprint: h.fingerprint.clone(),
+                                address: h.address.clone(),
+                                country: h.country.clone(),
+                                hidden: h.hidden,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+        out
+    }
+
     pub(crate) fn contacts(&self) -> anyhow::Result<Vec<ContactView>> {
         Ok(self
             .store
@@ -1846,10 +1901,11 @@ async fn run_connection(
     card: Option<SignedCard>,
     conn_id: u64,
     net_tx: mpsc::UnboundedSender<NetEvent>,
+    hops: Option<Vec<securetext_net::Hop>>,
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Outgoing>();
     if net_tx
-        .send(NetEvent::Connected { peer_key: peer_key.clone(), card, conn_id, tx })
+        .send(NetEvent::Connected { peer_key: peer_key.clone(), card, conn_id, tx, hops })
         .is_err()
     {
         return;
@@ -2025,7 +2081,7 @@ mod tests {
     /// sends down it.
     fn fake_connection(node: &mut NodeState, peer: &[u8]) -> mpsc::UnboundedReceiver<Outgoing> {
         let (tx, rx) = mpsc::unbounded_channel();
-        node.connections.insert(peer.to_vec(), Conn { id: 999, tx, outgoing: true });
+        node.connections.insert(peer.to_vec(), Conn { id: 999, tx, outgoing: true, hops: None });
         rx
     }
 
@@ -2125,7 +2181,7 @@ mod tests {
         for i in 0..(MAX_UNKNOWN_CONNECTIONS + 10) {
             let (tx, rx) = mpsc::unbounded_channel();
             keep.push(rx);
-            alice.on_connected(vec![100 + i as u8; 32], None, 1000 + i as u64, tx);
+            alice.on_connected(vec![100 + i as u8; 32], None, 1000 + i as u64, tx, None);
         }
         assert_eq!(alice.connections.len(), MAX_UNKNOWN_CONNECTIONS);
         let mut bob = offline_node(dir.path(), "bob");
@@ -2134,7 +2190,7 @@ mod tests {
         let frames = take_frames(&mut bob, &alice);
         deliver(&bob, &mut alice, frames);
         let (tx, _rx) = mpsc::unbounded_channel();
-        alice.on_connected(bob.my_key().to_vec(), None, 5000, tx);
+        alice.on_connected(bob.my_key().to_vec(), None, 5000, tx, None);
         assert!(alice.connections.contains_key(bob.my_key()), "contacts aren't subject to the stranger cap");
     }
 
@@ -2214,12 +2270,12 @@ mod tests {
         // learns about them in a different order.
         let (t1, _r1) = mpsc::unbounded_channel();
         let (t2, _r2) = mpsc::unbounded_channel();
-        alice.on_connected(b_key.clone(), None, 1, t1); // she dialed it
-        alice.on_connected(b_key.clone(), Some(b_card), 2, t2); // he dialed it
+        alice.on_connected(b_key.clone(), None, 1, t1, None); // she dialed it
+        alice.on_connected(b_key.clone(), Some(b_card), 2, t2, None); // he dialed it
         let (t3, _r3) = mpsc::unbounded_channel();
         let (t4, _r4) = mpsc::unbounded_channel();
-        bob.on_connected(a_key.clone(), None, 2, t4); // he dialed it
-        bob.on_connected(a_key.clone(), Some(a_card), 1, t3); // she dialed it
+        bob.on_connected(a_key.clone(), None, 2, t4, None); // he dialed it
+        bob.on_connected(a_key.clone(), Some(a_card), 1, t3, None); // she dialed it
         let expected = if a_key < b_key { 1 } else { 2 };
         assert_eq!(alice.connections[&b_key].id, expected, "Alice keeps the lower key's connection");
         assert_eq!(bob.connections[&a_key].id, expected, "and so does Bob");
