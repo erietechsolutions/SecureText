@@ -7,7 +7,7 @@
 | Ubuntu | 22.04 LTS and newer |
 | Fedora | Current release at time of build (tracks Fedora's own support window) |
 | Windows | Windows 10 (21H2+) and Windows 11 |
-| Android | *Planned* (roadmap Phases 10–11); Planned to be backwards compatible with version 11 or newer |
+| Android | *Planned* (roadmap Phases 10–11); Planned to be backwards compatible with version 12 or newer |
 
 **Current verification (2026-09-26):** everything through Phase 5 has been
 built and verified on Fedora 44 only. Ubuntu and Windows are supported
