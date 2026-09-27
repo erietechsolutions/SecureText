@@ -24,6 +24,9 @@ use crate::Event;
 
 /// Ringing gives up after this long.
 const RING_TIMEOUT: Duration = Duration::from_secs(60);
+/// A pair in the call that still isn't connected after this long gets
+/// another try (signals are live-only, so one can be lost).
+const STUCK: Duration = Duration::from_secs(10);
 /// A ring older than this when it arrives is ignored.
 const STALE_RING_MS: i64 = 90_000;
 const TURN_SETTING: &str = "turn_servers";
@@ -64,6 +67,10 @@ pub(crate) struct CallState {
     turn_source: &'static str,
     started: Instant,
     muted: bool,
+    /// When each not-yet-connected participant last got a (re)try.
+    since: HashMap<Vec<u8>, Instant>,
+    /// When we last re-announced ourselves to people who owe us an offer.
+    last_nudge: Option<Instant>,
 }
 
 pub(crate) enum CallNet {
@@ -224,6 +231,8 @@ impl NodeState {
             turn_source: "yours",
             started: Instant::now(),
             muted: false,
+            since: HashMap::new(),
+            last_nudge: None,
         });
         self.start_engine();
         self.emit_call(None);
@@ -341,6 +350,7 @@ impl NodeState {
         let Some(engine) = c.engine.clone() else { return };
         c.offered.insert(peer.clone());
         c.participants.insert(peer.clone(), "connecting".into());
+        c.since.insert(peer.clone(), Instant::now());
         let call_id = c.call_id.clone();
         let net_tx = self.net_tx.clone();
         self.tasks.spawn(async move {
@@ -379,27 +389,31 @@ impl NodeState {
                     Ok(engine) => {
                         engine.set_muted(c.muted);
                         c.engine = Some(engine);
-                        let (gid, id, phase) = (c.gid.clone(), c.call_id.clone(), c.phase);
+                        let (gid, id, phase, caller) = (c.gid.clone(), c.call_id.clone(), c.phase, c.caller.clone());
                         let queued = std::mem::take(&mut c.queued_offers);
-                        let joined: Vec<Vec<u8>> = c
-                            .participants
-                            .iter()
-                            .filter(|(k, state)| state.as_str() == "joined" && **k != c.caller)
-                            .map(|(k, _)| k.clone())
-                            .collect();
-                        if phase == Phase::Active && c.caller != self.public.public_key {
+                        let me = self.public.public_key.clone();
+                        if phase == Phase::Active && caller != me {
                             // Tell everyone we're here; they'll offer.
                             let _ = self.send_call_signal(&gid, &id, CallSignal::Join);
                         }
                         for (peer, sdp) in queued {
                             self.spawn_answer(peer, sdp);
                         }
-                        // As the caller: anyone who answered while we were
-                        // still starting up gets an offer now.
-                        if self.call.as_ref().is_some_and(|c| c.caller == self.public.public_key) {
-                            for peer in joined {
-                                self.spawn_offer(peer);
-                            }
+                        // Anyone who joined while our engine was starting,
+                        // and whom it's our turn to offer to (`we_offer`).
+                        let waiting: Vec<Vec<u8>> = self
+                            .call
+                            .as_ref()
+                            .map(|c| {
+                                c.participants
+                                    .iter()
+                                    .filter(|(k, state)| state.as_str() == "joined" && we_offer(&me, &caller, k))
+                                    .map(|(k, _)| k.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for peer in waiting {
+                            self.spawn_offer(peer);
                         }
                     }
                     Err(e) => self.end_call(&format!("couldn't start the call: {e}")),
@@ -408,6 +422,11 @@ impl NodeState {
             }
             CallNet::Sdp { call_id, peer, offer, result } => {
                 let Some(c) = self.call.as_ref().filter(|c| c.call_id == call_id) else { return };
+                // An offer we gave up on (we answered theirs instead) is
+                // stale; sending it would only confuse the other side.
+                if offer && !c.offered.contains(&peer) {
+                    return;
+                }
                 let gid = c.gid.clone();
                 match result {
                     Ok(sdp) => {
@@ -435,6 +454,9 @@ impl NodeState {
                     EngineEvent::PeerState { peer, state } => {
                         if let (Some(c), Ok(key)) = (self.call.as_mut(), wire::from_hex(&peer)) {
                             if c.participants.contains_key(&key) {
+                                if state == "connected" {
+                                    c.since.remove(&key);
+                                }
                                 c.participants.insert(key, state);
                             }
                         }
@@ -484,6 +506,8 @@ impl NodeState {
                     turn_source: "the caller's",
                     started: Instant::now(),
                     muted: false,
+                    since: HashMap::new(),
+                    last_nudge: None,
                 });
                 self.emit_call(None);
             }
@@ -491,13 +515,22 @@ impl NodeState {
             CallSignal::Join => {
                 let c = self.call.as_mut().expect("ours");
                 c.participants.entry(sender.to_vec()).or_insert_with(|| "joined".into());
+                c.since.entry(sender.to_vec()).or_insert_with(Instant::now);
                 if c.phase == Phase::Outgoing {
                     c.phase = Phase::Active;
                 }
-                // Everyone already in the call offers the newcomer a
-                // connection (once our engine is up; until then the join
-                // is remembered and offered to when it is).
-                if c.phase == Phase::Active && c.engine.is_some() && !c.offered.contains(sender) {
+                // Offer the newcomer a connection if it's our turn
+                // (`we_offer`), once our engine is up; until then the join
+                // is remembered and offered to when it is.
+                // A repeated Join (a retry) must not disturb a connection
+                // that's up or being set up.
+                let settled = c.participants.get(sender).is_some_and(|st| st == "connected" || st == "connecting");
+                if c.phase == Phase::Active
+                    && c.engine.is_some()
+                    && !settled
+                    && !c.offered.contains(sender)
+                    && we_offer(&me, &c.caller, sender)
+                {
                     self.spawn_offer(sender.to_vec());
                 }
                 self.emit_call(None);
@@ -507,7 +540,8 @@ impl NodeState {
                 if c.phase == Phase::Incoming {
                     return; // not accepted
                 }
-                // Both offered at once: the lower key's offer wins.
+                // `we_offer` means this shouldn't happen, but if both sides
+                // did offer (say, mixed versions), the lower key's offer wins.
                 if c.offered.contains(sender) {
                     if me.as_slice() < sender {
                         return;
@@ -564,8 +598,10 @@ impl NodeState {
         }
     }
 
-    /// Called from the node's tick: ringing times out.
+    /// Called from the node's tick: ringing times out, and pairs that
+    /// haven't connected get another try.
     pub(crate) fn call_tick(&mut self) {
+        self.retry_stuck_pairs();
         let Some(c) = &self.call else { return };
         if c.started.elapsed() < RING_TIMEOUT {
             return;
@@ -577,6 +613,58 @@ impl NodeState {
                 self.emit_call(Some("missed call"));
             }
             Phase::Active => {}
+        }
+    }
+}
+
+/// Which side of a pair starts their connection, so exactly one does and
+/// two offers never cross: the caller offers to everyone who joins, and
+/// between two others, the lower identity key offers. (If offers crossed,
+/// one side's late-finishing offer could replace the connection it had
+/// just answered on, leaving the pair stuck. The CI test found this on a
+/// slow runner.)
+fn we_offer(me: &[u8], caller: &[u8], peer: &[u8]) -> bool {
+    me == caller || (peer != caller && me < peer)
+}
+
+impl NodeState {
+    /// Call signals are live-only, so on a flaky link one can be lost and
+    /// leave a pair of participants unconnected. After `STUCK`, whoever
+    /// offers for that pair offers again (replacing any half-built
+    /// connection), and whoever waits re-announces its Join so the other
+    /// side knows to.
+    fn retry_stuck_pairs(&mut self) {
+        let me = self.public.public_key.clone();
+        let Some(c) = self.call.as_mut() else { return };
+        if c.phase != Phase::Active || c.engine.is_none() {
+            return;
+        }
+        let stuck: Vec<Vec<u8>> = c
+            .participants
+            .iter()
+            .filter(|(k, state)| state.as_str() != "connected" && c.since.get(*k).is_none_or(|t| t.elapsed() > STUCK))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let caller = c.caller.clone();
+        let mut nudge = false;
+        for peer in stuck {
+            if we_offer(&me, &caller, &peer) {
+                if let Some(c) = self.call.as_mut() {
+                    c.offered.remove(&peer);
+                }
+                self.spawn_offer(peer);
+            } else {
+                nudge = true;
+                if let Some(c) = self.call.as_mut() {
+                    c.since.insert(peer, Instant::now());
+                }
+            }
+        }
+        let Some(c) = self.call.as_mut() else { return };
+        if nudge && c.last_nudge.is_none_or(|t| t.elapsed() > STUCK) {
+            c.last_nudge = Some(Instant::now());
+            let (gid, id) = (c.gid.clone(), c.call_id.clone());
+            let _ = self.send_call_signal(&gid, &id, CallSignal::Join);
         }
     }
 }

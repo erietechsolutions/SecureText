@@ -87,6 +87,18 @@ async fn wait_media(node: &NodeHandle, peers: usize) {
     .await;
 }
 
+/// Like `wait_media`, without `eventually`'s own 20 s limit (the caller
+/// sets one).
+async fn wait_media_long(node: &NodeHandle, peers: usize) {
+    loop {
+        let stats = node.call_stats().await.unwrap();
+        if stats.len() == peers && stats.iter().all(|s| s.state == "connected") {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_dm_call_rings_connects_through_the_relay_and_hangs_up() {
     let dir = tempfile::tempdir().unwrap();
@@ -200,7 +212,14 @@ async fn a_channel_call_meshes_three_people_and_everyone_hears_everyone() {
     carol.node.accept_call().await.unwrap();
 
     for p in [&alice, &bob, &carol] {
-        wait_media(&p.node, 2).await;
+        // Generous: on a slow machine a lost signal costs a 10 s retry.
+        if tokio::time::timeout(Duration::from_secs(60), wait_media_long(&p.node, 2)).await.is_err() {
+            for (who, q) in [("alice", &alice), ("bob", &bob), ("carol", &carol)] {
+                eprintln!("{who} ({}): {:?}", my_key(&q.node).await, q.node.call_status().await);
+                eprintln!("{who} stats: {:?}", q.node.call_stats().await);
+            }
+            panic!("media never connected for everyone");
+        }
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     // Each person hears both others' tones in the mix, and not their own.
