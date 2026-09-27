@@ -82,7 +82,8 @@ fn working_dir() -> std::io::Result<tempfile::TempDir> {
         }
         b
     };
-    if cfg!(target_os = "linux") {
+    #[cfg(target_os = "linux")]
+    {
         if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
             if runtime.is_absolute() && runtime.is_dir() {
                 if let Ok(dir) = builder.tempdir_in(&runtime) {
